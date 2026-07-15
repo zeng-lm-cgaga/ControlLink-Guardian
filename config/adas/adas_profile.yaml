@@ -1,0 +1,54 @@
+schema_version: 1
+profile_id: adas
+contract: ../common/gateway_contract.yaml
+source_policy: ../common/source_policy.yaml
+fastdds_profile: ../common/fastdds_default_profiles.xml
+
+enabled_sources:
+  - planning
+  - teleop
+
+clock_mode: system
+use_sim_time: false
+
+adapter:
+  type: socketcan
+  config: can_signal_map.yaml
+  canonical_input_topic: /control_link/output/control_cmd
+  vehicle_state_output_topic: /control_link/vehicle_state
+  interface: vcan0
+  poll_timeout_ms: 20
+  tx_period_ms: 20
+  vehicle_state_publish_period_ms: 20
+  local_watchdog_timeout_ms: 100
+  can_state_frame_timeout_ms: 100
+  recovery_valid_frames: 5
+
+ingress:
+  planning:
+    input_topic: /planning/control_cmd
+    input_type: control_link_interfaces/msg/ControlCommand
+    output_topic: /control_link/input/planning
+  teleop:
+    input_topic: /teleop/cmd_vel
+    input_type: geometry_msgs/msg/Twist
+    output_topic: /control_link/input/teleop
+
+vehicle_simulator:
+  state_period_ms: 20
+  local_watchdog_timeout_ms: 100
+  first_order_time_constant_ms: 150
+
+record_topics:
+  - /control_link/input/planning
+  - /control_link/input/teleop
+  - /control_link/output/control_cmd
+  - /control_link/state
+  - /control_link/source_status
+  - /control_link/vehicle_state
+  - /diagnostics
+
+replay:
+  enabled_by_default: false
+  input_namespace: /replay/control_link
+  allow_can_tx: false

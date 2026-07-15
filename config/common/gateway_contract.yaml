@@ -1,0 +1,100 @@
+schema_version: 1
+contract_id: control_link_gateway_v1
+
+gateway:
+  node_fqn: /control_link/gateway
+  output_rate_hz: 50
+  command_timeout_ms: 100
+  source_switch_hold_ms: 100
+  recovery_valid_samples: 5
+  graph_poll_ms: 200
+  graph_stable_window_ms: 500
+  ros_clock_stall_timeout_ms: 100
+  vehicle_state_topic_timeout_ms: 150
+  output_tick_late_threshold_ms: 40
+  consecutive_late_ticks_to_safe_stop: 2
+
+limits:
+  max_abs_linear_velocity_mps: 1.0
+  max_abs_angular_velocity_radps: 1.5
+  reject_non_finite: true
+  reject_zero_stamp: true
+  max_future_skew_ms: 20
+
+qos_profiles:
+  control_input:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 1
+    deadline_ms: 80
+    lifespan_ms: 100
+    liveliness: automatic
+    liveliness_lease_duration_ms: 300
+  canonical_output:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 1
+    deadline_ms: 40
+    lifespan_ms: 100
+    liveliness: automatic
+    liveliness_lease_duration_ms: 300
+  runtime_state:
+    reliability: reliable
+    durability: volatile
+    history: keep_last
+    depth: 10
+
+input:
+  topic_prefix: /control_link/input
+  type: control_link_interfaces/msg/ControlCommand
+  qos_profile: control_input
+
+output:
+  topic: /control_link/output/control_cmd
+  type: control_link_interfaces/msg/ControlCommand
+  qos_profile: canonical_output
+
+state_topics:
+  gateway_state:
+    topic: /control_link/state
+    type: control_link_interfaces/msg/GatewayState
+    qos_profile: runtime_state
+  source_status:
+    topic: /control_link/source_status
+    type: control_link_interfaces/msg/SourceStatus
+    qos_profile: runtime_state
+  vehicle_state:
+    topic: /control_link/vehicle_state
+    type: control_link_interfaces/msg/VehicleState
+    qos_profile: runtime_state
+  diagnostics:
+    topic: /diagnostics
+    type: diagnostic_msgs/msg/DiagnosticArray
+
+critical_endpoints:
+  - id: canonical_output_consumer
+    topic: /control_link/output/control_cmd
+    type: control_link_interfaces/msg/ControlCommand
+    remote_direction: subscription
+    remote_node_fqn: /control_link/vehicle_adapter
+    min_count: 1
+    max_count: 1
+    allow_additional_endpoints: true
+    required_for_activation: true
+    exact_qos_required: true
+    runtime_loss_action: safe_stop
+    runtime_qos_mismatch_action: degraded
+  - id: vehicle_state_producer
+    topic: /control_link/vehicle_state
+    type: control_link_interfaces/msg/VehicleState
+    remote_direction: publisher
+    remote_node_fqn: /control_link/vehicle_adapter
+    min_count: 1
+    max_count: 1
+    allow_additional_endpoints: false
+    required_for_activation: true
+    exact_qos_required: true
+    runtime_loss_action: safe_stop
+    runtime_qos_mismatch_action: degraded

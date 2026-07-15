@@ -1,0 +1,74 @@
+schema_version: 1
+profile_id: robot
+contract: ../common/gateway_contract.yaml
+source_policy: ../common/source_policy.yaml
+fastdds_profile: ../common/fastdds_default_profiles.xml
+
+enabled_sources:
+  - nav2
+  - teleop
+
+clock_mode: sim
+use_sim_time: true
+
+geometry:
+  wheel_separation_m: 0.40
+  wheel_radius_m: 0.08
+
+adapter:
+  type: ros2_control
+  config: ros2_control.yaml
+  canonical_input_topic: /control_link/output/control_cmd
+  controller_output_topic: /diff_drive_controller/cmd_vel
+  controller_command_type: geometry_msgs/msg/TwistStamped
+  local_watchdog_timeout_ms: 100
+
+ingress:
+  nav2:
+    input_topic: /cmd_vel
+    input_type: geometry_msgs/msg/Twist
+    output_topic: /control_link/input/nav2
+  teleop:
+    input_topic: /teleop/cmd_vel
+    input_type: geometry_msgs/msg/Twist
+    output_topic: /control_link/input/teleop
+
+resources:
+  package: control_link_bringup
+  robot_description: urdf/control_link_diffbot.urdf.xacro
+  world: worlds/control_link_flat.sdf
+  map_yaml: maps/control_link_map.yaml
+  nav2_params: config/robot/nav2_params.yaml
+
+frames:
+  map: map
+  odom: odom
+  base_footprint: base_footprint
+  base_link: base_link
+  laser: laser_link
+
+health:
+  vehicle_state_publish_period_ms: 50
+  tf_lookup_timeout_ms: 20
+  tf_max_age_ms: 100
+  controller_state_timeout_ms: 150
+  odometry_timeout_ms: 150
+
+fixed_demo_goal:
+  frame_id: map
+  x_m: 2.0
+  y_m: 1.0
+  yaw_rad: 0.0
+
+record_topics:
+  - /control_link/input/nav2
+  - /control_link/input/teleop
+  - /control_link/output/control_cmd
+  - /control_link/state
+  - /control_link/source_status
+  - /control_link/vehicle_state
+  - /diagnostics
+  - /tf
+  - /tf_static
+  - /odom
+  - /scan

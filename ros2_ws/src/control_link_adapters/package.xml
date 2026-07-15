@@ -1,0 +1,14 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>control_link_adapters</name>
+  <version>0.1.0</version>
+  <description>Ingress and execution-platform adapters for ControlLink Guardian.</description>
+  <maintainer email="zenglm707@gmail.com">zeng-lm-cgaga</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

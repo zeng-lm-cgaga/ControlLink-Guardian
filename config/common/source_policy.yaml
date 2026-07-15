@@ -1,0 +1,22 @@
+schema_version: 1
+policy_id: control_link_sources_v1
+
+sources:
+  - id: teleop
+    topic: /control_link/input/teleop
+    type: control_link_interfaces/msg/ControlCommand
+    priority: 200
+    lease_timeout_ms: 120
+    required_for_activation: false
+  - id: planning
+    topic: /control_link/input/planning
+    type: control_link_interfaces/msg/ControlCommand
+    priority: 150
+    lease_timeout_ms: 120
+    required_for_activation: false
+  - id: nav2
+    topic: /control_link/input/nav2
+    type: control_link_interfaces/msg/ControlCommand
+    priority: 100
+    lease_timeout_ms: 150
+    required_for_activation: false

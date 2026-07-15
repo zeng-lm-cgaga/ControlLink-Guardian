@@ -1,0 +1,20 @@
+# ROS2/colcon outputs
+build/
+install/
+log/
+
+# Local IDE and Python state
+.vscode/
+.idea/
+*.vc.db
+**/__pycache__/
+*.py[cod]
+
+# Local runtime evidence
+reports/
+
+# Native crash/profiling artifacts
+core
+core.*
+*.profraw
+*.profdata

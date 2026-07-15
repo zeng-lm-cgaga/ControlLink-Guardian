@@ -1,0 +1,138 @@
+schema_version: 1
+protocol_id: control_link_demo_can_v1
+description: Project-owned 8-byte vcan demonstration protocol
+byte_order: little_endian
+dlc: 8
+
+crc:
+  algorithm: crc8_sae_j1850
+  polynomial: 0x1D
+  initial_value: 0xFF
+  final_xor: 0xFF
+  reflect_input: false
+  reflect_output: false
+  include_can_id_lsb_first: true
+  protected_payload_bytes: [0, 1, 2, 3, 4, 5, 6]
+
+rolling_counter:
+  bit_length: 4
+  modulo: 16
+  accept_any_first_value: true
+  duplicate_is_error: true
+  jump_is_error: true
+
+frames:
+  control_command:
+    can_id: 0x180
+    direction: gateway_to_vehicle
+    signals:
+      target_speed_mps:
+        byte_offset: 0
+        bit_offset: 0
+        bit_length: 16
+        signed: true
+        scale: 0.01
+        offset: 0.0
+        minimum: -1.0
+        maximum: 1.0
+      target_yaw_rate_radps:
+        byte_offset: 2
+        bit_offset: 0
+        bit_length: 16
+        signed: true
+        scale: 0.001
+        offset: 0.0
+        minimum: -1.5
+        maximum: 1.5
+      command_mode:
+        byte_offset: 4
+        bit_offset: 0
+        bit_length: 8
+        signed: false
+        enum:
+          hold: 0
+          active: 1
+      rolling_counter:
+        byte_offset: 5
+        bit_offset: 0
+        bit_length: 4
+        signed: false
+      reserved_counter_high_nibble:
+        byte_offset: 5
+        bit_offset: 4
+        bit_length: 4
+        constant: 0
+      command_valid:
+        byte_offset: 6
+        bit_offset: 0
+        bit_length: 1
+        signed: false
+      reserved_flags:
+        byte_offset: 6
+        bit_offset: 1
+        bit_length: 7
+        constant: 0
+      crc:
+        byte_offset: 7
+        bit_offset: 0
+        bit_length: 8
+        signed: false
+
+  vehicle_state:
+    can_id: 0x280
+    direction: vehicle_to_gateway
+    signals:
+      measured_speed_mps:
+        byte_offset: 0
+        bit_offset: 0
+        bit_length: 16
+        signed: true
+        scale: 0.01
+        offset: 0.0
+        minimum: -1.0
+        maximum: 1.0
+      measured_yaw_rate_radps:
+        byte_offset: 2
+        bit_offset: 0
+        bit_length: 16
+        signed: true
+        scale: 0.001
+        offset: 0.0
+        minimum: -1.5
+        maximum: 1.5
+      vehicle_mode:
+        byte_offset: 4
+        bit_offset: 0
+        bit_length: 8
+        signed: false
+        enum:
+          standby: 0
+          running: 1
+          safe_stop: 2
+          fault: 3
+      fault_code:
+        byte_offset: 5
+        bit_offset: 0
+        bit_length: 8
+        signed: false
+      state_counter:
+        byte_offset: 6
+        bit_offset: 0
+        bit_length: 4
+        signed: false
+      echoed_control_counter:
+        byte_offset: 6
+        bit_offset: 4
+        bit_length: 4
+        signed: false
+      crc:
+        byte_offset: 7
+        bit_offset: 0
+        bit_length: 8
+        signed: false
+
+validation:
+  reject_wrong_dlc: true
+  reject_extended_frame: true
+  reject_remote_frame: true
+  reject_nonzero_reserved_bits: true

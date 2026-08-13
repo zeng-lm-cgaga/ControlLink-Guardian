@@ -6,11 +6,11 @@ find_package(builtin_interfaces REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
 rosidl_generate_interfaces(${PROJECT_NAME}
-  "msg/ControlCommand.msg"
-  "msg/GatewayState.msg"
-  "msg/SourceStatus.msg"
-  "msg/VehicleState.msg"
-  DEPENDENCIES builtin_interfaces
+	"msg/ControlCommand.msg"
+	"msg/GatewayState.msg"
+	"msg/SourceStatus.msg"
+	"msg/VehicleState.msg"
+	DEPENDENCIES builtin_interfaces
 )
 
 ament_export_dependencies(rosidl_default_runtime)

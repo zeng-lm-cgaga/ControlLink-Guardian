@@ -1,14 +1,22 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>control_link_gateway</name>
-  <version>0.1.0</version>
-  <description>Lifecycle control gateway and deterministic data-plane rules for ControlLink Guardian.</description>
-  <maintainer email="zenglm707@gmail.com">zeng-lm-cgaga</maintainer>
-  <license>Apache-2.0</license>
+	<name>control_link_gateway</name>
+	<version>0.1.0</version>
+	<description>Lifecycle control gateway and deterministic data-plane rules for ControlLink Guardian.</description>
+	<maintainer email="zenglm707@gmail.com">zeng-lm-cgaga</maintainer>
+	<license>Apache-2.0</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+	<buildtool_depend>ament_cmake</buildtool_depend>
+	<depend>builtin_interfaces</depend>
+	<depend>control_link_contract</depend>
+	<depend>control_link_interfaces</depend>
+	<depend>diagnostic_msgs</depend>
+	<depend>lifecycle_msgs</depend>
+	<depend>rclcpp</depend>
+	<depend>rclcpp_lifecycle</depend>
+	<depend>rmw</depend>
 
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+	<export>
+		<build_type>ament_cmake</build_type>
+	</export>
 </package>

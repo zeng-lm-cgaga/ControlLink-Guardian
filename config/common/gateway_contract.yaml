@@ -45,6 +45,8 @@ qos_profiles:
     durability: volatile
     history: keep_last
     depth: 10
+    liveliness: automatic
+    liveliness_lease_duration_ms: 300
 
 input:
   topic_prefix: /control_link/input

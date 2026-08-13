@@ -12,6 +12,7 @@ uint16 REJECT_STALE=9
 uint16 REJECT_SEQUENCE_NOT_INCREASING=10
 uint16 REJECT_CLOCK_INVALID=11
 uint16 REJECT_HOLD_NONZERO=12
+uint16 REJECT_INVALID_STAMP=13
 
 # 每条消息只描述一个配置来源；consumer 按 source_id 聚合。
 # 与本来源状态快照对应的 ROS time 观测时间。

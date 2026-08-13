@@ -1,14 +1,50 @@
 <?xml version="1.0"?>
 <package format="3">
-  <name>control_link_bringup</name>
-  <version>0.1.0</version>
-  <description>Launch and profile assembly package for ControlLink Guardian.</description>
-  <maintainer email="zenglm707@gmail.com">zeng-lm-cgaga</maintainer>
-  <license>Apache-2.0</license>
+	<name>control_link_bringup</name>
+	<version>0.1.0</version>
+	<description>Launch and profile assembly package for ControlLink Guardian.</description>
+	<maintainer email="zenglm707@gmail.com">zeng-lm-cgaga</maintainer>
+	<license>Apache-2.0</license>
 
-  <buildtool_depend>ament_cmake</buildtool_depend>
+	<buildtool_depend>ament_cmake</buildtool_depend>
+	<buildtool_depend>ament_cmake_python</buildtool_depend>
+	<depend>control_link_contract</depend>
+	<depend>control_link_adapters</depend>
+	<depend>control_link_interfaces</depend>
+	<depend>controller_manager_msgs</depend>
+	<depend>geometry_msgs</depend>
+	<depend>lifecycle_msgs</depend>
+	<depend>nav2_msgs</depend>
+	<depend>nav_msgs</depend>
+	<depend>nlohmann-json-dev</depend>
+	<depend>rclcpp</depend>
+	<depend>rclcpp_action</depend>
+	<depend>ros_gz_interfaces</depend>
+	<depend>rosgraph_msgs</depend>
+	<depend>tf2</depend>
+	<depend>tf2_ros</depend>
+	<exec_depend>ament_index_python</exec_depend>
+	<exec_depend>controller_manager</exec_depend>
+	<exec_depend>control_link_gateway</exec_depend>
+	<exec_depend>diff_drive_controller</exec_depend>
+	<exec_depend>gz_ros2_control</exec_depend>
+	<exec_depend>joint_state_broadcaster</exec_depend>
+	<exec_depend>launch</exec_depend>
+	<exec_depend>launch_ros</exec_depend>
+	<exec_depend>nav2_bringup</exec_depend>
+	<exec_depend>python3-yaml</exec_depend>
+	<exec_depend>rclpy</exec_depend>
+	<exec_depend>robot_state_publisher</exec_depend>
+	<exec_depend>ros_gz_bridge</exec_depend>
+	<exec_depend>ros_gz_sim</exec_depend>
+	<exec_depend>ros2bag</exec_depend>
+	<exec_depend>sensor_msgs</exec_depend>
+	<exec_depend>xacro</exec_depend>
+	<test_depend>launch_testing_ament_cmake</test_depend>
+	<test_depend>launch_testing_ros</test_depend>
+	<test_depend>python3-pytest</test_depend>
 
-  <export>
-    <build_type>ament_cmake</build_type>
-  </export>
+	<export>
+		<build_type>ament_cmake</build_type>
+	</export>
 </package>

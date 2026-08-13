@@ -19,8 +19,10 @@ adapter:
   type: ros2_control
   config: ros2_control.yaml
   canonical_input_topic: /control_link/output/control_cmd
+  controller_node_fqn: /diff_drive_controller
   controller_output_topic: /diff_drive_controller/cmd_vel
   controller_command_type: geometry_msgs/msg/TwistStamped
+  odometry_topic: /odom
   local_watchdog_timeout_ms: 100
 
 ingress:
@@ -68,7 +70,10 @@ record_topics:
   - /control_link/source_status
   - /control_link/vehicle_state
   - /diagnostics
+  - /clock
   - /tf
   - /tf_static
   - /odom
   - /scan
+  - /navigate_to_pose/_action/status
+  - /navigate_to_pose/_action/feedback

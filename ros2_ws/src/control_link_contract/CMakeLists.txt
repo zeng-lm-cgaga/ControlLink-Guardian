@@ -2,52 +2,60 @@ cmake_minimum_required(VERSION 3.8)
 project(control_link_contract)
 
 if(NOT CMAKE_CXX_STANDARD)
-  set(CMAKE_CXX_STANDARD 17)
+	set(CMAKE_CXX_STANDARD 17)
 endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 find_package(ament_cmake REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rmw REQUIRED)
 
 add_library(${PROJECT_NAME} SHARED
-  src/parser.cpp
+	src/parser.cpp
+	src/can_signal_parser.cpp
+	src/qos_factory.cpp
+	src/compatibility.cpp
+	src/contract_bundle.cpp
+	src/fastdds_environment.cpp
 )
 target_include_directories(${PROJECT_NAME}
-  PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
+	PUBLIC
+		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+		$<INSTALL_INTERFACE:include>
 )
 target_link_libraries(${PROJECT_NAME} PUBLIC yaml-cpp)
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 
 install(
-  DIRECTORY include/
-  DESTINATION include
+	DIRECTORY include/
+	DESTINATION include
 )
 install(
-  TARGETS ${PROJECT_NAME}
-  EXPORT export_${PROJECT_NAME}
-  ARCHIVE DESTINATION lib
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
-  INCLUDES DESTINATION include
+	TARGETS ${PROJECT_NAME}
+	EXPORT export_${PROJECT_NAME}
+	ARCHIVE DESTINATION lib
+	LIBRARY DESTINATION lib
+	RUNTIME DESTINATION bin
+	INCLUDES DESTINATION include
 )
+ament_target_dependencies(${PROJECT_NAME} PUBLIC rclcpp rmw)
 
 if(BUILD_TESTING)
-  find_package(ament_cmake_gtest REQUIRED)
+	find_package(ament_cmake_gtest REQUIRED)
 
-  ament_add_gtest(test_gateway_contract_parser
-    test/test_gateway_contract_parser.cpp
-  )
-  target_link_libraries(test_gateway_contract_parser ${PROJECT_NAME})
-  target_compile_definitions(test_gateway_contract_parser PRIVATE
-    CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
-  )
-  target_compile_options(test_gateway_contract_parser PRIVATE -Wall -Wextra -Wpedantic)
+	ament_add_gtest(test_gateway_contract_parser
+		test/test_gateway_contract_parser.cpp
+	)
+	target_link_libraries(test_gateway_contract_parser ${PROJECT_NAME})
+	target_compile_definitions(test_gateway_contract_parser PRIVATE
+		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
+	)
+	target_compile_options(test_gateway_contract_parser PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
-ament_export_dependencies(yaml_cpp_vendor)
+ament_export_dependencies(rclcpp rmw yaml_cpp_vendor)
 
 ament_package()

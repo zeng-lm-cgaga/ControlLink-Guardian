@@ -1,0 +1,137 @@
+<?xml version="1.0"?>
+<sdf version="1.8">
+	<world name="control_link_flat">
+		<physics name="2ms" type="ignored">
+			<max_step_size>0.002</max_step_size>
+			<real_time_factor>1.0</real_time_factor>
+		</physics>
+
+		<plugin filename="ignition-gazebo-physics-system" name="gz::sim::systems::Physics"/>
+		<plugin filename="ignition-gazebo-user-commands-system" name="gz::sim::systems::UserCommands"/>
+		<plugin filename="ignition-gazebo-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+		<plugin filename="ignition-gazebo-sensors-system" name="gz::sim::systems::Sensors">
+			<render_engine>ogre2</render_engine>
+		</plugin>
+
+		<light type="directional" name="sun">
+			<cast_shadows>true</cast_shadows>
+			<pose>0 0 10 0 0 0</pose>
+			<diffuse>0.8 0.8 0.8 1</diffuse>
+			<specular>0.2 0.2 0.2 1</specular>
+			<direction>-0.5 0.1 -0.9</direction>
+		</light>
+
+		<model name="ground_plane">
+			<static>true</static>
+			<link name="ground_link">
+				<collision name="ground_collision">
+					<geometry>
+						<plane>
+							<normal>0 0 1</normal>
+							<size>20 20</size>
+						</plane>
+					</geometry>
+				</collision>
+				<visual name="ground_visual">
+					<geometry>
+						<plane>
+							<normal>0 0 1</normal>
+							<size>20 20</size>
+						</plane>
+					</geometry>
+					<material>
+						<ambient>0.16 0.18 0.20 1</ambient>
+						<diffuse>0.28 0.31 0.34 1</diffuse>
+					</material>
+				</visual>
+			</link>
+		</model>
+
+		<model name="map_boundary">
+			<static>true</static>
+			<link name="north_wall">
+				<pose>0 3.9 0.25 0 0 0</pose>
+				<collision name="collision">
+					<geometry><box><size>8.0 0.2 0.5</size></box></geometry>
+				</collision>
+				<visual name="visual">
+					<geometry><box><size>8.0 0.2 0.5</size></box></geometry>
+					<material><diffuse>0.35 0.38 0.42 1</diffuse></material>
+				</visual>
+			</link>
+			<link name="south_wall">
+				<pose>0 -3.9 0.25 0 0 0</pose>
+				<collision name="collision">
+					<geometry><box><size>8.0 0.2 0.5</size></box></geometry>
+				</collision>
+				<visual name="visual">
+					<geometry><box><size>8.0 0.2 0.5</size></box></geometry>
+					<material><diffuse>0.35 0.38 0.42 1</diffuse></material>
+				</visual>
+			</link>
+			<link name="east_wall">
+				<pose>3.9 0 0.25 0 0 0</pose>
+				<collision name="collision">
+					<geometry><box><size>0.2 7.6 0.5</size></box></geometry>
+				</collision>
+				<visual name="visual">
+					<geometry><box><size>0.2 7.6 0.5</size></box></geometry>
+					<material><diffuse>0.35 0.38 0.42 1</diffuse></material>
+				</visual>
+			</link>
+			<link name="west_wall">
+				<pose>-3.9 0 0.25 0 0 0</pose>
+				<collision name="collision">
+					<geometry><box><size>0.2 7.6 0.5</size></box></geometry>
+				</collision>
+				<visual name="visual">
+					<geometry><box><size>0.2 7.6 0.5</size></box></geometry>
+					<material><diffuse>0.35 0.38 0.42 1</diffuse></material>
+				</visual>
+			</link>
+		</model>
+
+		<!-- 两个静态障碍物与 control_link_map.pgm 使用同一 world 坐标 -->
+		<model name="north_west_obstacle">
+			<static>true</static>
+			<pose>-1.2 1.2 0.5 0 0 0</pose>
+			<link name="obstacle_link">
+				<collision name="obstacle_collision">
+					<geometry>
+						<box><size>0.8 1.2 1.0</size></box>
+					</geometry>
+				</collision>
+				<visual name="obstacle_visual">
+					<geometry>
+						<box><size>0.8 1.2 1.0</size></box>
+					</geometry>
+					<material>
+						<ambient>0.45 0.12 0.10 1</ambient>
+						<diffuse>0.70 0.20 0.16 1</diffuse>
+					</material>
+				</visual>
+			</link>
+		</model>
+
+		<model name="south_east_obstacle">
+			<static>true</static>
+			<pose>1.1 -1.0 0.5 0 0 0</pose>
+			<link name="obstacle_link">
+				<collision name="obstacle_collision">
+					<geometry>
+						<box><size>1.0 0.8 1.0</size></box>
+					</geometry>
+				</collision>
+				<visual name="obstacle_visual">
+					<geometry>
+						<box><size>1.0 0.8 1.0</size></box>
+					</geometry>
+					<material>
+						<ambient>0.12 0.32 0.18 1</ambient>
+						<diffuse>0.18 0.52 0.28 1</diffuse>
+					</material>
+				</visual>
+			</link>
+		</model>
+	</world>
+</sdf>

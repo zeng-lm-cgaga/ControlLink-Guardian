@@ -458,7 +458,28 @@ END_SYSTEM_TIME="$(date --iso-8601=seconds)"
 END_MONOTONIC_SECONDS="$(cut -d' ' -f1 /proc/uptime)"
 
 STATUS="ERROR"
+
+# A complete measurement is not sufficient evidence when any launch child
+# terminates abnormally. Keep the raw measurements, but fail at the producer
+# boundary so a single run cannot be mistaken for PASS before aggregation.
+LAUNCH_PROCESS_FAILURE=false
+for process_name in \
+	vcan_vehicle_simulator \
+	socketcan_adapter_node \
+	mock_control_source_node \
+	control_link_gateway_node; do
+	if ! grep -Eq "\\[${process_name}-[0-9]+\\]: process has finished cleanly" \
+		"${RUN_DIR}/logs/launch.log"; then
+		LAUNCH_PROCESS_FAILURE=true
+	fi
+done
+if grep -Eq 'process has died|Traceback \\(most recent call last\\)' \
+	"${RUN_DIR}/logs/launch.log"; then
+	LAUNCH_PROCESS_FAILURE=true
+fi
+
 if [[ "${MEASUREMENT_EXIT_CODE}" -eq 0 ]] &&
+	[[ "${LAUNCH_PROCESS_FAILURE}" == false ]] &&
 	jq -e '.completed == true' "${RUN_DIR}/performance/summary.json" >/dev/null 2>&1; then
 	if jq -e '.protocol.protocol_conformant_parameters == true' \
 		"${RUN_DIR}/performance/summary.json" >/dev/null; then

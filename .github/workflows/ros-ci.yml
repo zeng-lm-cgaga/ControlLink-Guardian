@@ -1,0 +1,55 @@
+name: ROS 2 CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ros-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: Humble build and headless tests
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      ROS_DISTRO: humble
+      ROS_DOMAIN_ID: 210
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install ROS 2 Humble
+        uses: ros-tooling/setup-ros@649ef6bcd696da05bc27ceb3fab69d810c0daeab # v0.7
+        with:
+          required-ros-distributions: humble
+
+      - name: Install CI utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq python3-yaml shellcheck
+
+      - name: Build and test
+        run: ./scripts/build_and_test.sh --domain-id "${ROS_DOMAIN_ID}"
+
+      - name: Upload test and link-audit evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ros2-ci-evidence
+          path: |
+            ros2_ws/log/e12
+            ros2_ws/build/e12/*/test_results
+          if-no-files-found: warn
+          retention-days: 7

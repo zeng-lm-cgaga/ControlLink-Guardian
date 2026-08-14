@@ -50,8 +50,7 @@ namespace control_link_adapters
 		void publish_vehicle_state();
 		void publish_diagnostics();
 
-		[[nodiscard]] std::optional<CanFrame> make_periodic_control_frame(
-			std::chrono::steady_clock::time_point now);
+		[[nodiscard]] std::optional<CanFrame> make_periodic_control_frame();
 		[[nodiscard]] CanFrame make_control_frame_locked(
 			CanControlMode mode,
 			double speed_mps,

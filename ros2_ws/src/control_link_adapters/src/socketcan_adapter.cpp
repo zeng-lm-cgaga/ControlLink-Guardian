@@ -309,9 +309,9 @@ namespace control_link_adapters
 			{
 				handle_can_error(error);
 			},
-			[this](std::chrono::steady_clock::time_point now)
+			[this](std::chrono::steady_clock::time_point)
 			{
-				return make_periodic_control_frame(now);
+				return make_periodic_control_frame();
 			},
 			[this](const CanFrame &frame)
 			{
@@ -485,10 +485,11 @@ namespace control_link_adapters
 		last_can_io_error_ = error;
 	}
 
-	std::optional<CanFrame> SocketCanAdapter::make_periodic_control_frame(
-		std::chrono::steady_clock::time_point now)
+	std::optional<CanFrame> SocketCanAdapter::make_periodic_control_frame()
 	{
 		std::lock_guard<std::mutex> lock{runtime_mutex_};
+		// canonical callback 也在此锁内刷新 watchdog，评估时间必须在锁内后取
+		const auto now = std::chrono::steady_clock::now();
 		if (force_next_hold_)
 		{
 			force_next_hold_ = false;
@@ -704,10 +705,11 @@ namespace control_link_adapters
 			return;
 		}
 
-		const auto now_steady = std::chrono::steady_clock::now();
 		VehicleState state;
 		{
 			std::lock_guard<std::mutex> lock{runtime_mutex_};
+			// 与 CAN snapshot 在同一临界区取时，避免锁等待期间的新帧晚于旧 now
+			const auto now_steady = std::chrono::steady_clock::now();
 			mark_can_timeout_locked(now_steady);
 			state = compose_vehicle_state_locked(now_ros_ns, now_steady);
 		}

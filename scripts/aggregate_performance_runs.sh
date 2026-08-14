@@ -231,6 +231,7 @@ PY
 done
 
 GENERATED_AT="$(date --iso-8601=seconds)"
+AGGREGATE_TEMP_PATH="${TEMP_DIR}/aggregate.json"
 jq -s \
 	--arg generated_at "${GENERATED_AT}" \
 	--arg git_commit "${EXPECTED_COMMIT}" '
@@ -246,11 +247,11 @@ jq -s \
 			p99_ms: range($values | map(.p99)),
 			max_ms: range($values | map(.max))
 		};
-	def resource_envelope($runs; $label):
+	def resource_envelope($runs; $resource_name):
 		{
-			cpu_mean_percent: range($runs | map(.resources[$label].cpu_percent.mean)),
-			cpu_max_percent: range($runs | map(.resources[$label].cpu_percent.max)),
-			rss_max_kib: range($runs | map(.resources[$label].rss_kib.max))
+			cpu_mean_percent: range($runs | map(.resources[$resource_name].cpu_percent.mean)),
+			cpu_max_percent: range($runs | map(.resources[$resource_name].cpu_percent.max)),
+			rss_max_kib: range($runs | map(.resources[$resource_name].rss_kib.max))
 		};
 	. as $runs |
 	{
@@ -288,8 +289,10 @@ jq -s \
 			source: resource_envelope($runs; "source"),
 			observer: resource_envelope($runs; "observer")
 		}
-	}' "${TEMP_DIR}"/*.run.json > "${OUTPUT_PATH}"
+	}' "${TEMP_DIR}"/*.run.json > "${AGGREGATE_TEMP_PATH}" ||
+	fail "aggregate jq generation failed" 7
 
-jq -e '.validated == true and .run_count == 3' "${OUTPUT_PATH}" >/dev/null ||
+jq -e '.validated == true and .run_count == 3' "${AGGREGATE_TEMP_PATH}" >/dev/null ||
 	fail "aggregate summary self-check failed" 7
+mv -- "${AGGREGATE_TEMP_PATH}" "${OUTPUT_PATH}"
 printf 'Validated aggregate summary: %s\n' "${OUTPUT_PATH}"

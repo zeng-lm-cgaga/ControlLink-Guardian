@@ -28,7 +28,7 @@ usage()
 		"Options:" \
 		"  --output-root <path>" \
 		"  --domain-id <0..232>" \
-		"  --can-interface <vcan*>" \
+		"  --can-interface <vcanN>" \
 		"  --warmup-seconds <integer>" \
 		"  --measurement-seconds <integer>" \
 		"  --min-output-ticks <integer>" \
@@ -116,8 +116,8 @@ require_unsigned "${MAX_EXTRA_WAIT_SECONDS}" "max-extra-wait-seconds"
 ((MEASUREMENT_SECONDS > 0)) || fail "measurement-seconds must be positive"
 ((MIN_OUTPUT_TICKS > 0)) || fail "min-output-ticks must be positive"
 ((MAX_EXTRA_WAIT_SECONDS > 0)) || fail "max-extra-wait-seconds must be positive"
-[[ "${CAN_INTERFACE}" == vcan* ]] ||
-	fail "performance baseline only accepts an explicit vcan* interface" 3
+[[ "${CAN_INTERFACE}" =~ ^vcan[0-9]+$ ]] ||
+	fail "performance baseline only accepts an explicit vcan<N> interface" 3
 
 [[ -f /opt/ros/humble/setup.bash ]] || fail "ROS2 Humble setup is missing" 3
 [[ -f "${WORKSPACE_DIR}/install/setup.bash" ]] ||
@@ -264,15 +264,18 @@ cleanup_measurement()
 	fi
 	printf 'Stopping measurement process group %s with SIGINT\n' "${MEASUREMENT_PGID}"
 	/bin/kill -INT -- "-${MEASUREMENT_PGID}" 2>/dev/null || true
-	for _ in $(seq 1 20); do
-		if ! process_group_exists "${MEASUREMENT_PGID}"; then
-			wait "${MEASUREMENT_PID}" 2>/dev/null || true
-			MEASUREMENT_PGID=""
-			return
-		fi
-		sleep 0.25
-	done
+	if wait_for_process_group_exit "${MEASUREMENT_PGID}" 20; then
+		wait "${MEASUREMENT_PID}" 2>/dev/null || true
+		MEASUREMENT_PGID=""
+		return
+	fi
 	/bin/kill -TERM -- "-${MEASUREMENT_PGID}" 2>/dev/null || true
+	if wait_for_process_group_exit "${MEASUREMENT_PGID}" 20; then
+		wait "${MEASUREMENT_PID}" 2>/dev/null || true
+		MEASUREMENT_PGID=""
+		return
+	fi
+	/bin/kill -KILL -- "-${MEASUREMENT_PGID}" 2>/dev/null || true
 	wait "${MEASUREMENT_PID}" 2>/dev/null || true
 	MEASUREMENT_PGID=""
 }
@@ -289,15 +292,18 @@ cleanup_secondary_source()
 	fi
 	printf 'Stopping secondary source process group %s with SIGINT\n' "${SECONDARY_SOURCE_PGID}"
 	/bin/kill -INT -- "-${SECONDARY_SOURCE_PGID}" 2>/dev/null || true
-	for _ in $(seq 1 20); do
-		if ! process_group_exists "${SECONDARY_SOURCE_PGID}"; then
-			wait "${SECONDARY_SOURCE_PID}" 2>/dev/null || true
-			SECONDARY_SOURCE_PGID=""
-			return
-		fi
-		sleep 0.25
-	done
+	if wait_for_process_group_exit "${SECONDARY_SOURCE_PGID}" 20; then
+		wait "${SECONDARY_SOURCE_PID}" 2>/dev/null || true
+		SECONDARY_SOURCE_PGID=""
+		return
+	fi
 	/bin/kill -TERM -- "-${SECONDARY_SOURCE_PGID}" 2>/dev/null || true
+	if wait_for_process_group_exit "${SECONDARY_SOURCE_PGID}" 20; then
+		wait "${SECONDARY_SOURCE_PID}" 2>/dev/null || true
+		SECONDARY_SOURCE_PGID=""
+		return
+	fi
+	/bin/kill -KILL -- "-${SECONDARY_SOURCE_PGID}" 2>/dev/null || true
 	wait "${SECONDARY_SOURCE_PID}" 2>/dev/null || true
 	SECONDARY_SOURCE_PGID=""
 }
@@ -308,6 +314,19 @@ process_group_exists()
 	ps -eo pgid= | awk -v expected="${group}" '
 		$1 == expected {found = 1; exit}
 		END {exit !found}'
+}
+
+wait_for_process_group_exit()
+{
+	local group="$1"
+	local checks="$2"
+	for _ in $(seq 1 "${checks}"); do
+		if ! process_group_exists "${group}"; then
+			return 0
+		fi
+		sleep 0.25
+	done
+	! process_group_exists "${group}"
 }
 
 cleanup_all()

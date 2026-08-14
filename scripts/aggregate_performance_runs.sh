@@ -45,15 +45,27 @@ command -v python3 >/dev/null || fail "python3 is required" 3
 command -v sha256sum >/dev/null || fail "sha256sum is required" 3
 python3 -c 'import yaml' >/dev/null 2>&1 || fail "Python PyYAML is required" 3
 
+OUTPUT_PATH="$(realpath -m -- "${OUTPUT_PATH}")"
 OUTPUT_PARENT="$(dirname -- "${OUTPUT_PATH}")"
 [[ -d "${OUTPUT_PARENT}" ]] || fail "output parent does not exist: ${OUTPUT_PARENT}"
-OUTPUT_PATH="$(realpath -m -- "${OUTPUT_PATH}")"
+OUTPUT_PARENT="$(realpath -e -- "${OUTPUT_PARENT}")" ||
+	fail "cannot resolve output parent: ${OUTPUT_PARENT}"
+OUTPUT_PATH="$(realpath -m -- "${OUTPUT_PARENT}/$(basename -- "${OUTPUT_PATH}")")"
 [[ ! -e "${OUTPUT_PATH}" ]] || fail "output already exists: ${OUTPUT_PATH}"
 
 TEMP_DIR="$(mktemp -d)"
-trap 'rm -rf -- "${TEMP_DIR}"' EXIT
+AGGREGATE_TEMP_PATH=""
+cleanup_temporary_files()
+{
+	rm -rf -- "${TEMP_DIR}"
+	if [[ -n "${AGGREGATE_TEMP_PATH}" ]]; then
+		rm -f -- "${AGGREGATE_TEMP_PATH}"
+	fi
+}
+trap cleanup_temporary_files EXIT
 
 declare -A SEEN_RUN_DIRS=()
+declare -A SEEN_RUN_IDS=()
 EXPECTED_COMMIT=""
 index=0
 
@@ -83,6 +95,7 @@ for requested_run_dir in "${RUN_DIRS[@]}"; do
 		[[ -f "${required_path}" ]] || fail "required run artifact is missing: ${required_path}" 7
 	done
 
+	declare -A SEEN_ARTIFACT_PATHS=()
 	HASH_LINE_COUNT=0
 	while IFS= read -r hash_line || [[ -n "${hash_line}" ]]; do
 		((HASH_LINE_COUNT += 1))
@@ -96,6 +109,9 @@ for requested_run_dir in "${RUN_DIRS[@]}"; do
 			fail "unexpected path in SHA-256 manifest: ${artifact_path}" 7
 			;;
 		esac
+		[[ -z "${SEEN_ARTIFACT_PATHS[${artifact_path}]:-}" ]] ||
+			fail "duplicate path in SHA-256 manifest: ${artifact_path}" 7
+		SEEN_ARTIFACT_PATHS["${artifact_path}"]=1
 		[[ "${artifact_path}" != /* && "${artifact_path}" != *".."* ]] ||
 			fail "unsafe path in SHA-256 manifest: ${artifact_path}" 7
 	done < "${HASH_PATH}"
@@ -113,11 +129,37 @@ import pathlib
 import sys
 
 import yaml
+from yaml.constructor import ConstructorError
+
+
+class UniqueKeyLoader(yaml.SafeLoader):
+	pass
+
+
+def construct_unique_mapping(loader, node, deep=False):
+	mapping = {}
+	for key_node, value_node in node.value:
+		key = loader.construct_object(key_node, deep=deep)
+		if key in mapping:
+			raise ConstructorError(
+				"while constructing a mapping",
+				node.start_mark,
+				"duplicate key: " + repr(key),
+				key_node.start_mark,
+			)
+		mapping[key] = loader.construct_object(value_node, deep=deep)
+	return mapping
+
+
+UniqueKeyLoader.add_constructor(
+	yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+	construct_unique_mapping,
+)
 
 source_path = pathlib.Path(sys.argv[1])
 output_path = pathlib.Path(sys.argv[2])
 with source_path.open("r", encoding="utf-8") as source:
-	manifest = yaml.safe_load(source)
+	manifest = yaml.load(source, Loader=UniqueKeyLoader)
 if not isinstance(manifest, dict):
 	raise SystemExit("run manifest root must be a map: " + str(source_path))
 with output_path.open("x", encoding="utf-8") as output:
@@ -127,12 +169,15 @@ PY
 	jq -e '
 		.schema_version == 1 and
 		.profile == "adas" and
+		(.run_id | type == "string") and
+		(.run_id | strings | test("^[A-Za-z0-9._-]+$")) and
 		.status == "PASS" and
 		.scope == "VM_ONLY_ADAS_EXTERNAL_OBSERVER" and
 		.git_dirty == false and
 		.build_type == "RelWithDebInfo" and
 		.rmw == "rmw_fastrtps_cpp" and
-		(.git_commit | type == "string" and length == 40) and
+		(.git_commit | type == "string") and
+		(.git_commit | strings | test("^[0-9a-f]{40}$")) and
 		(.ros_domain_id | type == "number" and . >= 0 and . <= 232) and
 		.warmup_seconds == 30 and
 		.measurement_seconds == 300 and
@@ -143,6 +188,10 @@ PY
 		fail "manifest protocol validation failed for ${RUN_DIR}" 7
 
 	RUN_COMMIT="$(jq -r '.git_commit' "${MANIFEST_JSON}")"
+	RUN_ID_VALUE="$(jq -r '.run_id' "${MANIFEST_JSON}")"
+	[[ -z "${SEEN_RUN_IDS[${RUN_ID_VALUE}]:-}" ]] ||
+		fail "run id is duplicated: ${RUN_ID_VALUE}" 7
+	SEEN_RUN_IDS["${RUN_ID_VALUE}"]=1
 	if [[ -z "${EXPECTED_COMMIT}" ]]; then
 		EXPECTED_COMMIT="${RUN_COMMIT}"
 	elif [[ "${RUN_COMMIT}" != "${EXPECTED_COMMIT}" ]]; then
@@ -165,11 +214,20 @@ PY
 		(.measurement_end_steady_ns - .measurement_start_steady_ns) >= 300000000000 and
 		.excluded.invalid_control_frames == 0 and
 		.excluded.invalid_state_frames == 0 and
+		(["canonical_delivery_interval_ms", "canonical_delivery_abs_jitter_ms",
+			"observer_callback_to_output_ms", "observer_source_switch_ms",
+			"can_observer_round_trip_ms"] - (.metrics | keys) | length) == 0 and
+		(["gateway", "adapter", "simulator", "source", "observer"] -
+			(.resources | keys) | length) == 0 and
+		(.resources | length) == 5 and
 		([.resources[] |
 			(.cpu_percent.count >= 150 and .rss_kib.count >= 150)] | all)
 	' "${SUMMARY_PATH}" >/dev/null ||
 		fail "summary protocol validation failed for ${RUN_DIR}" 7
 
+	[[ "$(head -n 1 "${OUTPUT_CSV_PATH}")" == \
+		"arrival_steady_ns,interval_ns,interval_ms,signed_jitter_ms,abs_jitter_ms,source_id,source_sequence,mode" ]] ||
+		fail "unexpected canonical output CSV header: ${RUN_DIR}" 7
 	awk -F, 'NR > 1 && $8 != "0" {exit 1}' "${OUTPUT_CSV_PATH}" ||
 		fail "canonical output entered a non-NORMAL mode during ${RUN_DIR}" 7
 	SWITCH_ROWS="$(( $(wc -l < "${SWITCH_CSV_PATH}") - 1 ))"
@@ -231,7 +289,8 @@ PY
 done
 
 GENERATED_AT="$(date --iso-8601=seconds)"
-AGGREGATE_TEMP_PATH="${TEMP_DIR}/aggregate.json"
+# 临时文件放在目标目录同一文件系统，便于用 no-clobber rename 保证结果不可覆盖
+AGGREGATE_TEMP_PATH="$(mktemp "${OUTPUT_PARENT}/.control-link-aggregate.XXXXXX")"
 jq -s \
 	--arg generated_at "${GENERATED_AT}" \
 	--arg git_commit "${EXPECTED_COMMIT}" '
@@ -294,5 +353,9 @@ jq -s \
 
 jq -e '.validated == true and .run_count == 3' "${AGGREGATE_TEMP_PATH}" >/dev/null ||
 	fail "aggregate summary self-check failed" 7
-mv -- "${AGGREGATE_TEMP_PATH}" "${OUTPUT_PATH}"
+mv --no-clobber -- "${AGGREGATE_TEMP_PATH}" "${OUTPUT_PATH}" ||
+	fail "cannot install aggregate output: ${OUTPUT_PATH}" 7
+[[ ! -e "${AGGREGATE_TEMP_PATH}" ]] ||
+	fail "aggregate output was created concurrently: ${OUTPUT_PATH}" 7
+AGGREGATE_TEMP_PATH=""
 printf 'Validated aggregate summary: %s\n' "${OUTPUT_PATH}"

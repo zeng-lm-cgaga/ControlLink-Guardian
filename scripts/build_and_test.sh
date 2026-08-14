@@ -73,8 +73,14 @@ STATUS_PATH="${LOG_BASE}/control_link_ci/status.env"
 on_exit()
 {
 	local exit_code=$?
-	printf 'schema_version=1\nexit_code=%s\nlast_step=%q\n' \
-		"${exit_code}" "${CURRENT_STEP}" > "${STATUS_PATH}"
+	local status_temp_path="${STATUS_PATH}.tmp"
+	# EXIT trap 可能在失败路径执行，先写完整临时文件再安装状态快照
+	if printf 'schema_version=1\nexit_code=%s\nlast_step=%q\n' \
+		"${exit_code}" "${CURRENT_STEP}" > "${status_temp_path}"; then
+		mv --no-clobber -- "${status_temp_path}" "${STATUS_PATH}" ||
+			printf 'WARN: could not install E12 status file: %s\n' "${STATUS_PATH}" >&2
+	fi
+	rm -f -- "${status_temp_path}"
 	if ((exit_code == 0)); then
 		printf 'E12 local pipeline completed successfully\n'
 	else

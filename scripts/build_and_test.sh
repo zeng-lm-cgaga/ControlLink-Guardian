@@ -92,6 +92,9 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID_VALUE}"
 export RMW_IMPLEMENTATION="rmw_fastrtps_cpp"
 export RMW_FASTRTPS_USE_QOS_FROM_XML="0"
 export LIBGL_ALWAYS_SOFTWARE="1"
+# 这台 VM 的内存不足以稳定并行编译 bringup 中多个大型验证工具，
+# 固定 CMake 单作业保证本地与 CI 的构建结果可复现
+export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-1}"
 
 for command_name in colcon python3 readelf ldd realpath; do
 	command -v "${command_name}" >/dev/null || fail "required command is missing: ${command_name}" 3

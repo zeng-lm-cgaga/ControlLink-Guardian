@@ -1,5 +1,6 @@
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -52,6 +53,8 @@ namespace
 			declare_parameter<double>("publish_rate_hz", 25.0);
 			declare_parameter<double>("linear_velocity_mps", 0.25);
 			declare_parameter<double>("angular_velocity_radps", 0.10);
+			declare_parameter<std::int64_t>("startup_delay_ms", 0);
+			declare_parameter<std::int64_t>("minimum_subscription_count", 0);
 
 			const auto profile_path = std::filesystem::path{
 				get_parameter("profile_path").as_string()};
@@ -82,6 +85,25 @@ namespace
 			}
 
 			const auto rate_hz = get_parameter("publish_rate_hz").as_double();
+			const auto startup_delay_ms =
+				get_parameter("startup_delay_ms").as_int();
+			const auto minimum_subscription_count =
+				get_parameter("minimum_subscription_count").as_int();
+			if (startup_delay_ms < 0 || startup_delay_ms > 60'000)
+			{
+				throw std::out_of_range(
+					"mock source startup_delay_ms must be in [0,60000]");
+			}
+			if (minimum_subscription_count < 0 ||
+				minimum_subscription_count > 1024)
+			{
+				throw std::out_of_range(
+					"mock source minimum_subscription_count must be in [0,1024]");
+			}
+			publish_not_before_ = std::chrono::steady_clock::now() +
+				std::chrono::milliseconds{startup_delay_ms};
+			minimum_subscription_count_ =
+				static_cast<std::size_t>(minimum_subscription_count);
 			linear_velocity_mps_ =
 				get_parameter("linear_velocity_mps").as_double();
 			angular_velocity_radps_ =
@@ -113,10 +135,13 @@ namespace
 
 			RCLCPP_INFO(
 				get_logger(),
-				"Mock source ready: source=%s, topic=%s, rate_hz=%.2f",
+				"Mock source ready: source=%s, topic=%s, rate_hz=%.2f, "
+				"startup_delay_ms=%ld, minimum_subscriptions=%zu",
 				source_id_.c_str(),
 				source_iterator->second.topic.c_str(),
-				rate_hz);
+				rate_hz,
+				static_cast<long>(startup_delay_ms),
+				minimum_subscription_count_);
 		}
 
 	private:
@@ -139,6 +164,22 @@ namespace
 
 		void publish_command()
 		{
+			const auto now_steady = std::chrono::steady_clock::now();
+			if (now_steady < publish_not_before_ ||
+				publisher_->get_subscription_count() < minimum_subscription_count_)
+			{
+				return;
+			}
+			if (!publishing_started_)
+			{
+				publishing_started_ = true;
+				RCLCPP_INFO(
+					get_logger(),
+					"Mock source publishing started: source=%s, matched_subscriptions=%zu",
+					source_id_.c_str(),
+					publisher_->get_subscription_count());
+			}
+
 			if (source_sequence_ == std::numeric_limits<std::uint64_t>::max())
 			{
 				RCLCPP_ERROR(
@@ -177,6 +218,9 @@ namespace
 		std::uint64_t source_sequence_{0};
 		double linear_velocity_mps_{0.0};
 		double angular_velocity_radps_{0.0};
+		std::chrono::steady_clock::time_point publish_not_before_{};
+		std::size_t minimum_subscription_count_{0U};
+		bool publishing_started_{false};
 	};
 } // namespace
 

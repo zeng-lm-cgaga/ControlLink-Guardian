@@ -433,6 +433,8 @@ if [[ "${SOURCE_SWITCH_SCENARIO}" == true ]]; then
 		-p "profile_path:=${PROFILE_PATH}"
 		-p "config_root:=${CONFIG_ROOT}"
 		-p "source_id:=teleop"
+		-p "startup_delay_ms:=1000"
+		-p "minimum_subscription_count:=2"
 	)
 	printf 'Secondary source command:'
 	printf ' %q' "${SECONDARY_SOURCE_COMMAND[@]}"

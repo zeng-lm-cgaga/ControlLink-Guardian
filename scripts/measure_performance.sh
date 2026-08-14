@@ -12,6 +12,10 @@ WARMUP_SECONDS=30
 MEASUREMENT_SECONDS=300
 MIN_OUTPUT_TICKS=10000
 MAX_EXTRA_WAIT_SECONDS=60
+MAX_WARMUP_SECONDS=86400
+MAX_MEASUREMENT_SECONDS=86400
+MAX_MIN_OUTPUT_TICKS=1000000000
+MAX_EXTRA_WAIT_LIMIT=86400
 SOURCE_SWITCH_SCENARIO=false
 LAUNCH_PID=""
 LAUNCH_PGID=""
@@ -47,6 +51,19 @@ require_unsigned()
 	local value="$1"
 	local field="$2"
 	[[ "${value}" =~ ^[0-9]+$ ]] || fail "${field} must be an unsigned integer"
+}
+
+require_bounded_unsigned()
+{
+	local value="$1"
+	local field="$2"
+	local maximum="$3"
+	require_unsigned "${value}" "${field}"
+	# 先按字符串长度拒绝超大输入，再做算术比较，避免 Bash 整数溢出绕过上限
+	if ((${#value} > ${#maximum})) ||
+		((${#value} == ${#maximum} && 10#${value} > 10#${maximum})); then
+		fail "${field} must be at most ${maximum}"
+	fi
 }
 
 while (($# > 0)); do
@@ -107,12 +124,11 @@ done
 
 [[ "${RUN_ID}" =~ ^[A-Za-z0-9._-]+$ ]] ||
 	fail "run-id must match [A-Za-z0-9._-]+"
-require_unsigned "${ROS_DOMAIN_ID_VALUE}" "domain-id"
-((ROS_DOMAIN_ID_VALUE <= 232)) || fail "domain-id must be at most 232"
-require_unsigned "${WARMUP_SECONDS}" "warmup-seconds"
-require_unsigned "${MEASUREMENT_SECONDS}" "measurement-seconds"
-require_unsigned "${MIN_OUTPUT_TICKS}" "min-output-ticks"
-require_unsigned "${MAX_EXTRA_WAIT_SECONDS}" "max-extra-wait-seconds"
+require_bounded_unsigned "${ROS_DOMAIN_ID_VALUE}" "domain-id" 232
+require_bounded_unsigned "${WARMUP_SECONDS}" "warmup-seconds" "${MAX_WARMUP_SECONDS}"
+require_bounded_unsigned "${MEASUREMENT_SECONDS}" "measurement-seconds" "${MAX_MEASUREMENT_SECONDS}"
+require_bounded_unsigned "${MIN_OUTPUT_TICKS}" "min-output-ticks" "${MAX_MIN_OUTPUT_TICKS}"
+require_bounded_unsigned "${MAX_EXTRA_WAIT_SECONDS}" "max-extra-wait-seconds" "${MAX_EXTRA_WAIT_LIMIT}"
 ((MEASUREMENT_SECONDS > 0)) || fail "measurement-seconds must be positive"
 ((MIN_OUTPUT_TICKS > 0)) || fail "min-output-ticks must be positive"
 ((MAX_EXTRA_WAIT_SECONDS > 0)) || fail "max-extra-wait-seconds must be positive"
@@ -129,19 +145,25 @@ source /opt/ros/humble/setup.bash
 source "${WORKSPACE_DIR}/install/setup.bash"
 set -u
 
-command -v ros2 >/dev/null || fail "ros2 is not available" 3
-command -v jq >/dev/null || fail "jq is not available" 3
-command -v setsid >/dev/null || fail "setsid is not available" 3
-command -v sha256sum >/dev/null || fail "sha256sum is not available" 3
-ip link show "${CAN_INTERFACE}" >/dev/null 2>&1 ||
+for command_name in awk cut date git grep ip jq nproc ps ros2 seq setsid sha256sum sleep timeout; do
+	command -v "${command_name}" >/dev/null ||
+		fail "required command is missing: ${command_name}" 3
+done
+CAN_LINK_JSON="$(ip -details -json link show dev "${CAN_INTERFACE}" 2>/dev/null)" ||
 	fail "SocketCAN interface does not exist: ${CAN_INTERFACE}" 3
-ip -details link show "${CAN_INTERFACE}" | grep -q '<[^>]*UP[^>]*>' ||
+jq -e 'length == 1 and .[0].linkinfo.info_kind == "vcan"' \
+	<<< "${CAN_LINK_JSON}" >/dev/null ||
+	fail "performance baseline requires an actual vcan link: ${CAN_INTERFACE}" 3
+jq -e 'length == 1 and (. [0].flags | index("UP") != null)' \
+	<<< "${CAN_LINK_JSON}" >/dev/null ||
 	fail "SocketCAN interface is not UP: ${CAN_INTERFACE}" 3
 
 mkdir -p -- "${OUTPUT_ROOT}"
 OUTPUT_ROOT="$(realpath -- "${OUTPUT_ROOT}")"
 RUN_DIR="${OUTPUT_ROOT}/${RUN_ID}"
-[[ ! -e "${RUN_DIR}" ]] || fail "run directory already exists: ${RUN_DIR}"
+if ! mkdir -- "${RUN_DIR}"; then
+	fail "run directory already exists or cannot be created: ${RUN_DIR}" 7
+fi
 mkdir -p -- \
 	"${RUN_DIR}/contract_snapshot" \
 	"${RUN_DIR}/logs" \

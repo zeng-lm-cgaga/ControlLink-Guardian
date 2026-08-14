@@ -5,6 +5,7 @@ from ament_index_python.packages import get_package_share_directory
 from control_link_bringup.profile_bootstrap import (
 	load_fastdds_profile_path,
 	load_yaml_mapping,
+	require_up_vcan_interface,
 )
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction, TimerAction
@@ -63,6 +64,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		raise RuntimeError(
 			"can_interface must match ADAS Profile adapter.interface; expected=" +
 			configured_interface + "; actual=" + requested_interface)
+	require_up_vcan_interface(requested_interface)
 
 	fastdds_profile_path = load_fastdds_profile_path(profile_path, config_root)
 	participant_env = {
@@ -77,6 +79,8 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	}
 
 	start_source = _bool_argument(context, "start_source")
+	start_lifecycle_activator = _bool_argument(
+		context, "start_lifecycle_activator")
 	start_secondary_source = _bool_argument(context, "start_secondary_source")
 	source_id = LaunchConfiguration("source_id").perform(context)
 	secondary_source_id = LaunchConfiguration("secondary_source_id").perform(context)
@@ -164,7 +168,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 				TimerAction(
 					period=secondary_source_delay_seconds,
 					actions=[secondary_source_node]))
-		actions.extend([
+	actions.append(
 		Node(
 			package="control_link_gateway",
 			executable="control_link_gateway_node",
@@ -174,19 +178,20 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			emulate_tty=True,
 			additional_env=participant_env,
 			parameters=[common_parameters],
-		),
-		Node(
-			package="control_link_bringup",
-			executable="gateway_lifecycle_activator",
-			name="gateway_lifecycle_activator",
-			output="screen",
-			additional_env=participant_env,
-			parameters=[{
-				"target_fqn": "/control_link/gateway",
-				"timeout_ms": 45000,
-			}],
-		),
-	])
+		))
+	if start_lifecycle_activator:
+		actions.append(
+			Node(
+				package="control_link_bringup",
+				executable="gateway_lifecycle_activator",
+				name="gateway_lifecycle_activator",
+				output="screen",
+				additional_env=participant_env,
+				parameters=[{
+					"target_fqn": "/control_link/gateway",
+					"timeout_ms": 45000,
+				}],
+			))
 	return actions
 
 
@@ -201,6 +206,11 @@ def generate_launch_description():
 			"start_source",
 			default_value="true",
 			description="Start one Contract-bound mock planning source",
+		),
+		DeclareLaunchArgument(
+			"start_lifecycle_activator",
+			default_value="true",
+			description="Start the normal Gateway Lifecycle activation gate",
 		),
 		DeclareLaunchArgument(
 			"source_id",

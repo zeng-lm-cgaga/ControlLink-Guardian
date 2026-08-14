@@ -2119,7 +2119,7 @@ namespace control_link_contract
 				const YAML::Node &node,
 				const std::string &path) const
 			{
-				check_keys(node, {"enabled_by_default", "input_namespace", "allow_can_tx"}, path);
+				check_keys(node, {"input_namespace"}, path);
 
 				const auto input_namespace = require_string(
 					node, "input_namespace", child_path(path, "input_namespace"));
@@ -2131,11 +2131,7 @@ namespace control_link_contract
 						"使用以 / 开头且不含通配符的 replay namespace");
 				}
 
-				ReplayConfig result{
-					require_bool(
-						node, "enabled_by_default", child_path(path, "enabled_by_default")),
-					input_namespace,
-					require_bool(node, "allow_can_tx", child_path(path, "allow_can_tx"))};
+				ReplayConfig result{input_namespace};
 				return result;
 			}
 

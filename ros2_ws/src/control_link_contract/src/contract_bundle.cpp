@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <variant>
@@ -34,6 +35,20 @@ namespace control_link_contract
 					return profile.common;
 				},
 				config);
+		}
+
+		std::string node_namespace(const std::string &node_fqn)
+		{
+			const auto separator = node_fqn.rfind('/');
+			if (separator == 0U)
+			{
+				return "/";
+			}
+			if (separator == std::string::npos)
+			{
+				throw std::logic_error("validated Gateway node FQN has no namespace separator");
+			}
+			return node_fqn.substr(0U, separator);
 		}
 
 		void validate_sources(
@@ -174,6 +189,18 @@ namespace control_link_contract
 			}
 
 			const auto &adas = std::get<AdasProfile>(profile);
+			const auto live_gateway_namespace = node_namespace(
+				contract.gateway.node_fqn);
+			if (adas.replay.input_namespace == live_gateway_namespace)
+			{
+				fail_bundle(
+					profile_path,
+					"replay.input_namespace",
+					"replay namespace overlaps the live Gateway namespace",
+					"namespace different from " + live_gateway_namespace,
+					adas.replay.input_namespace,
+					"使用独立 replay namespace，防止录包消息进入 live Topic 或形成回放自激循环");
+			}
 			if (adas.adapter.canonical_input_topic != contract.output.topic)
 			{
 				fail_bundle(

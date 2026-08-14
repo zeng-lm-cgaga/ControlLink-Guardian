@@ -58,6 +58,20 @@ ament_target_dependencies(${PROJECT_NAME}_node
 	rclcpp_lifecycle
 )
 
+if(BUILD_TESTING)
+	find_package(ament_cmake_gtest REQUIRED)
+
+	ament_add_gtest(test_gateway_components
+		test/test_gateway_components.cpp
+	)
+	target_link_libraries(test_gateway_components ${PROJECT_NAME})
+	target_compile_definitions(test_gateway_components PRIVATE
+		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
+		CONTROL_LINK_TEST_SOURCE_POLICY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/source_policy.yaml"
+	)
+	target_compile_options(test_gateway_components PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 install(
 	DIRECTORY include/
 	DESTINATION include

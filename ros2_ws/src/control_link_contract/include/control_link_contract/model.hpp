@@ -355,9 +355,7 @@ namespace control_link_contract
 
 	struct ReplayConfig
 	{
-		bool enabled_by_default;
 		std::string input_namespace;
-		bool allow_can_tx;
 	};
 
 	struct AdasProfile

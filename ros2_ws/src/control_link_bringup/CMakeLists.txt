@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(control_link_bringup)
 
+option(
+	CONTROL_LINK_ENABLE_VCAN_TESTS
+	"Build ADAS launch tests that require an existing vcan0"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -13,6 +19,7 @@ find_package(control_link_contract REQUIRED)
 find_package(control_link_adapters REQUIRED)
 find_package(control_link_interfaces REQUIRED)
 find_package(controller_manager_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(lifecycle_msgs REQUIRED)
 find_package(nav2_msgs REQUIRED)
@@ -61,6 +68,15 @@ add_executable(vcan_vehicle_simulator
 add_executable(measure_runtime
 	tools/measure_runtime.cpp
 )
+add_executable(verify_gateway_lifecycle
+	tools/verify_gateway_lifecycle.cpp
+)
+add_executable(verify_adas_vcan
+	tools/verify_adas_vcan.cpp
+)
+add_executable(replay_input_bridge
+	tools/replay_input_bridge.cpp
+)
 
 target_compile_options(robot_readiness_gate PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(gateway_lifecycle_activator PRIVATE -Wall -Wextra -Wpedantic)
@@ -72,6 +88,9 @@ target_compile_options(verify_robot_controller_loss PRIVATE -Wall -Wextra -Wpeda
 target_compile_options(verify_robot_command_timeout PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(vcan_vehicle_simulator PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(measure_runtime PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(verify_gateway_lifecycle PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(verify_adas_vcan PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(replay_input_bridge PRIVATE -Wall -Wextra -Wpedantic)
 
 ament_target_dependencies(robot_readiness_gate
 	controller_manager_msgs
@@ -144,6 +163,23 @@ ament_target_dependencies(measure_runtime
 	control_link_interfaces
 	rclcpp
 )
+ament_target_dependencies(verify_gateway_lifecycle
+	control_link_contract
+	control_link_interfaces
+	lifecycle_msgs
+	rclcpp
+)
+ament_target_dependencies(verify_adas_vcan
+	control_link_contract
+	control_link_interfaces
+	diagnostic_msgs
+	rclcpp
+)
+ament_target_dependencies(replay_input_bridge
+	control_link_contract
+	control_link_interfaces
+	rclcpp
+)
 target_link_libraries(measure_runtime
 	nlohmann_json::nlohmann_json
 )
@@ -173,14 +209,43 @@ install(
 		verify_robot_command_timeout
 		vcan_vehicle_simulator
 		measure_runtime
+		verify_gateway_lifecycle
+		verify_adas_vcan
+		replay_input_bridge
 	RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
+	find_package(ament_cmake_pytest REQUIRED)
+	ament_add_pytest_test(
+		test_replay_launch_config
+		test/test_replay_launch_config.py
+		ENV
+			CONTROL_LINK_REPLAY_LAUNCH_PATH=${CMAKE_CURRENT_SOURCE_DIR}/launch/replay.launch.py
+	)
 	add_launch_test(
 		test/test_robot_profile_launch.py
 		TIMEOUT 360
 	)
+	add_launch_test(
+		test/test_gateway_lifecycle_launch.py
+		TARGET test_gateway_lifecycle_default_launch
+		TIMEOUT 120
+	)
+	add_launch_test(
+		test/test_gateway_lifecycle_launch.py
+		TARGET test_gateway_lifecycle_shm_launch
+		TIMEOUT 120
+		ENV CONTROL_LINK_TEST_FASTDDS_PROFILE=fastdds_shm_only_profiles.xml
+	)
+	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
+		add_launch_test(
+			test/test_adas_vcan_launch.py
+			TARGET test_adas_vcan_launch
+			TIMEOUT 150
+			ENV ROS_DOMAIN_ID=218
+		)
+	endif()
 endif()
 
 ament_package()

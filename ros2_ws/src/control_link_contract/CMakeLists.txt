@@ -44,6 +44,7 @@ ament_target_dependencies(${PROJECT_NAME} PUBLIC rclcpp rmw)
 
 if(BUILD_TESTING)
 	find_package(ament_cmake_gtest REQUIRED)
+	find_package(std_msgs REQUIRED)
 
 	ament_add_gtest(test_gateway_contract_parser
 		test/test_gateway_contract_parser.cpp
@@ -53,6 +54,19 @@ if(BUILD_TESTING)
 		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
 	)
 	target_compile_options(test_gateway_contract_parser PRIVATE -Wall -Wextra -Wpedantic)
+
+	ament_add_gtest(test_contract_components
+		test/test_contract_components.cpp
+	)
+	target_link_libraries(test_contract_components ${PROJECT_NAME})
+	ament_target_dependencies(test_contract_components rclcpp std_msgs)
+	target_compile_definitions(test_contract_components PRIVATE
+		CONTROL_LINK_TEST_CONFIG_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../config"
+		CONTROL_LINK_TEST_ROBOT_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/robot/robot_profile.yaml"
+		CONTROL_LINK_TEST_ADAS_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/adas_profile.yaml"
+		CONTROL_LINK_TEST_FASTDDS_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/fastdds_default_profiles.xml"
+	)
+	target_compile_options(test_contract_components PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)

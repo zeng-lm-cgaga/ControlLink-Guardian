@@ -49,6 +49,4 @@ record_topics:
   - /diagnostics
 
 replay:
-  enabled_by_default: false
   input_namespace: /replay/control_link
-  allow_can_tx: false

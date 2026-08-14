@@ -67,6 +67,20 @@ trap cleanup_temporary_files EXIT
 declare -A SEEN_RUN_DIRS=()
 declare -A SEEN_RUN_IDS=()
 EXPECTED_COMMIT=""
+EXPECTED_ARTIFACT_PATHS=(
+	contract_snapshot/adas_profile.yaml
+	contract_snapshot/can_signal_map.yaml
+	contract_snapshot/fastdds_default_profiles.xml
+	contract_snapshot/gateway_contract.yaml
+	contract_snapshot/source_policy.yaml
+	environment.json
+	performance/callback_to_output.csv
+	performance/can_round_trip.csv
+	performance/output_ticks.csv
+	performance/resources.csv
+	performance/source_switch.csv
+	performance/summary.json
+)
 index=0
 
 for requested_run_dir in "${RUN_DIRS[@]}"; do
@@ -99,6 +113,8 @@ for requested_run_dir in "${RUN_DIRS[@]}"; do
 	HASH_LINE_COUNT=0
 	while IFS= read -r hash_line || [[ -n "${hash_line}" ]]; do
 		((HASH_LINE_COUNT += 1))
+		[[ "${hash_line}" =~ ^[0-9a-fA-F]{64}[[:space:]][[:space:]][^[:space:]].*$ ]] ||
+			fail "malformed SHA-256 line in ${HASH_PATH}" 7
 		artifact_path="${hash_line#*  }"
 		[[ "${artifact_path}" != "${hash_line}" ]] ||
 			fail "malformed SHA-256 line in ${HASH_PATH}" 7
@@ -117,6 +133,10 @@ for requested_run_dir in "${RUN_DIRS[@]}"; do
 	done < "${HASH_PATH}"
 	((HASH_LINE_COUNT == 12)) ||
 		fail "unexpected SHA-256 artifact count in ${RUN_DIR}: ${HASH_LINE_COUNT}" 7
+	for expected_artifact in "${EXPECTED_ARTIFACT_PATHS[@]}"; do
+		[[ -n "${SEEN_ARTIFACT_PATHS[${expected_artifact}]:-}" ]] ||
+			fail "required artifact is not covered by SHA-256 manifest: ${RUN_DIR}/${expected_artifact}" 7
+	done
 	(
 		cd -- "${RUN_DIR}"
 		sha256sum --strict -c artifact_sha256.txt >/dev/null
@@ -178,7 +198,7 @@ PY
 		.rmw == "rmw_fastrtps_cpp" and
 		(.git_commit | type == "string") and
 		(.git_commit | strings | test("^[0-9a-f]{40}$")) and
-		(.ros_domain_id | type == "number" and . >= 0 and . <= 232) and
+		(.ros_domain_id | type == "number" and floor == . and . >= 0 and . <= 232) and
 		.warmup_seconds == 30 and
 		.measurement_seconds == 300 and
 		.minimum_output_ticks == 10000 and
@@ -189,6 +209,8 @@ PY
 
 	RUN_COMMIT="$(jq -r '.git_commit' "${MANIFEST_JSON}")"
 	RUN_ID_VALUE="$(jq -r '.run_id' "${MANIFEST_JSON}")"
+	[[ "${RUN_ID_VALUE}" == "$(basename -- "${RUN_DIR}")" ]] ||
+		fail "manifest run_id does not match run directory: ${RUN_ID_VALUE}" 7
 	[[ -z "${SEEN_RUN_IDS[${RUN_ID_VALUE}]:-}" ]] ||
 		fail "run id is duplicated: ${RUN_ID_VALUE}" 7
 	SEEN_RUN_IDS["${RUN_ID_VALUE}"]=1

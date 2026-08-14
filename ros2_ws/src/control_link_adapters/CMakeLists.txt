@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(control_link_adapters)
 
+option(
+	CONTROL_LINK_ENABLE_VCAN_TESTS
+	"Build SocketCAN integration tests that require an existing vcan0"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -108,6 +114,39 @@ ament_target_dependencies(twist_ingress_adapter_node
 ament_target_dependencies(socketcan_adapter_node
 	rclcpp
 )
+
+if(BUILD_TESTING)
+	find_package(ament_cmake_gtest REQUIRED)
+
+	ament_add_gtest(test_adapter_core
+		test/test_adapter_core.cpp
+	)
+	target_link_libraries(test_adapter_core ${PROJECT_NAME})
+	target_compile_definitions(test_adapter_core PRIVATE
+		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
+	)
+	target_compile_options(test_adapter_core PRIVATE -Wall -Wextra -Wpedantic)
+
+	ament_add_gtest(test_can_codec
+		test/test_can_codec.cpp
+	)
+	target_link_libraries(test_can_codec ${PROJECT_NAME})
+	target_compile_definitions(test_can_codec PRIVATE
+		CONTROL_LINK_TEST_CAN_SIGNAL_MAP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/can_signal_map.yaml"
+	)
+	target_compile_options(test_can_codec PRIVATE -Wall -Wextra -Wpedantic)
+
+	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
+		ament_add_gtest(test_socketcan_transport
+			test/test_socketcan_transport.cpp
+		)
+		target_link_libraries(test_socketcan_transport ${PROJECT_NAME})
+		target_compile_options(
+			test_socketcan_transport
+			PRIVATE -Wall -Wextra -Wpedantic
+		)
+	endif()
+endif()
 
 install(
 	DIRECTORY include/

@@ -7,6 +7,7 @@ WORKSPACE_DIR="${ROOT_DIR}/ros2_ws"
 BUILD_BASE="${WORKSPACE_DIR}/build/e12"
 INSTALL_BASE="${WORKSPACE_DIR}/install/e12"
 LOG_BASE="${WORKSPACE_DIR}/log/e12"
+E12_LOCK_PATH="${TMPDIR:-/tmp}/control_link_guardian_e12.lock"
 ROS_DISTRO_VALUE="${ROS_DISTRO:-humble}"
 ROS_DOMAIN_ID_VALUE=210
 SKIP_ROSDEP=false
@@ -49,12 +50,20 @@ while (($# > 0)); do
 done
 
 [[ "${ROS_DOMAIN_ID_VALUE}" =~ ^[0-9]+$ ]] || fail "domain-id must be unsigned" 2
-((ROS_DOMAIN_ID_VALUE <= 232)) || fail "domain-id must be at most 232" 2
+if ((${#ROS_DOMAIN_ID_VALUE} > 3)) ||
+	((${#ROS_DOMAIN_ID_VALUE} == 3 && 10#${ROS_DOMAIN_ID_VALUE} > 10#232)); then
+	fail "domain-id must be at most 232" 2
+fi
 [[ "${ROS_DISTRO_VALUE}" == "humble" ]] ||
 	fail "E12 is pinned to ROS2 Humble; actual=${ROS_DISTRO_VALUE}" 3
 [[ -d "${WORKSPACE_DIR}/src" ]] || fail "ROS2 workspace source directory is missing" 3
 [[ -f "/opt/ros/${ROS_DISTRO_VALUE}/setup.bash" ]] ||
 	fail "ROS2 ${ROS_DISTRO_VALUE} setup is missing" 3
+command -v flock >/dev/null || fail "required command is missing: flock" 3
+
+# e12 使用固定的 build/install/log 目录，必须禁止两个流水线互相清理证据
+exec 9>"${E12_LOCK_PATH}"
+flock -n 9 || fail "another E12 pipeline is already using the workspace evidence directories" 3
 
 # 只清理脚本独占的 e12 子目录，不触碰开发者日常 build/install/log
 for owned_path in "${BUILD_BASE}" "${INSTALL_BASE}" "${LOG_BASE}"; do
@@ -74,19 +83,33 @@ on_exit()
 {
 	local exit_code=$?
 	local status_temp_path="${STATUS_PATH}.tmp"
+	local status_write_failed=false
 	# EXIT trap 可能在失败路径执行，先写完整临时文件再安装状态快照
-	if printf 'schema_version=1\nexit_code=%s\nlast_step=%q\n' \
+	if ! printf 'schema_version=1\nexit_code=%s\nlast_step=%q\n' \
 		"${exit_code}" "${CURRENT_STEP}" > "${status_temp_path}"; then
-		mv --no-clobber -- "${status_temp_path}" "${STATUS_PATH}" ||
-			printf 'WARN: could not install E12 status file: %s\n' "${STATUS_PATH}" >&2
+		status_write_failed=true
+	else
+		# status.env 属于本次运行，必须原子替换旧快照，否则失败运行会残留旧的成功状态
+		if ! mv --force -- "${status_temp_path}" "${STATUS_PATH}"; then
+			status_write_failed=true
+		fi
 	fi
 	rm -f -- "${status_temp_path}"
+	if [[ "${status_write_failed}" == true ]]; then
+		printf 'ERROR: could not install E12 status file: %s\n' "${STATUS_PATH}" >&2
+		# 原本成功但状态证据无法落盘时，不能继续报告成功；原始失败码保持不变
+		if ((exit_code == 0)); then
+			exit_code=4
+		fi
+	fi
 	if ((exit_code == 0)); then
 		printf 'E12 local pipeline completed successfully\n'
 	else
 		printf 'E12 local pipeline failed: step=%s exit_code=%s\n' \
 			"${CURRENT_STEP}" "${exit_code}" >&2
 	fi
+	trap - EXIT
+	exit "${exit_code}"
 }
 trap on_exit EXIT
 
@@ -216,32 +239,30 @@ set +u
 source "${INSTALL_BASE}/setup.bash"
 set -u
 
-CURRENT_STEP="Contract unit tests"
+CURRENT_STEP="all registered package tests"
 colcon --log-base "${LOG_BASE}" test \
 	--base-paths src \
 	--build-base "${BUILD_BASE}" \
 	--install-base "${INSTALL_BASE}" \
 	--test-result-base "${BUILD_BASE}" \
-	--packages-select control_link_contract \
-	--executor sequential \
-	--event-handlers console_direct+ \
-	--return-code-on-test-failure
-
-CURRENT_STEP="Robot headless launch test"
-colcon --log-base "${LOG_BASE}" test \
-	--base-paths src \
-	--build-base "${BUILD_BASE}" \
-	--install-base "${INSTALL_BASE}" \
-	--test-result-base "${BUILD_BASE}" \
-	--packages-select control_link_bringup \
+	--packages-select \
+		control_link_interfaces \
+		control_link_contract \
+		control_link_gateway \
+		control_link_adapters \
+		control_link_bringup \
 	--executor sequential \
 	--event-handlers console_direct+ \
 	--return-code-on-test-failure
 
 CURRENT_STEP="colcon test result audit"
+TEST_RESULT_PATH="${LOG_BASE}/control_link_ci/test-result.txt"
 colcon test-result \
 	--test-result-base "${BUILD_BASE}" \
-	--verbose
+	--verbose | tee "${TEST_RESULT_PATH}"
+grep -Eq 'Summary: [1-9][0-9]* tests, 0 errors, 0 failures, 0 skipped' \
+	"${TEST_RESULT_PATH}" ||
+	fail "test-result audit did not report a non-empty, clean test suite" 4
 
 CURRENT_STEP="dynamic link audit"
 LDD_LOG_PATH="${LOG_BASE}/control_link_ci/ldd-r.log"

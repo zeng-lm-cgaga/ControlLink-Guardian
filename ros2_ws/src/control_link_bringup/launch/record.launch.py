@@ -5,42 +5,12 @@ import re
 from ament_index_python.packages import get_package_share_directory
 from control_link_bringup.profile_bootstrap import (
 	load_fastdds_profile_path,
+	load_record_topics,
 	load_yaml_mapping,
 )
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
-from rclpy.exceptions import InvalidTopicNameException
-from rclpy.validate_full_topic_name import validate_full_topic_name
-
-
-def _record_topics(profile, profile_path):
-	topics = profile.get("record_topics")
-	if not isinstance(topics, list) or not topics:
-		raise RuntimeError(
-			profile_path +
-			":record_topics: wrong YAML value; expected=non-empty sequence")
-
-	result = []
-	seen = set()
-	for index, topic in enumerate(topics):
-		field_path = profile_path + ":record_topics[" + str(index) + "]"
-		if not isinstance(topic, str) or not topic:
-			raise RuntimeError(
-				field_path +
-				": wrong YAML value; expected=non-empty absolute ROS Topic name")
-		try:
-			validate_full_topic_name(topic)
-		except InvalidTopicNameException as error:
-			raise RuntimeError(
-				field_path + ": invalid ROS Topic name; actual=" + topic +
-				"; reason=" + str(error)) from error
-		if topic in seen:
-			raise RuntimeError(
-				field_path + ": duplicate record Topic; actual=" + topic)
-		seen.add(topic)
-		result.append(topic)
-	return result
 
 
 def _non_negative_integer(context, argument_name):
@@ -71,7 +41,7 @@ def _launch_recorder(context, *args, **kwargs):
 			"profile_id mismatch; expected=" + profile_id + "; actual=" +
 			str(profile.get("profile_id")))
 
-	topics = _record_topics(profile, profile_path)
+	topics = load_record_topics(profile, profile_path)
 	use_sim_time = profile.get("use_sim_time")
 	if not isinstance(use_sim_time, bool):
 		raise RuntimeError(

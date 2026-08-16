@@ -27,6 +27,9 @@ Nav2 / teleop / planning-control
 - Lifecycle 资源管理、双 callback group、结构化 GatewayState、SourceStatus、VehicleState 和 diagnostics
 - 固定 50Hz canonical 输出，非 ACTIVE 数据面状态持续发布软件层 HOLD
 - adapter 本地看门狗和执行端结构化健康反馈，覆盖网关停发与平台反馈超时
+- 基于语义配置哈希的 Contract 身份追踪，以及 Lifecycle 事务式重配置、Graph 验证和失败回滚
+- 决策事件 JSONL 记录与离线确定性回放，复用生产 Validator、Arbiter 和 GatewayStateMachine
+- 可由 ros2_control 加载的 mock `hardware_interface::SystemInterface`，支持执行链和故障传播验证
 
 ## 两种运行 Profile
 
@@ -54,6 +57,13 @@ Robot 与 ADAS 复用相同的 Contract、命令校验、来源仲裁和状态�
 Robot Profile 使用 Nav2、AMCL、tf2、ros2_control 和 Gazebo，Gateway 的 canonical command 只能经执行 adapter 进入 `diff_drive_controller`
 
 ![Robot Profile 的 Gazebo 仿真闭环](assets/机器人仿真闭环.png)
+
+## 运行演示
+
+- [Robot Profile：Nav2、Guardian、ros2_control 与 Gazebo 控制闭环](assets/机器人控制闭环演示_1080p60.webm)
+- [ADAS Profile：Guardian、SocketCAN/vcan 与车辆状态反馈闭环](assets/ADAS控制闭环演示_1080p60.webm)
+
+两段视频均以 1080p60 录制，分别展示 Robot 与 ADAS 运行链路中的网关状态、控制输入、canonical 输出和执行端反馈
 
 ## 快速运行
 
@@ -106,7 +116,15 @@ source switch 每轮只有一个外部观察样本，起点不是 Gateway 内部
 
 ## 技术栈
 
-`C++17` · `ROS2 Humble` · `rclcpp Lifecycle` · `Fast DDS / RMW` · `yaml-cpp` · `Nav2` · `tf2` · `ros2_control` · `Gazebo` · `SocketCAN / vcan` · `rosbag2` · `GTest / launch_test`
+| 层次 | 技术与接口 |
+|---|---|
+| C++ 工程 | C++17、CMake、ament_cmake、colcon、RAII、标准库并发与 filesystem |
+| ROS2 运行时 | ROS2 Humble、rclcpp Lifecycle、MultiThreadedExecutor、callback group、ROS Graph、rosidl、diagnostics |
+| DDS 通信 | Fast DDS、RMW、QoS Request-vs-Offered compatibility、endpoint GID、SHM transport |
+| 机器人系统 | Nav2、AMCL、tf2、ros2_control、pluginlib、diff_drive_controller、Gazebo |
+| Linux 与车辆链路 | SocketCAN/PF_CAN、vcan、poll、eventfd、独立 I/O thread、CRC 与 rolling counter |
+| 配置与可靠性 | yaml-cpp、OpenSSL SHA-256、JSONL decision trace、确定性回放、事务式重配置与回滚 |
+| 测试与证据 | GTest、launch_testing、pytest、rosbag2、ldd -r、GitHub Actions |
 
 ## 能力边界
 

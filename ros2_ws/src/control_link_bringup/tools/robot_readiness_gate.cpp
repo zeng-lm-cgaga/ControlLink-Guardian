@@ -131,6 +131,8 @@ namespace
 			"map_frame", "map");
 		const auto base_frame = node->declare_parameter<std::string>(
 			"base_frame", "base_footprint");
+		const auto controller_manager_fqn = node->declare_parameter<std::string>(
+			"controller_manager_fqn", "");
 		if (phase != "controllers" && phase != "nav2")
 		{
 			throw std::invalid_argument(
@@ -139,6 +141,12 @@ namespace
 		if (timeout_ms <= 0)
 		{
 			throw std::invalid_argument("timeout_ms must be positive");
+		}
+		if (phase == "controllers" &&
+			(controller_manager_fqn.empty() || controller_manager_fqn.front() != '/'))
+		{
+			throw std::invalid_argument(
+				"controller_manager_fqn must be an absolute node FQN");
 		}
 
 		rclcpp::executors::SingleThreadedExecutor executor;
@@ -151,7 +159,7 @@ namespace
 		if (phase == "controllers")
 		{
 			auto controllers_client = node->create_client<ListControllers>(
-				"/controller_manager/list_controllers");
+				controller_manager_fqn + "/list_controllers");
 			while (rclcpp::ok() && std::chrono::steady_clock::now() < deadline)
 			{
 				executor.spin_some();

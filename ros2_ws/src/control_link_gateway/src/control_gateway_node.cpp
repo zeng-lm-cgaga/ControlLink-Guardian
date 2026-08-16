@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -32,6 +33,9 @@ namespace control_link_gateway
 	{
 		constexpr char kProfilePathParameter[] = "profile_path";
 		constexpr char kConfigRootParameter[] = "config_root";
+		constexpr char kDecisionTracePathParameter[] = "decision_trace_path";
+		constexpr char kDecisionTraceQueueCapacityParameter[] =
+			"decision_trace_queue_capacity";
 		constexpr char kCanonicalConsumerId[] = "canonical_output_consumer";
 		constexpr char kVehicleStateProducerId[] = "vehicle_state_producer";
 
@@ -97,21 +101,7 @@ namespace control_link_gateway
 					std::ceil(period_ns))};
 		}
 
-		bool recovery_health_is_healthy(
-			const GatewayHealthSnapshot &health) noexcept
-		{
-			return health.critical_endpoints_healthy &&
-				health.critical_qos_compatible &&
-				health.ros_clock_healthy &&
-				health.vehicle_state_valid &&
-				health.vehicle_state_fresh &&
-				!health.vehicle_reports_safe_stop &&
-				!health.vehicle_reports_fault &&
-				health.output_tick_healthy &&
-				health.internal_invariants_healthy;
-		}
-
-	builtin_interfaces::msg::Time ros_time_message(
+		builtin_interfaces::msg::Time ros_time_message(
 			std::int64_t nanoseconds)
 		{
 			if (nanoseconds < 0)
@@ -216,43 +206,8 @@ namespace control_link_gateway
 				0.0 : static_cast<double>(nanoseconds) / kNanosecondsPerMillisecond;
 		}
 
-		control_link_interfaces::msg::ControlCommand make_canonical_command(
-			const StateMachineDecision &decision)
-		{
-			using Message = control_link_interfaces::msg::ControlCommand;
-			Message message;
-
-			if (decision.state == DataState::kActive && !decision.selected.has_value())
-			{
-				throw std::logic_error(
-					"ACTIVE Gateway decision has no selected source");
-			}
-
-			if (decision.selected.has_value())
-			{
-				const auto &selected = decision.selected.value();
-				message.source_stamp = ros_time_message(selected.source_stamp_ns);
-				message.source_id = selected.source_id;
-				message.source_sequence = selected.sequence;
-			}
-
-			if (decision.state != DataState::kActive)
-			{
-				message.mode = Message::MODE_HOLD;
-				message.linear_velocity_mps = 0.0;
-				message.angular_velocity_radps = 0.0;
-				return message;
-			}
-
-			const auto &selected = decision.selected.value();
-			message.mode = static_cast<std::uint8_t>(selected.mode);
-			message.linear_velocity_mps = selected.linear_velocity_mps;
-			message.angular_velocity_radps = selected.angular_velocity_radps;
-			return message;
-		}
-
 		control_link_interfaces::msg::GatewayState make_gateway_state(
-			const StateMachineDecision &decision,
+			const DecisionResult &decision,
 			std::int64_t now_ros_ns)
 		{
 			control_link_interfaces::msg::GatewayState message;
@@ -262,46 +217,58 @@ namespace control_link_gateway
 			message.recovery_valid_count = decision.recovery_valid_count;
 			message.transition_sequence = decision.transition_sequence;
 
-			if (decision.selected.has_value())
+			if (!decision.canonical_command.source_id.empty())
 			{
-				const auto &selected = decision.selected.value();
+				const auto &selected = decision.canonical_command;
 				message.active_source_id = selected.source_id;
-				message.active_source_sequence = selected.sequence;
+				message.active_source_sequence = selected.source_sequence;
+				const auto source_stamp_ns = rclcpp::Time(selected.source_stamp).nanoseconds();
 				message.active_command_age_ms = nanoseconds_to_milliseconds(
-					now_ros_ns - selected.source_stamp_ns);
+					now_ros_ns - source_stamp_ns);
 			}
 
 			return message;
 		}
 
-		std::map<std::string, SourceRuntimeSlot> make_source_slots(
-			const control_link_contract::ContractBundle &bundle)
+		DecisionSourceEndpointState decision_endpoint_state(
+			SourceEndpointState state)
 		{
-			if (!bundle.profile)
+			switch (state)
 			{
-				throw std::logic_error(
-					"ControlGatewayNode requires a non-null ProfileConfig");
+			case SourceEndpointState::kMissing:
+				return DecisionSourceEndpointState::kMissing;
+			case SourceEndpointState::kAmbiguous:
+				return DecisionSourceEndpointState::kAmbiguous;
+			case SourceEndpointState::kUnexpectedDirection:
+				return DecisionSourceEndpointState::kUnexpectedDirection;
+			case SourceEndpointState::kTypeMismatch:
+				return DecisionSourceEndpointState::kTypeMismatch;
+			case SourceEndpointState::kQosMismatch:
+				return DecisionSourceEndpointState::kQosMismatch;
+			case SourceEndpointState::kUsable:
+				return DecisionSourceEndpointState::kUsable;
 			}
+			throw std::logic_error("unsupported SourceEndpointState reached Decision Trace");
+		}
 
-			std::map<std::string, SourceRuntimeSlot> slots;
-			// Robot/ADAS Profile 共用 ProfileCommon，只为当前 enabled source 建立运行时槽位
-			std::visit(
-				[&slots](const auto &profile)
-				{
-					for (const auto &source_id : profile.common.enabled_sources)
-					{
-						const bool inserted = slots.try_emplace(source_id).second;
-						if (!inserted)
-						{
-							throw std::logic_error(
-								"duplicate enabled source reached Gateway runtime: " +
-								source_id);
-						}
-					}
-				},
-				*bundle.profile);
-
-			return slots;
+		DecisionTraceHeader make_decision_trace_header(
+			const control_link_contract::ContractBundle &bundle,
+			const std::string &rmw_implementation)
+		{
+			const char *ros_distro = std::getenv("ROS_DISTRO");
+			return DecisionTraceHeader{
+				kDecisionTraceSchemaVersion,
+				CONTROL_LINK_GIT_COMMIT,
+				CONTROL_LINK_GIT_DIRTY != 0,
+				CONTROL_LINK_BUILD_TYPE,
+				bundle.identity.decision_config.profile_id,
+				bundle.identity.contract.contract_id,
+				bundle.identity.contract.contract_version,
+				bundle.identity.contract.contract_hash,
+				bundle.identity.decision_config.decision_config_hash,
+				rmw_implementation,
+				ros_distro == nullptr || *ros_distro == '\0' ? "unknown" : ros_distro,
+				"relative_ns_zero"};
 		}
 
 		std::map<std::string, SourceEndpointStabilityTracker>
@@ -352,6 +319,8 @@ namespace control_link_gateway
 	{
 		declare_parameter<std::string>(kProfilePathParameter, "");
 		declare_parameter<std::string>(kConfigRootParameter, "");
+		declare_parameter<std::string>(kDecisionTracePathParameter, "");
+		declare_parameter<std::int64_t>(kDecisionTraceQueueCapacityParameter, 4096);
 		// Executor add_node() 前固定调度拓扑，Lifecycle 只增删组内的 endpoint 和 timer
 		data_plane_group_ = create_callback_group(
 			rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -359,24 +328,99 @@ namespace control_link_gateway
 			rclcpp::CallbackGroupType::MutuallyExclusive);
 	}
 
-	void ControlGatewayNode::update_health_epoch_locked() noexcept
+	std::int64_t ControlGatewayNode::decision_steady_offset_locked(
+		std::chrono::steady_clock::time_point now) const
 	{
-		const bool healthy = recovery_health_is_healthy(health_snapshot_);
-		if (healthy == recovery_health_healthy_)
+		if (!decision_steady_origin_.has_value() ||
+			now < decision_steady_origin_.value())
 		{
-			return;
+			throw std::logic_error("Decision Trace steady origin is unavailable or in the future");
+		}
+		return std::chrono::duration_cast<std::chrono::nanoseconds>(
+			now - decision_steady_origin_.value()).count();
+	}
+
+	std::optional<DecisionResult> ControlGatewayNode::submit_decision_event_locked(
+		DecisionEventPayload payload)
+	{
+		if (!decision_engine_)
+		{
+			throw std::logic_error("Gateway cannot submit an event without DecisionEngine");
+		}
+		DecisionEvent event{
+			decision_engine_->next_event_sequence(),
+			std::move(payload)};
+		std::optional<DecisionResult> result;
+		try
+		{
+			result = decision_engine_->apply_event(event);
+		}
+		catch (...)
+		{
+			if (decision_trace_recorder_)
+			{
+				decision_trace_recorder_->invalidate(
+					"DecisionEngine rejected a live event before it could be recorded");
+				trace_recording_failed_ = true;
+			}
+			throw;
 		}
 
-		pending_recovery_evidences_.clear();
-		if (health_epoch_ == std::numeric_limits<std::uint64_t>::max())
+		if (decision_trace_recorder_)
 		{
-			health_snapshot_.internal_invariants_healthy = false;
-			recovery_health_healthy_ = false;
-			return;
+			try
+			{
+				if (!decision_trace_recorder_->try_enqueue(
+						DecisionTraceFrame{std::move(event), result}))
+				{
+					trace_recording_failed_ = true;
+				}
+			}
+			catch (...)
+			{
+				// frame 复制属于旁路观测，失败只能使 trace INVALID，不能打断数据面
+				decision_trace_recorder_->invalidate(
+					"Decision Trace frame construction failed");
+				trace_recording_failed_ = true;
+			}
 		}
+		return result;
+	}
 
-		health_epoch_ += 1U;
-		recovery_health_healthy_ = healthy;
+	void ControlGatewayNode::submit_health_snapshot_locked(
+		std::chrono::steady_clock::time_point observed_at)
+	{
+		if (!decision_engine_)
+		{
+			throw std::logic_error("Gateway cannot submit health without DecisionEngine");
+		}
+		health_snapshot_.output_tick_healthy =
+			decision_engine_->health_snapshot().output_tick_healthy;
+		std::vector<DecisionSourceEndpoint> endpoints;
+		endpoints.reserve(source_endpoint_trackers_.size());
+		for (const auto &[source_id, tracker] : source_endpoint_trackers_)
+		{
+			DecisionSourceEndpoint endpoint{
+				source_id,
+				DecisionSourceEndpointState::kMissing,
+				std::nullopt};
+			if (tracker.stable_assessment.has_value())
+			{
+				const auto &stable = tracker.stable_assessment.value();
+				endpoint.state = decision_endpoint_state(stable.state);
+				if (stable.usable())
+				{
+					endpoint.publisher_generation = stable.publisher_generation;
+				}
+			}
+			endpoints.push_back(std::move(endpoint));
+		}
+		(void)submit_decision_event_locked(
+			DecisionHealthSnapshotEvent{
+				decision_engine_->next_health_revision(),
+				decision_steady_offset_locked(observed_at),
+				health_snapshot_,
+				std::move(endpoints)});
 	}
 
 	void ControlGatewayNode::update_ros_clock_health_locked(
@@ -459,7 +503,6 @@ namespace control_link_gateway
 		}
 
 		health_snapshot_.ros_clock_healthy = healthy;
-		update_health_epoch_locked();
 	}
 
 	void ControlGatewayNode::poll_ros_clock() noexcept
@@ -472,9 +515,11 @@ namespace control_link_gateway
 				return;
 			}
 
+			const auto now_steady = std::chrono::steady_clock::now();
 			update_ros_clock_health_locked(
-				std::chrono::steady_clock::now(),
+				now_steady,
 				get_clock()->now().nanoseconds());
+			submit_health_snapshot_locked(now_steady);
 		}
 		catch (const std::exception &exception)
 		{
@@ -482,7 +527,6 @@ namespace control_link_gateway
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.ros_clock_healthy = false;
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -495,7 +539,6 @@ namespace control_link_gateway
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.ros_clock_healthy = false;
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -509,18 +552,20 @@ namespace control_link_gateway
 		{
 			diagnostic_msgs::msg::DiagnosticArray message;
 			decltype(diagnostics_publisher_) publisher;
-			const auto now_steady = std::chrono::steady_clock::now();
 
-				{
-					std::scoped_lock lock(runtime_mutex_);
-					if (!health_plane_configured_ || !contract_bundle_ ||
-					!diagnostics_publisher_)
+			{
+				std::scoped_lock lock(runtime_mutex_);
+				if (!health_plane_configured_ || !contract_bundle_ ||
+					!decision_engine_ || !diagnostics_publisher_)
 				{
 					return;
 				}
 
+				// 多个 callback group 会竞争此锁，DecisionEvent 时间必须按实际提交顺序采样
+				const auto now_steady = std::chrono::steady_clock::now();
 				const auto now_ros_ns = get_clock()->now().nanoseconds();
 				update_ros_clock_health_locked(now_steady, now_ros_ns);
+				submit_health_snapshot_locked(now_steady);
 				if (now_ros_ns >= 0)
 				{
 					message.header.stamp = ros_time_message(now_ros_ns);
@@ -554,16 +599,17 @@ namespace control_link_gateway
 						state_status,
 						"recovery_valid_count",
 						std::to_string(decision.recovery_valid_count));
-					if (decision.selected.has_value())
+					if (!decision.canonical_command.source_id.empty())
 					{
 						add_diagnostic_value(
 							state_status,
 							"active_source_id",
-							decision.selected->source_id);
+							decision.canonical_command.source_id);
 						add_diagnostic_value(
 							state_status,
 							"active_source_sequence",
-							std::to_string(decision.selected->sequence));
+							std::to_string(
+								decision.canonical_command.source_sequence));
 					}
 				}
 				else
@@ -582,6 +628,38 @@ namespace control_link_gateway
 					"lifecycle_state",
 					get_current_state().label());
 				message.status.push_back(std::move(state_status));
+
+				const auto &identity = contract_bundle_->identity;
+				diagnostic_msgs::msg::DiagnosticStatus config_status =
+					make_diagnostic_status(
+						"gateway/config",
+						diagnostic_msgs::msg::DiagnosticStatus::OK,
+						"validated immutable configuration");
+				add_diagnostic_value(
+					config_status,
+					"contract_id",
+					identity.contract.contract_id);
+				add_diagnostic_value(
+					config_status,
+					"contract_version",
+					std::to_string(identity.contract.contract_version));
+				add_diagnostic_value(
+					config_status,
+					"contract_hash",
+					identity.contract.contract_hash);
+				add_diagnostic_value(
+					config_status,
+					"profile_id",
+					identity.decision_config.profile_id);
+				add_diagnostic_value(
+					config_status,
+					"decision_config_hash",
+					identity.decision_config.decision_config_hash);
+				add_diagnostic_value(
+					config_status,
+					"fastdds_profile_hash",
+					contract_bundle_->fastdds_profile_hash);
+				message.status.push_back(std::move(config_status));
 
 				const auto &gateway = contract_bundle_->gateway_contract->gateway;
 				diagnostic_msgs::msg::DiagnosticStatus clock_status =
@@ -654,10 +732,11 @@ namespace control_link_gateway
 					output_status,
 					"healthy",
 					output_tick_healthy ? "true" : "false");
-				add_diagnostic_value(
-					output_status,
-					"consecutive_late_ticks",
-					std::to_string(consecutive_late_output_ticks_));
+					add_diagnostic_value(
+						output_status,
+						"consecutive_late_ticks",
+						std::to_string(
+							decision_engine_->consecutive_late_output_ticks()));
 				add_diagnostic_value(
 					output_status,
 					"late_threshold_ms",
@@ -742,7 +821,11 @@ namespace control_link_gateway
 				}
 				message.status.push_back(std::move(endpoint_status));
 
-				for (const auto &[source_id, slot] : source_slots_)
+				const auto relative_now = std::chrono::steady_clock::time_point{
+					std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+						std::chrono::nanoseconds{
+							decision_steady_offset_locked(now_steady)})};
+				for (const auto &[source_id, slot] : decision_engine_->source_slots())
 				{
 					const auto &source =
 						contract_bundle_->source_policy->sources.at(source_id);
@@ -768,7 +851,7 @@ namespace control_link_gateway
 							*contract_bundle_->gateway_contract,
 							*contract_bundle_->source_policy,
 							now_ros_ns,
-							now_steady);
+							relative_now);
 						lease_valid = assessment.lease_valid;
 						command_age_ms = nanoseconds_to_milliseconds(
 							assessment.command_age_ns);
@@ -826,6 +909,63 @@ namespace control_link_gateway
 					message.status.push_back(std::move(source_status));
 				}
 
+				diagnostic_msgs::msg::DiagnosticStatus trace_status;
+				if (!decision_trace_recorder_)
+				{
+					trace_status = make_diagnostic_status(
+						"gateway/decision_trace",
+						diagnostic_msgs::msg::DiagnosticStatus::OK,
+						"decision trace disabled");
+					add_diagnostic_value(trace_status, "enabled", "false");
+				}
+				else
+				{
+					const auto recorder_status = decision_trace_recorder_->status();
+					trace_recording_failed_ = trace_recording_failed_ ||
+						!recorder_status.trace_valid;
+					trace_status = make_diagnostic_status(
+						"gateway/decision_trace",
+						trace_recording_failed_ ?
+							diagnostic_msgs::msg::DiagnosticStatus::ERROR :
+							diagnostic_msgs::msg::DiagnosticStatus::OK,
+						trace_recording_failed_ ?
+							"decision trace INVALID" :
+							"decision trace recording");
+					add_diagnostic_value(trace_status, "enabled", "true");
+					add_diagnostic_value(
+						trace_status,
+						"accepting",
+						recorder_status.accepting ? "true" : "false");
+					add_diagnostic_value(
+						trace_status,
+						"trace_valid",
+						recorder_status.trace_valid ? "true" : "false");
+					add_diagnostic_value(
+						trace_status,
+						"trace_overflow",
+						recorder_status.trace_overflow ? "true" : "false");
+					add_diagnostic_value(
+						trace_status,
+						"writer_failed",
+						recorder_status.writer_failed ? "true" : "false");
+					add_diagnostic_value(
+						trace_status,
+						"accepted_event_count",
+						std::to_string(recorder_status.accepted_event_count));
+					add_diagnostic_value(
+						trace_status,
+						"accepted_result_count",
+						std::to_string(recorder_status.accepted_result_count));
+					if (!recorder_status.error_message.empty())
+					{
+						add_diagnostic_value(
+							trace_status,
+							"error",
+							recorder_status.error_message);
+					}
+				}
+				message.status.push_back(std::move(trace_status));
+
 				publisher = diagnostics_publisher_;
 			}
 
@@ -851,20 +991,6 @@ namespace control_link_gateway
 				get_logger(),
 				"Gateway diagnostics update failed with an unknown exception");
 		}
-	}
-
-	void ControlGatewayNode::record_recovery_evidence_locked(
-		const std::string &source_id,
-		const PublisherGenerationKey &publisher_generation,
-		RejectReason result)
-	{
-		pending_recovery_evidences_.push_back(
-			RecoveryEvidence{
-				RecoveryCandidateKey{
-					source_id,
-					publisher_generation},
-				result,
-				health_epoch_});
 	}
 
 	void ControlGatewayNode::request_lifecycle_error() noexcept
@@ -922,7 +1048,7 @@ namespace control_link_gateway
 					return;
 				}
 
-				if (!contract_bundle_ || !source_arbiter_ || !state_machine_ ||
+				if (!contract_bundle_ || !decision_engine_ ||
 					!canonical_output_publisher_ || !gateway_state_publisher_ ||
 					!source_status_publisher_ ||
 					!canonical_output_publisher_->is_activated() ||
@@ -935,111 +1061,46 @@ namespace control_link_gateway
 
 				const auto now_steady = std::chrono::steady_clock::now();
 				const auto now_ros_ns = get_clock()->now().nanoseconds();
-				const auto &gateway = contract_bundle_->gateway_contract->gateway;
 				update_ros_clock_health_locked(now_steady, now_ros_ns);
-
-				if (last_output_tick_at_.has_value())
-				{
-					if (now_steady < last_output_tick_at_.value())
-					{
-						throw std::logic_error(
-							"output tick steady clock moved backwards");
-					}
-
-					const bool late =
-						now_steady - last_output_tick_at_.value() >
-						checked_milliseconds(
-							gateway.output_tick_late_threshold_ms,
-							"gateway.output_tick_late_threshold_ms");
-					if (late)
-					{
-						if (consecutive_late_output_ticks_ <
-							std::numeric_limits<std::uint64_t>::max())
-						{
-							consecutive_late_output_ticks_ += 1U;
-						}
-					}
-					else
-					{
-						consecutive_late_output_ticks_ = 0U;
-					}
-				}
-				last_output_tick_at_ = now_steady;
-
-				if (gateway.consecutive_late_ticks_to_safe_stop == 0U)
-				{
-					throw std::logic_error(
-						"Gateway reached a zero late-tick safety threshold");
-				}
-				health_snapshot_.output_tick_healthy =
-					consecutive_late_output_ticks_ <
-					gateway.consecutive_late_ticks_to_safe_stop;
 				refresh_vehicle_state_health_locked(now_steady);
-
-				auto snapshots = collect_latest_valid_snapshots(source_slots_);
-				const auto arbitration = source_arbiter_->evaluate(
-					ArbitrationInput{
-						&snapshots,
-						now_ros_ns,
-						now_steady});
-				auto evidences = std::move(pending_recovery_evidences_);
-				pending_recovery_evidences_.clear();
-				const auto decision = state_machine_->evaluate(
-					StateMachineInput{
-						health_snapshot_,
-						arbitration,
-						std::move(evidences),
-						health_epoch_});
+				submit_health_snapshot_locked(now_steady);
+				const auto tick = decision_engine_->describe_output_tick(
+					decision_steady_offset_locked(now_steady),
+					now_ros_ns);
+				auto produced = submit_decision_event_locked(tick);
+				if (!produced.has_value())
+				{
+					throw std::logic_error("DecisionEngine output tick produced no DecisionResult");
+				}
+				const auto decision = std::move(produced.value());
+				health_snapshot_.output_tick_healthy =
+					decision_engine_->health_snapshot().output_tick_healthy;
+				last_output_tick_at_ = now_steady;
 				last_decision_ = decision;
 
-				canonical_message = make_canonical_command(decision);
+				canonical_message = decision.canonical_command;
 				gateway_state_message = make_gateway_state(decision, now_ros_ns);
-				source_status_messages.reserve(source_slots_.size());
-				for (const auto &[source_id, slot] : source_slots_)
+				source_status_messages.reserve(decision.sources.size());
+				for (const auto &source_result : decision.sources)
 				{
 					const auto &source =
-						contract_bundle_->source_policy->sources.at(source_id);
-					const auto &tracker = source_endpoint_trackers_.at(source_id);
+						contract_bundle_->source_policy->sources.at(source_result.source_id);
 
 					control_link_interfaces::msg::SourceStatus status;
 					status.observed_at = ros_time_message(now_ros_ns);
-					status.source_id = source_id;
+					status.source_id = source_result.source_id;
 					status.priority = source.priority;
 					status.enabled = true;
 					status.last_reject_reason =
-						static_cast<std::uint16_t>(slot.last_reject_reason);
+						static_cast<std::uint16_t>(source_result.last_reject_reason);
 					status.last_source_sequence =
-						slot.last_accepted_sequence.value_or(0U);
-					status.accepted_count = slot.accepted_count;
-					status.rejected_count = slot.rejected_count;
-
-					const bool stable_generation_matches =
-						tracker.stable_assessment.has_value() &&
-						tracker.stable_assessment->usable() &&
-						tracker.stable_assessment->publisher_generation.has_value() &&
-						slot.confirmed_publisher_generation.has_value() &&
-						tracker.stable_assessment->publisher_generation.value() ==
-							slot.confirmed_publisher_generation.value();
-					status.command_valid =
-						stable_generation_matches &&
-						slot.latest_valid_snapshot.has_value();
-
-					if (slot.latest_valid_snapshot.has_value())
-					{
-						const auto &snapshot =
-							slot.latest_valid_snapshot.value();
-						const auto assessment = assess_source_snapshot(
-							source_id,
-							snapshot,
-							*contract_bundle_->gateway_contract,
-							*contract_bundle_->source_policy,
-							now_ros_ns,
-							now_steady);
-						status.lease_valid =
-							status.command_valid && assessment.lease_valid;
-						status.command_age_ms = nanoseconds_to_milliseconds(
-							assessment.command_age_ns);
-					}
+						source_result.last_accepted_sequence.value_or(0U);
+					status.accepted_count = source_result.accepted_count;
+					status.rejected_count = source_result.rejected_count;
+					status.command_valid = source_result.command_valid;
+					status.lease_valid = source_result.lease_valid;
+					status.command_age_ms = nanoseconds_to_milliseconds(
+						source_result.command_age_ns);
 
 					source_status_messages.push_back(std::move(status));
 				}
@@ -1047,7 +1108,7 @@ namespace control_link_gateway
 				canonical_publisher = canonical_output_publisher_;
 				gateway_state_publisher = gateway_state_publisher_;
 				source_status_publisher = source_status_publisher_;
-				request_error = decision.state == DataState::kError;
+				request_error = decision.lifecycle_error_requested;
 			}
 
 			{
@@ -1082,7 +1143,16 @@ namespace control_link_gateway
 			{
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1095,7 +1165,16 @@ namespace control_link_gateway
 			{
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1225,7 +1304,6 @@ namespace control_link_gateway
 						expected.exact_qos_required});
 			}
 
-			const auto observed_at = std::chrono::steady_clock::now();
 			const auto stable_window = checked_milliseconds(
 				contract.gateway.graph_stable_window_ms,
 				"gateway.graph_stable_window_ms");
@@ -1241,6 +1319,8 @@ namespace control_link_gateway
 				{
 					return;
 				}
+				// Graph 查询保持在锁外，但观测提交时间必须在锁内采样，避免排队后时间倒退
+				const auto observed_at = std::chrono::steady_clock::now();
 
 				for (const auto &[source_id, observation] : source_observations)
 				{
@@ -1258,18 +1338,6 @@ namespace control_link_gateway
 					}
 
 					const auto &stable = tracker.stable_assessment.value();
-					auto &slot = source_slots_.at(source_id);
-					if (stable.usable())
-					{
-						(void)confirm_publisher_generation(
-							slot,
-							stable.publisher_generation.value());
-					}
-					else
-					{
-						invalidate_source_endpoint_snapshot(slot);
-					}
-
 					transition_logs.push_back(SourceGraphTransitionLog{
 						source_id,
 						stable.state,
@@ -1343,6 +1411,7 @@ namespace control_link_gateway
 				}
 
 				refresh_vehicle_state_health_locked(observed_at);
+				submit_health_snapshot_locked(observed_at);
 			}
 
 			// 日志可能触发格式化和 I/O，不占用 data plane 共用的 runtime_mutex_
@@ -1393,7 +1462,16 @@ namespace control_link_gateway
 			{
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1406,7 +1484,16 @@ namespace control_link_gateway
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.critical_endpoints_healthy = false;
 				health_snapshot_.critical_qos_compatible = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1436,7 +1523,6 @@ namespace control_link_gateway
 		health_snapshot_.vehicle_reports_safe_stop =
 			assessment.reports_safe_stop;
 		health_snapshot_.vehicle_reports_fault = assessment.reports_fault;
-		update_health_epoch_locked();
 	}
 
 	void ControlGatewayNode::handle_vehicle_state(
@@ -1478,6 +1564,7 @@ namespace control_link_gateway
 						VehicleStateRejectReason::kPublisherGenerationUnstable,
 						std::nullopt});
 				refresh_vehicle_state_health_locked(received_at);
+				submit_health_snapshot_locked(received_at);
 				return;
 			}
 
@@ -1494,6 +1581,7 @@ namespace control_link_gateway
 						VehicleStateRejectReason::kPublisherGenerationUnstable,
 						std::nullopt});
 				refresh_vehicle_state_health_locked(received_at);
+				submit_health_snapshot_locked(received_at);
 				return;
 			}
 
@@ -1513,13 +1601,23 @@ namespace control_link_gateway
 			const auto result = vehicle_state_validator_->validate(state, context);
 			commit_vehicle_state_validation_result(vehicle_state_runtime_, result);
 			refresh_vehicle_state_health_locked(received_at);
+			submit_health_snapshot_locked(received_at);
 		}
 		catch (const std::exception &exception)
 		{
 			{
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1541,92 +1639,41 @@ namespace control_link_gateway
 				return;
 			}
 
-			const auto received_at = std::chrono::steady_clock::now();
-			const auto now_ros_ns = get_clock()->now().nanoseconds();
-
-			if (!contract_bundle_ || !command_validator_)
+			if (!contract_bundle_ || !decision_engine_)
 			{
 				throw std::logic_error(
 					"source callback reached an incomplete Gateway configuration");
 			}
-
-			auto slot_iterator = source_slots_.find(expected_source_id);
-			auto tracker_iterator =
-				source_endpoint_trackers_.find(expected_source_id);
-			if (slot_iterator == source_slots_.end() ||
-				tracker_iterator == source_endpoint_trackers_.end())
+			if (source_endpoint_trackers_.count(expected_source_id) == 0U)
 			{
 				throw std::logic_error(
-					"source callback has no matching runtime slot or endpoint tracker: " +
+					"source callback has no matching endpoint tracker: " +
 					expected_source_id);
 			}
-
-			auto &slot = slot_iterator->second;
-			const auto actual_generation =
-				publisher_generation_from_message_info(message_info);
-			const auto &tracker = tracker_iterator->second;
-
-			RejectReason binding_reject_reason =
-				RejectReason::kPublisherGenerationUnstable;
-			if (tracker.stable_assessment.has_value() &&
-				tracker.stable_assessment->state ==
-					SourceEndpointState::kAmbiguous)
-			{
-				binding_reject_reason =
-					RejectReason::kSourceEndpointAmbiguous;
-			}
-
-			const bool stable_generation_matches =
-				tracker.stable_assessment.has_value() &&
-				tracker.stable_assessment->usable() &&
-				tracker.stable_assessment->publisher_generation.has_value() &&
-				tracker.stable_assessment->publisher_generation.value() ==
-					actual_generation;
-			if (!stable_generation_matches)
-			{
-				commit_validation_result(
-					slot,
-					CommandValidationResult{
-						binding_reject_reason,
-						std::nullopt});
-				record_recovery_evidence_locked(
+			const auto received_at = std::chrono::steady_clock::now();
+			(void)submit_decision_event_locked(
+				DecisionSourceSampleEvent{
 					expected_source_id,
-					actual_generation,
-					binding_reject_reason);
-				return;
-			}
-
-			// stable Graph generation 只能由 poll_graph() 确认到同一个 Slot
-			if (!message_matches_confirmed_generation(slot, actual_generation))
-			{
-				throw std::logic_error(
-					"stable source endpoint generation does not match the runtime slot: " +
-					expected_source_id);
-			}
-
-			const auto &source =
-				contract_bundle_->source_policy->sources.at(expected_source_id);
-			const CommandValidationContext context{
-				expected_source_id,
-				actual_generation,
-				slot.last_accepted_sequence,
-				source.priority,
-				now_ros_ns,
-				health_snapshot_.ros_clock_healthy,
-				received_at};
-			const auto result = command_validator_->validate(command, context);
-			commit_validation_result(slot, result);
-			record_recovery_evidence_locked(
-				expected_source_id,
-				actual_generation,
-				result.reason);
+					publisher_generation_from_message_info(message_info),
+					command,
+					get_clock()->now().nanoseconds(),
+					decision_steady_offset_locked(received_at)});
 		}
 		catch (const std::exception &exception)
 		{
 			{
 				std::scoped_lock lock(runtime_mutex_);
 				health_snapshot_.internal_invariants_healthy = false;
-				update_health_epoch_locked();
+				try
+				{
+					if (decision_engine_ && decision_engine_->configured())
+					{
+						submit_health_snapshot_locked(std::chrono::steady_clock::now());
+					}
+				}
+				catch (...)
+				{
+				}
 			}
 			RCLCPP_ERROR(
 				get_logger(),
@@ -1670,13 +1717,7 @@ namespace control_link_gateway
 
 			auto qos_factory = std::make_unique<control_link_contract::QosFactory>(
 				bundle->gateway_contract);
-			auto command_validator = std::make_unique<CommandValidator>(
-				bundle->gateway_contract);
-			auto source_arbiter = std::make_unique<SourceArbiter>(
-				bundle->gateway_contract,
-				bundle->source_policy);
-			auto state_machine = std::make_unique<GatewayStateMachine>(
-				bundle->gateway_contract);
+			auto decision_engine = std::make_unique<DecisionEngine>(bundle);
 			auto vehicle_state_validator = std::make_unique<VehicleStateValidator>(
 				bundle->gateway_contract);
 			if (!data_plane_group_ || !health_group_)
@@ -1686,9 +1727,8 @@ namespace control_link_gateway
 			}
 			const auto data_plane_group = data_plane_group_;
 			const auto health_group = health_group_;
-			auto source_slots = make_source_slots(*bundle);
 			auto source_endpoint_trackers =
-				make_source_endpoint_trackers(source_slots);
+				make_source_endpoint_trackers(decision_engine->source_slots());
 			auto critical_endpoint_trackers =
 				make_critical_endpoint_trackers(*bundle->gateway_contract);
 
@@ -1755,7 +1795,7 @@ namespace control_link_gateway
 			source_subscription_options.callback_group = data_plane_group;
 			std::map<std::string, SourceSubscription::SharedPtr>
 				source_subscriptions;
-			for (const auto &[source_id, slot] : source_slots)
+			for (const auto &[source_id, slot] : decision_engine->source_slots())
 			{
 				(void)slot;
 				const auto &source = bundle->source_policy->sources.at(source_id);
@@ -1875,14 +1915,65 @@ namespace control_link_gateway
 				},
 				backward_jump_threshold);
 
+			const auto trace_path = std::filesystem::path{
+				get_parameter(kDecisionTracePathParameter).as_string()};
+			const auto trace_capacity_value =
+				get_parameter(kDecisionTraceQueueCapacityParameter).as_int();
+			if (trace_capacity_value <= 0)
+			{
+				throw std::invalid_argument(
+					"decision_trace_queue_capacity must be positive");
+			}
+			if (!trace_path.empty() && !trace_path.is_absolute())
+			{
+				throw std::invalid_argument("decision_trace_path must be absolute");
+			}
+			if (!trace_path.empty())
+			{
+				const auto parent = trace_path.parent_path();
+				if (parent.empty() || !std::filesystem::is_directory(parent))
+				{
+					throw std::invalid_argument(
+						"decision_trace_path parent must be an existing directory");
+				}
+				if (std::filesystem::exists(trace_path) &&
+					!std::filesystem::is_regular_file(trace_path))
+				{
+					throw std::invalid_argument(
+						"decision_trace_path must target a regular file");
+				}
+			}
+			const auto decision_steady_origin = std::chrono::steady_clock::now();
+			std::unique_ptr<DecisionTraceRecorder> decision_trace_recorder;
+			if (!trace_path.empty())
+			{
+				decision_trace_recorder = std::make_unique<DecisionTraceRecorder>(
+					trace_path,
+					make_decision_trace_header(*bundle, rmw_implementation),
+					static_cast<std::size_t>(trace_capacity_value));
+			}
+			DecisionEvent configure_event{
+				decision_engine->next_event_sequence(),
+				DecisionLifecycleEvent{
+					DecisionLifecycleTransition::kConfigure,
+					DecisionLifecycleResult::kSuccess}};
+			auto configure_result = decision_engine->apply_event(configure_event);
+			if (configure_result.has_value())
+			{
+				throw std::logic_error("DecisionEngine configure event produced a result");
+			}
+			const bool trace_configure_accepted = !decision_trace_recorder ||
+				decision_trace_recorder->try_enqueue(
+					DecisionTraceFrame{std::move(configure_event), std::nullopt});
+
 			std::scoped_lock lock(runtime_mutex_);
 			contract_bundle_ = std::move(bundle);
 			qos_factory_ = std::move(qos_factory);
-			command_validator_ = std::move(command_validator);
-			source_arbiter_ = std::move(source_arbiter);
-			state_machine_ = std::move(state_machine);
+			decision_engine_ = std::move(decision_engine);
+			decision_trace_recorder_ = std::move(decision_trace_recorder);
+			decision_steady_origin_ = decision_steady_origin;
+			trace_recording_failed_ = !trace_configure_accepted;
 			vehicle_state_validator_ = std::move(vehicle_state_validator);
-			source_slots_ = std::move(source_slots);
 			source_endpoint_trackers_ = std::move(source_endpoint_trackers);
 			critical_endpoint_trackers_ =
 				std::move(critical_endpoint_trackers);
@@ -1901,9 +1992,6 @@ namespace control_link_gateway
 			clock_timer_ = std::move(clock_timer);
 			diagnostics_timer_ = std::move(diagnostics_timer);
 			output_timer_ = std::move(output_timer);
-			pending_recovery_evidences_.clear();
-			health_epoch_ = 0U;
-			recovery_health_healthy_ = false;
 			last_ros_time_ns_.reset();
 			last_ros_time_progress_at_.reset();
 			pending_ros_clock_backward_jumps_.store(
@@ -1913,7 +2001,6 @@ namespace control_link_gateway
 			ros_clock_backward_jump_ = false;
 			ros_clock_backward_jump_count_ = 0U;
 			last_output_tick_at_.reset();
-			consecutive_late_output_ticks_ = 0U;
 			lifecycle_error_requested_ = false;
 			last_decision_.reset();
 			canonical_output_publisher_ = std::move(canonical_output_publisher);
@@ -1925,8 +2012,14 @@ namespace control_link_gateway
 
 			RCLCPP_INFO(
 				get_logger(),
-				"Gateway configured with profile: %s",
-				profile_path.string().c_str());
+				"Gateway configured: profile=%s, contract=%s@%lu, contract_hash=%s, "
+				"decision_config_hash=%s",
+				profile_path.string().c_str(),
+				contract_bundle_->identity.contract.contract_id.c_str(),
+				static_cast<unsigned long>(
+					contract_bundle_->identity.contract.contract_version),
+				contract_bundle_->identity.contract.contract_hash.c_str(),
+				contract_bundle_->identity.decision_config.decision_config_hash.c_str());
 			return CallbackReturn::SUCCESS;
 		}
 		catch (const std::exception &exception)
@@ -1943,13 +2036,13 @@ namespace control_link_gateway
 		const rclcpp_lifecycle::State &previous_state)
 	{
 		(void)previous_state;
+		bool activation_committed = false;
 
 		try
 		{
 			std::scoped_lock lock(runtime_mutex_, publisher_mutex_);
 			if (!health_plane_configured_ || !contract_bundle_ ||
-				!qos_factory_ || !command_validator_ || !source_arbiter_ ||
-				!state_machine_ || !vehicle_state_validator_ ||
+				!qos_factory_ || !decision_engine_ || !vehicle_state_validator_ ||
 				!data_plane_group_ || !health_group_ || !graph_timer_ ||
 				!clock_timer_ || !diagnostics_timer_ || !output_timer_ ||
 				!ros_clock_jump_handler_ ||
@@ -1982,10 +2075,11 @@ namespace control_link_gateway
 			}
 
 			// freshness 是随 steady time 衰减的值，不能直接信任上一次 callback 的缓存
-			refresh_vehicle_state_health_locked(
-				std::chrono::steady_clock::now());
+			const auto activation_observed_at = std::chrono::steady_clock::now();
+			refresh_vehicle_state_health_locked(activation_observed_at);
+			submit_health_snapshot_locked(activation_observed_at);
 
-			for (const auto &[source_id, slot] : source_slots_)
+			for (const auto &[source_id, slot] : decision_engine_->source_slots())
 			{
 				const auto &source =
 					contract_bundle_->source_policy->sources.at(source_id);
@@ -2062,13 +2156,6 @@ namespace control_link_gateway
 					"VehicleState is not the allowed adapter bootstrap SAFE_STOP");
 			}
 
-			// 每次 Lifecycle activate 都从 STANDBY 和无 active source 的历史开始
-			auto source_arbiter = std::make_unique<SourceArbiter>(
-				contract_bundle_->gateway_contract,
-				contract_bundle_->source_policy);
-			auto state_machine = std::make_unique<GatewayStateMachine>(
-				contract_bundle_->gateway_contract);
-
 			bool canonical_output_activated = false;
 			bool gateway_state_activated = false;
 			bool source_status_activated = false;
@@ -2103,28 +2190,34 @@ namespace control_link_gateway
 					activated = false;
 				};
 
-			rollback(source_status_publisher_, source_status_activated);
-			rollback(gateway_state_publisher_, gateway_state_activated);
-			rollback(canonical_output_publisher_, canonical_output_activated);
+				rollback(source_status_publisher_, source_status_activated);
+				rollback(gateway_state_publisher_, gateway_state_activated);
+				rollback(canonical_output_publisher_, canonical_output_activated);
 			};
 
 			try
 			{
-				source_arbiter_ = std::move(source_arbiter);
-				state_machine_ = std::move(state_machine);
-				pending_recovery_evidences_.clear();
 				last_output_tick_at_.reset();
-				consecutive_late_output_ticks_ = 0U;
-				health_snapshot_.output_tick_healthy = true;
 				lifecycle_error_requested_ = false;
 				last_decision_.reset();
-				update_health_epoch_locked();
 				canonical_output_publisher_->on_activate();
 				canonical_output_activated = true;
 				gateway_state_publisher_->on_activate();
 				gateway_state_activated = true;
 				source_status_publisher_->on_activate();
 				source_status_activated = true;
+				auto activation_result = submit_decision_event_locked(
+					DecisionLifecycleEvent{
+						DecisionLifecycleTransition::kActivate,
+						DecisionLifecycleResult::kSuccess});
+				if (activation_result.has_value() || !decision_engine_->active())
+				{
+					throw std::logic_error(
+						"DecisionEngine activation event produced an invalid state");
+				}
+				activation_committed = true;
+				health_snapshot_.output_tick_healthy =
+					decision_engine_->health_snapshot().output_tick_healthy;
 				data_plane_enabled_ = true;
 				output_timer_->reset();
 			}
@@ -2132,6 +2225,21 @@ namespace control_link_gateway
 			{
 				data_plane_enabled_ = false;
 				output_timer_->cancel();
+				if (activation_committed && decision_engine_->active())
+				{
+					try
+					{
+						(void)submit_decision_event_locked(
+							DecisionLifecycleEvent{
+								DecisionLifecycleTransition::kDeactivate,
+								DecisionLifecycleResult::kSuccess});
+						activation_committed = false;
+					}
+					catch (...)
+					{
+						health_snapshot_.internal_invariants_healthy = false;
+					}
+				}
 				rollback_publishers();
 				throw;
 			}
@@ -2141,6 +2249,24 @@ namespace control_link_gateway
 		}
 		catch (const std::logic_error &exception)
 		{
+			if (!activation_committed)
+			{
+				try
+				{
+					std::scoped_lock lock(runtime_mutex_);
+					if (decision_engine_ && decision_engine_->configured() &&
+						!decision_engine_->active())
+					{
+						(void)submit_decision_event_locked(
+							DecisionLifecycleEvent{
+								DecisionLifecycleTransition::kActivate,
+								DecisionLifecycleResult::kError});
+					}
+				}
+				catch (...)
+				{
+				}
+			}
 			RCLCPP_ERROR(
 				get_logger(),
 				"Gateway activation invariant failed: %s",
@@ -2149,6 +2275,24 @@ namespace control_link_gateway
 		}
 		catch (const std::exception &exception)
 		{
+			if (!activation_committed)
+			{
+				try
+				{
+					std::scoped_lock lock(runtime_mutex_);
+					if (decision_engine_ && decision_engine_->configured() &&
+						!decision_engine_->active())
+					{
+						(void)submit_decision_event_locked(
+							DecisionLifecycleEvent{
+								DecisionLifecycleTransition::kActivate,
+								DecisionLifecycleResult::kFailure});
+					}
+				}
+				catch (...)
+				{
+				}
+			}
 			RCLCPP_WARN(
 				get_logger(),
 				"Gateway activation rejected: %s",
@@ -2157,6 +2301,24 @@ namespace control_link_gateway
 		}
 		catch (...)
 		{
+			if (!activation_committed)
+			{
+				try
+				{
+					std::scoped_lock lock(runtime_mutex_);
+					if (decision_engine_ && decision_engine_->configured() &&
+						!decision_engine_->active())
+					{
+						(void)submit_decision_event_locked(
+							DecisionLifecycleEvent{
+								DecisionLifecycleTransition::kActivate,
+								DecisionLifecycleResult::kError});
+					}
+				}
+				catch (...)
+				{
+				}
+			}
 			RCLCPP_ERROR(
 				get_logger(),
 				"Gateway activation failed with an unknown exception");
@@ -2176,8 +2338,6 @@ namespace control_link_gateway
 			// 普通 Subscription 不受 Lifecycle 自动停用，必须先关闭数据面写入门
 			data_plane_enabled_ = false;
 			last_output_tick_at_.reset();
-			consecutive_late_output_ticks_ = 0U;
-			pending_recovery_evidences_.clear();
 			output_timer = output_timer_;
 			lifecycle_error_requested = lifecycle_error_requested_;
 		}
@@ -2187,41 +2347,69 @@ namespace control_link_gateway
 		}
 
 		// 先关闭入口让尚未进入发布边界的 tick 丢弃，再等待已进入边界的旧 tick 完成
-		std::scoped_lock publisher_lock(publisher_mutex_);
 		bool failed = false;
-		auto deactivate = [this, &failed](auto &publisher, const char *name)
 		{
-			if (!publisher || !publisher->is_activated())
+			std::scoped_lock publisher_lock(publisher_mutex_);
+			auto deactivate = [this, &failed](auto &publisher, const char *name)
 			{
-				return;
-			}
+				if (!publisher || !publisher->is_activated())
+				{
+					return;
+				}
 
-			try
-			{
-				publisher->on_deactivate();
-			}
-			catch (const std::exception &exception)
-			{
-				failed = true;
-				RCLCPP_ERROR(
-					get_logger(),
-					"Failed to deactivate publisher %s: %s",
-					name,
-					exception.what());
-			}
-			catch (...)
-			{
-				failed = true;
-				RCLCPP_ERROR(
-					get_logger(),
-					"Failed to deactivate publisher %s with an unknown exception",
-					name);
-			}
-		};
+				try
+				{
+					publisher->on_deactivate();
+				}
+				catch (const std::exception &exception)
+				{
+					failed = true;
+					RCLCPP_ERROR(
+						get_logger(),
+						"Failed to deactivate publisher %s: %s",
+						name,
+						exception.what());
+				}
+				catch (...)
+				{
+					failed = true;
+					RCLCPP_ERROR(
+						get_logger(),
+						"Failed to deactivate publisher %s with an unknown exception",
+						name);
+				}
+			};
 
-		deactivate(source_status_publisher_, "source_status");
-		deactivate(gateway_state_publisher_, "gateway_state");
-		deactivate(canonical_output_publisher_, "canonical_output");
+			deactivate(source_status_publisher_, "source_status");
+			deactivate(gateway_state_publisher_, "gateway_state");
+			deactivate(canonical_output_publisher_, "canonical_output");
+		}
+
+		try
+		{
+			std::scoped_lock lock(runtime_mutex_);
+			if (!decision_engine_ || !decision_engine_->configured() ||
+				!decision_engine_->active())
+			{
+				throw std::logic_error(
+					"Gateway deactivation reached an invalid DecisionEngine state");
+			}
+			const auto result = failed || lifecycle_error_requested ?
+				DecisionLifecycleResult::kError :
+				DecisionLifecycleResult::kSuccess;
+			(void)submit_decision_event_locked(
+				DecisionLifecycleEvent{
+					DecisionLifecycleTransition::kDeactivate,
+					result});
+		}
+		catch (const std::exception &exception)
+		{
+			failed = true;
+			RCLCPP_ERROR(
+				get_logger(),
+				"Failed to commit DecisionEngine deactivation: %s",
+				exception.what());
+		}
 
 		if (failed || lifecycle_error_requested)
 		{
@@ -2238,6 +2426,24 @@ namespace control_link_gateway
 		RCLCPP_ERROR(
 			get_logger(),
 			"Gateway entered Lifecycle error processing");
+		try
+		{
+			std::scoped_lock lock(runtime_mutex_);
+			if (decision_engine_ && decision_engine_->configured())
+			{
+				(void)submit_decision_event_locked(
+					DecisionLifecycleEvent{
+						DecisionLifecycleTransition::kError,
+						DecisionLifecycleResult::kSuccess});
+			}
+		}
+		catch (const std::exception &exception)
+		{
+			RCLCPP_ERROR(
+				get_logger(),
+				"Failed to commit DecisionEngine error transition: %s",
+				exception.what());
+		}
 		return on_cleanup(previous_state);
 	}
 
@@ -2245,6 +2451,7 @@ namespace control_link_gateway
 		const rclcpp_lifecycle::State &previous_state)
 	{
 		(void)previous_state;
+		std::unique_ptr<DecisionTraceRecorder> trace_recorder;
 
 		{
 			std::scoped_lock lock(runtime_mutex_, publisher_mutex_);
@@ -2277,12 +2484,17 @@ namespace control_link_gateway
 			source_status_publisher_.reset();
 			gateway_state_publisher_.reset();
 			canonical_output_publisher_.reset();
+			if (decision_engine_ && decision_engine_->configured())
+			{
+				(void)submit_decision_event_locked(
+					DecisionLifecycleEvent{
+						DecisionLifecycleTransition::kCleanup,
+						DecisionLifecycleResult::kSuccess});
+			}
+			trace_recorder = std::move(decision_trace_recorder_);
 			// CallbackGroup 属于节点，不属于单次配置，Executor spin 期间不能在这里销毁
 			vehicle_state_publisher_generation_.reset();
 			vehicle_state_runtime_ = VehicleStateRuntime{};
-			pending_recovery_evidences_.clear();
-			health_epoch_ = 0U;
-			recovery_health_healthy_ = false;
 			last_ros_time_ns_.reset();
 			last_ros_time_progress_at_.reset();
 			ros_clock_jump_handler_.reset();
@@ -2292,23 +2504,45 @@ namespace control_link_gateway
 			ros_clock_backward_jump_ = false;
 			ros_clock_backward_jump_count_ = 0U;
 			last_output_tick_at_.reset();
-			consecutive_late_output_ticks_ = 0U;
 			lifecycle_error_requested_ = false;
 			last_decision_.reset();
 			vehicle_state_validator_.reset();
 			critical_endpoint_trackers_.clear();
 			source_endpoint_trackers_.clear();
-			source_slots_.clear();
 			vehicle_state_qos_.reset();
 			canonical_output_qos_.reset();
 			source_input_qos_.reset();
 			rmw_implementation_.clear();
 			health_snapshot_ = GatewayHealthSnapshot{};
-			state_machine_.reset();
-			source_arbiter_.reset();
-			command_validator_.reset();
+			decision_engine_.reset();
+			decision_steady_origin_.reset();
+			trace_recording_failed_ = false;
 			qos_factory_.reset();
 			contract_bundle_.reset();
+		}
+
+		if (trace_recorder)
+		{
+			try
+			{
+				const auto status = trace_recorder->stop();
+				if (!status.trace_valid)
+				{
+					RCLCPP_ERROR(
+						get_logger(),
+						"Decision Trace closed INVALID: overflow=%s, writer_failed=%s, error=%s",
+						status.trace_overflow ? "true" : "false",
+						status.writer_failed ? "true" : "false",
+						status.error_message.c_str());
+				}
+			}
+			catch (const std::exception &exception)
+			{
+				RCLCPP_ERROR(
+					get_logger(),
+					"Failed to stop Decision Trace recorder: %s",
+					exception.what());
+			}
 		}
 
 		RCLCPP_INFO(get_logger(), "Gateway resources cleaned up");

@@ -64,6 +64,7 @@ namespace control_link_contract
 			ASSERT_NE(contract, nullptr);
 			EXPECT_EQ(contract->schema_version, 1U);
 			EXPECT_EQ(contract->contract_id, "control_link_gateway_v1");
+			EXPECT_EQ(contract->contract_version, 1U);
 			EXPECT_DOUBLE_EQ(contract->gateway.output_rate_hz, 50.0);
 			EXPECT_EQ(contract->gateway.command_timeout_ms, 100U);
 			EXPECT_DOUBLE_EQ(contract->limits.max_abs_linear_velocity_mps, 1.0);
@@ -84,6 +85,14 @@ namespace control_link_contract
 			const std::string error = parse_error(root);
 			EXPECT_NE(error.find("test.yaml:schema_version"), std::string::npos);
 			EXPECT_NE(error.find("expected="), std::string::npos);
+		}
+
+		TEST(GatewayContractParser, RejectsInvalidContractVersion)
+		{
+			YAML::Node root = YAML::Load(read_valid_contract());
+			root["contract_version"] = 0U;
+
+			expect_error(root, "contract_version", "invalid Contract version");
 		}
 
 		TEST(GatewayContractParser, RejectsUnknownNestedFieldWithPath)

@@ -62,11 +62,17 @@ def _require_single_joint_name(parameters, key, field_path):
 	return value[0]
 
 
-def _write_controller_config(template_path, wheel_separation, wheel_radius, frames):
+def _write_controller_config(
+	template_path,
+	wheel_separation,
+	wheel_radius,
+	frames,
+	standalone_controller_manager,
+):
 	document = load_yaml_mapping(template_path, "adapter.config")
 	controller_manager = _require_mapping(
 		document, "controller_manager", "adapter.config.controller_manager")
-	_require_mapping(
+	manager_parameters = _require_mapping(
 		controller_manager, "ros__parameters",
 		"adapter.config.controller_manager.ros__parameters")
 	diff_drive = _require_mapping(
@@ -87,16 +93,51 @@ def _write_controller_config(template_path, wheel_separation, wheel_radius, fram
 	parameters["wheel_radius"] = wheel_radius
 	parameters["odom_frame_id"] = frames["odom"]
 	parameters["base_frame_id"] = frames["base_footprint"]
+	generated_config = None
+	standalone_controller_config = None
+	try:
+		if standalone_controller_manager:
+			# Humble 嵌入式 controller 需要 wildcard 作用域，节点名/FQN 作用域不会命中其参数覆盖
+			with tempfile.NamedTemporaryFile(
+				mode="w",
+				encoding="utf-8",
+				prefix="control_link_diff_controller_",
+				suffix=".yaml",
+				delete=False,
+			) as controller_file:
+				standalone_controller_config = controller_file.name
+				yaml.safe_dump(
+					{"/**": {"ros__parameters": parameters}},
+					controller_file,
+					sort_keys=False,
+				)
+			manager_controller = _require_mapping(
+				manager_parameters,
+				"diff_drive_controller",
+				"adapter.config.controller_manager.ros__parameters.diff_drive_controller")
+			manager_controller["params_file"] = [standalone_controller_config]
 
-	with tempfile.NamedTemporaryFile(
-		mode="w",
-		encoding="utf-8",
-		prefix="control_link_ros2_control_",
-		suffix=".yaml",
-		delete=False,
-	) as generated_file:
-		yaml.safe_dump(document, generated_file, sort_keys=False)
-		return generated_file.name, left_wheel_joint, right_wheel_joint
+		with tempfile.NamedTemporaryFile(
+			mode="w",
+			encoding="utf-8",
+			prefix="control_link_ros2_control_",
+			suffix=".yaml",
+			delete=False,
+		) as generated_file:
+			generated_config = generated_file.name
+			yaml.safe_dump(document, generated_file, sort_keys=False)
+			return (
+				generated_config,
+				standalone_controller_config,
+				left_wheel_joint,
+				right_wheel_joint,
+			)
+	except Exception:
+		if generated_config is not None:
+			_remove_generated_file(generated_config)
+		if standalone_controller_config is not None:
+			_remove_generated_file(standalone_controller_config)
+		raise
 
 
 def _remove_generated_file(file_path):
@@ -111,6 +152,17 @@ def _launch_flag(context, name):
 	if value not in ("true", "false"):
 		raise RuntimeError(name + " must be true or false; actual=" + value)
 	return value == "true"
+
+
+def _launch_nonnegative_integer(context, name):
+	value = LaunchConfiguration(name).perform(context)
+	try:
+		result = int(value, 10)
+	except ValueError as error:
+		raise RuntimeError(name + " must be a non-negative integer; actual=" + value) from error
+	if result < 0:
+		raise RuntimeError(name + " must be a non-negative integer; actual=" + value)
+	return result
 
 
 def _launch_robot_platform(context, *args, **kwargs):
@@ -140,6 +192,13 @@ def _launch_robot_platform(context, *args, **kwargs):
 		adapter, "config", "adapter.config")
 	controller_node_fqn = _require_string(
 		adapter, "controller_node_fqn", "adapter.controller_node_fqn")
+	controller_manager_fqn = _require_string(
+		adapter, "controller_manager_fqn", "adapter.controller_manager_fqn")
+	if controller_manager_fqn != "/controller_manager":
+		raise RuntimeError(
+			"Robot platform currently requires adapter.controller_manager_fqn=/controller_manager")
+	hardware_component_name = _require_string(
+		adapter, "hardware_component_name", "adapter.hardware_component_name")
 	odometry_topic = _require_string(
 		adapter, "odometry_topic", "adapter.odometry_topic")
 	if os.path.isabs(adapter_config_reference):
@@ -171,12 +230,32 @@ def _launch_robot_platform(context, *args, **kwargs):
 		name: _require_string(frames, name, "frames." + name)
 		for name in ("map", "odom", "base_footprint", "base_link", "laser")
 	}
+	hardware_backend = LaunchConfiguration("hardware_backend").perform(context)
+	if hardware_backend not in ("gazebo", "mock"):
+		raise RuntimeError(
+			"hardware_backend must be one of: gazebo, mock; actual=" +
+			hardware_backend)
+	use_mock_hardware = hardware_backend == "mock"
+	mock_fail_read_after_cycles = _launch_nonnegative_integer(
+		context, "mock_fail_read_after_cycles")
+	mock_fail_write_after_cycles = _launch_nonnegative_integer(
+		context, "mock_fail_write_after_cycles")
+	start_adapter = _launch_flag(context, "start_adapter")
+	standalone_tf_fixture = _launch_flag(context, "standalone_tf_fixture")
+	gui = _launch_flag(context, "gui")
 	fastdds_profile_path = load_fastdds_profile_path(profile_path, config_root)
-	generated_config, left_wheel_joint, right_wheel_joint = _write_controller_config(
+	(
+		generated_config,
+		standalone_controller_config,
+		left_wheel_joint,
+		right_wheel_joint,
+	) = _write_controller_config(
 		controller_template_path,
 		wheel_separation,
 		wheel_radius,
-		frame_names)
+		frame_names,
+		use_mock_hardware,
+	)
 
 	try:
 		robot_description = xacro.process_file(
@@ -192,15 +271,22 @@ def _launch_robot_platform(context, *args, **kwargs):
 				"base_link_frame": frame_names["base_link"],
 				"laser_frame": frame_names["laser"],
 				"controller_config": generated_config,
+				"hardware_plugin": (
+					"control_link_adapters/ControlLinkMockSystem"
+					if use_mock_hardware else
+					"gz_ros2_control/GazeboSimSystem"),
+				"hardware_component_name": hardware_component_name,
+				"use_mock_hardware": "true" if use_mock_hardware else "false",
+				"mock_fail_read_after_cycles": str(mock_fail_read_after_cycles),
+				"mock_fail_write_after_cycles": str(mock_fail_write_after_cycles),
 			},
 		).toxml()
 	except Exception:
 		_remove_generated_file(generated_config)
+		if standalone_controller_config is not None:
+			_remove_generated_file(standalone_controller_config)
 		raise
 
-	start_adapter = _launch_flag(context, "start_adapter")
-	standalone_tf_fixture = _launch_flag(context, "standalone_tf_fixture")
-	gui = _launch_flag(context, "gui")
 	# VMware Xwayland 下 Ogre2 GUI 只显示空 Scene，Ogre1 GUI 不改变 server 侧 lidar renderer
 	gz_args = "-r --render-engine-gui ogre -v 2 " + world_path
 	if not gui:
@@ -229,18 +315,34 @@ def _launch_robot_platform(context, *args, **kwargs):
 			"-allow_renaming", "false",
 		],
 	)
+	controller_spawner_arguments = [
+		"joint_state_broadcaster",
+		"diff_drive_controller",
+		"--activate-as-group",
+		"--controller-manager-timeout", "20",
+		"--service-call-timeout", "10",
+		"--switch-timeout", "20",
+	]
 	controller_spawner = Node(
 		package="controller_manager",
 		executable="spawner",
 		name="control_link_controller_spawner",
 		output="screen",
-		arguments=[
-			"joint_state_broadcaster",
-			"diff_drive_controller",
-			"--activate-as-group",
-			"--controller-manager-timeout", "20",
-			"--service-call-timeout", "10",
-			"--switch-timeout", "20",
+		arguments=controller_spawner_arguments,
+	)
+	controller_manager = Node(
+		package="controller_manager",
+		executable="ros2_control_node",
+		output="screen",
+		parameters=[
+			generated_config,
+			{
+				"robot_description": robot_description,
+				"use_sim_time": True,
+			},
+		],
+		remappings=[
+			(controller_node_fqn + "/odom", odometry_topic),
 		],
 	)
 	adapter_node = Node(
@@ -266,6 +368,8 @@ def _launch_robot_platform(context, *args, **kwargs):
 		if event.returncode != 0:
 			raise RuntimeError(
 				"Robot spawn failed with exit code " + str(event.returncode))
+		if use_mock_hardware:
+			return [controller_manager, controller_spawner]
 		return [controller_spawner]
 
 	def on_spawner_exit(event, launch_context):
@@ -279,6 +383,8 @@ def _launch_robot_platform(context, *args, **kwargs):
 
 	def on_shutdown(event, launch_context):
 		_remove_generated_file(generated_config)
+		if standalone_controller_config is not None:
+			_remove_generated_file(standalone_controller_config)
 		return None
 
 	actions = [
@@ -339,6 +445,21 @@ def _launch_robot_platform(context, *args, **kwargs):
 
 def generate_launch_description():
 	return LaunchDescription([
+		DeclareLaunchArgument(
+			"hardware_backend",
+			default_value="gazebo",
+			description="ros2_control hardware backend: gazebo or deterministic mock",
+		),
+		DeclareLaunchArgument(
+			"mock_fail_read_after_cycles",
+			default_value="0",
+			description="Successful mock read cycles before a persistent injected error, zero disables",
+		),
+		DeclareLaunchArgument(
+			"mock_fail_write_after_cycles",
+			default_value="0",
+			description="Successful mock write cycles before a persistent injected error, zero disables",
+		),
 		DeclareLaunchArgument(
 			"gui",
 			default_value="false",

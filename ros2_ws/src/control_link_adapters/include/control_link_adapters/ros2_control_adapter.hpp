@@ -9,11 +9,13 @@
 #include "control_link_adapters/canonical_endpoint_tracker.hpp"
 #include "control_link_adapters/canonical_input_guard.hpp"
 #include "control_link_adapters/controller_endpoint_monitor.hpp"
+#include "control_link_adapters/hardware_component_monitor.hpp"
 #include "control_link_adapters/local_watchdog.hpp"
 #include "control_link_adapters/tf_health_monitor.hpp"
 #include "control_link_contract/contract_bundle.hpp"
 #include "control_link_interfaces/msg/control_command.hpp"
 #include "control_link_interfaces/msg/vehicle_state.hpp"
+#include "controller_manager_msgs/srv/list_hardware_components.hpp"
 #include "geometry_msgs/msg/twist_stamped.hpp"
 #include "nav_msgs/msg/odometry.hpp"
 #include "rclcpp/rclcpp.hpp"
@@ -32,6 +34,8 @@ namespace control_link_adapters
 
 	private:
 		using ControlCommand = control_link_interfaces::msg::ControlCommand;
+		using ListHardwareComponents =
+			controller_manager_msgs::srv::ListHardwareComponents;
 		using VehicleState = control_link_interfaces::msg::VehicleState;
 
 		struct OdomSnapshot
@@ -44,6 +48,9 @@ namespace control_link_adapters
 
 		void poll_canonical_endpoint();
 		void poll_controller_endpoint();
+		void poll_hardware_component();
+		void handle_hardware_component_response(
+			rclcpp::Client<ListHardwareComponents>::SharedFuture future);
 		void handle_canonical_command(
 			const ControlCommand &command,
 			const rclcpp::MessageInfo &message_info);
@@ -56,7 +63,7 @@ namespace control_link_adapters
 			std::int64_t now_ros_ns) const noexcept;
 		[[nodiscard]] std::uint16_t platform_fault_code(
 			std::chrono::steady_clock::time_point now_steady,
-			std::int64_t now_ros_ns) const noexcept;
+			std::int64_t now_ros_ns) const;
 		[[nodiscard]] std::uint16_t current_fault_code(
 			std::chrono::steady_clock::time_point now_steady,
 			std::int64_t now_ros_ns) const;
@@ -66,11 +73,13 @@ namespace control_link_adapters
 		std::string rmw_implementation_;
 		std::chrono::nanoseconds odometry_timeout_;
 		std::chrono::nanoseconds max_future_skew_;
+		std::chrono::milliseconds hardware_state_timeout_;
 
 		std::unique_ptr<CanonicalInputGuard> canonical_guard_;
 		std::unique_ptr<LocalWatchdog> local_watchdog_;
 		std::unique_ptr<CanonicalEndpointTracker> canonical_endpoint_tracker_;
 		std::unique_ptr<ControllerEndpointMonitor> controller_endpoint_monitor_;
+		std::unique_ptr<HardwareComponentMonitor> hardware_component_monitor_;
 
 		// 声明顺序保证销毁时 monitor -> listener -> buffer，避免悬空 buffer 引用
 		std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -82,8 +91,10 @@ namespace control_link_adapters
 		rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr
 			controller_command_publisher_;
 		rclcpp::Publisher<VehicleState>::SharedPtr vehicle_state_publisher_;
+		rclcpp::Client<ListHardwareComponents>::SharedPtr hardware_component_client_;
 		rclcpp::TimerBase::SharedPtr canonical_graph_timer_;
 		rclcpp::TimerBase::SharedPtr controller_graph_timer_;
+		rclcpp::TimerBase::SharedPtr hardware_component_timer_;
 		rclcpp::TimerBase::SharedPtr controller_output_timer_;
 		rclcpp::TimerBase::SharedPtr vehicle_state_timer_;
 
@@ -95,6 +106,8 @@ namespace control_link_adapters
 		ControllerEndpointSnapshot controller_endpoint_snapshot_{
 			ControllerEndpointState::kUnavailable,
 			std::nullopt};
+		bool hardware_request_pending_{false};
+		std::optional<std::chrono::steady_clock::time_point> hardware_request_started_at_;
 		TfHealthSnapshot tf_health_snapshot_{
 			TfHealthState::kUnavailable,
 			0,

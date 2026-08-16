@@ -91,8 +91,11 @@ namespace
 				*bundle_->profile,
 				"VehicleSimulator");
 
-			signal_map_ = control_link_contract::load_can_signal_map(
-				adas_profile_->adapter.config_path);
+			signal_map_ = bundle_->can_signal_map;
+			if (!signal_map_)
+			{
+				throw std::logic_error("ADAS ContractBundle is missing its CAN signal map");
+			}
 			codec_ = std::make_unique<CanCodec>(*signal_map_);
 			control_counter_checker_ = RollingCounterChecker(
 				codec_->config().rolling_counter_modulo);

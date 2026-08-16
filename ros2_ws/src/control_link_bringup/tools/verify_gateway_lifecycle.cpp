@@ -17,6 +17,8 @@
 #include "control_link_interfaces/msg/gateway_state.hpp"
 #include "control_link_interfaces/msg/source_status.hpp"
 #include "control_link_interfaces/msg/vehicle_state.hpp"
+#include "diagnostic_msgs/msg/diagnostic_array.hpp"
+#include "diagnostic_msgs/msg/diagnostic_status.hpp"
 #include "lifecycle_msgs/msg/state.hpp"
 #include "lifecycle_msgs/msg/transition.hpp"
 #include "lifecycle_msgs/srv/change_state.hpp"
@@ -29,6 +31,8 @@ namespace
 	using namespace std::chrono_literals;
 	using ChangeState = lifecycle_msgs::srv::ChangeState;
 	using ControlCommand = control_link_interfaces::msg::ControlCommand;
+	using DiagnosticArray = diagnostic_msgs::msg::DiagnosticArray;
+	using DiagnosticStatus = diagnostic_msgs::msg::DiagnosticStatus;
 	using GatewayState = control_link_interfaces::msg::GatewayState;
 	using GetState = lifecycle_msgs::srv::GetState;
 	using SourceStatus = control_link_interfaces::msg::SourceStatus;
@@ -107,6 +111,19 @@ namespace
 						hold_count_ += 1U;
 					}
 				});
+			diagnostics_subscription_ = create_subscription<DiagnosticArray>(
+				bundle_->gateway_contract->state_topics.at("diagnostics").topic,
+				rclcpp::QoS(rclcpp::KeepLast(10U)),
+				[this](DiagnosticArray::ConstSharedPtr message)
+				{
+					for (const auto &status : message->status)
+					{
+						if (status.name == "gateway/config")
+						{
+							config_identity_observed_ = config_identity_matches(status);
+						}
+					}
+				});
 
 			get_state_client_ = create_client<GetState>(target_fqn_ + "/get_state");
 			change_state_client_ =
@@ -124,6 +141,14 @@ namespace
 				executor,
 				lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE,
 				5s);
+			wait_until(
+				executor,
+				[this]()
+				{
+					return config_identity_observed_;
+				},
+				3s,
+				"Gateway diagnostics did not expose the validated config identity");
 
 			// 配置后 Gateway 的 Lifecycle publisher 已进入 Graph，第二个 publisher 会让 adapter fail closed
 			rogue_canonical_publisher_ = create_publisher<ControlCommand>(
@@ -293,6 +318,34 @@ namespace
 			rclcpp::Publisher<ControlCommand>::SharedPtr publisher;
 			std::uint64_t sequence{0U};
 		};
+
+		std::optional<std::string> diagnostic_value(
+			const DiagnosticStatus &status,
+			const std::string &key) const
+		{
+			for (const auto &value : status.values)
+			{
+				if (value.key == key)
+				{
+					return value.value;
+				}
+			}
+			return std::nullopt;
+		}
+
+		bool config_identity_matches(const DiagnosticStatus &status) const
+		{
+			const auto &identity = bundle_->identity;
+			return status.level == DiagnosticStatus::OK &&
+				diagnostic_value(status, "contract_id") == identity.contract.contract_id &&
+				diagnostic_value(status, "contract_version") ==
+					std::to_string(identity.contract.contract_version) &&
+				diagnostic_value(status, "contract_hash") == identity.contract.contract_hash &&
+				diagnostic_value(status, "profile_id") ==
+					identity.decision_config.profile_id &&
+				diagnostic_value(status, "decision_config_hash") ==
+					identity.decision_config.decision_config_hash;
+		}
 
 		void wait_for_lifecycle_services(
 			rclcpp::executors::SingleThreadedExecutor &executor)
@@ -510,6 +563,7 @@ namespace
 		rclcpp::Subscription<SourceStatus>::SharedPtr source_status_subscription_;
 		rclcpp::Subscription<VehicleState>::SharedPtr vehicle_state_subscription_;
 		rclcpp::Subscription<ControlCommand>::SharedPtr canonical_subscription_;
+		rclcpp::Subscription<DiagnosticArray>::SharedPtr diagnostics_subscription_;
 		rclcpp::Client<GetState>::SharedPtr get_state_client_;
 		rclcpp::Client<ChangeState>::SharedPtr change_state_client_;
 		rclcpp::Publisher<ControlCommand>::SharedPtr rogue_canonical_publisher_;
@@ -523,6 +577,7 @@ namespace
 		std::uint64_t ambiguous_planning_sequence_{0U};
 		std::uint64_t canonical_count_{0U};
 		std::uint64_t hold_count_{0U};
+		bool config_identity_observed_{false};
 		std::string target_fqn_;
 	};
 }  // namespace

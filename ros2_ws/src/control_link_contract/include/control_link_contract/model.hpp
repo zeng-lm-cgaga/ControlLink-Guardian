@@ -144,6 +144,7 @@ namespace control_link_contract
 	{
 		std::uint64_t schema_version;
 		std::string contract_id;
+		std::uint64_t contract_version;
 		GatewaySettings gateway;
 		CommandLimits limits;
 		std::map<std::string, QosProfile> qos_profiles;
@@ -277,7 +278,9 @@ namespace control_link_contract
 	{
 		std::filesystem::path config_path;
 		std::string canonical_input_topic;
+		std::string controller_manager_fqn;
 		std::string controller_node_fqn;
+		std::string hardware_component_name;
 		std::string controller_output_topic;
 		std::string controller_command_type;
 		std::string odometry_topic;

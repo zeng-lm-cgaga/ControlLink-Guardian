@@ -209,8 +209,11 @@ namespace control_link_adapters
 				"SocketCanAdapter use_sim_time does not match ADAS Profile");
 		}
 
-		signal_map_ = control_link_contract::load_can_signal_map(
-			adas_profile_->adapter.config_path);
+		signal_map_ = bundle_->can_signal_map;
+		if (!signal_map_)
+		{
+			throw std::logic_error("ADAS ContractBundle is missing its CAN signal map");
+		}
 		can_codec_ = std::make_unique<CanCodec>(*signal_map_);
 		state_counter_checker_ = RollingCounterChecker(
 			can_codec_->config().rolling_counter_modulo);

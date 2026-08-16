@@ -19,7 +19,9 @@ adapter:
   type: ros2_control
   config: ros2_control.yaml
   canonical_input_topic: /control_link/output/control_cmd
+  controller_manager_fqn: /controller_manager
   controller_node_fqn: /diff_drive_controller
+  hardware_component_name: ControlLinkExecutionSystem
   controller_output_topic: /diff_drive_controller/cmd_vel
   controller_command_type: geometry_msgs/msg/TwistStamped
   odometry_topic: /odom

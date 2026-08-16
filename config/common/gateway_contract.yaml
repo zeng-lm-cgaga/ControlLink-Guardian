@@ -1,5 +1,6 @@
 schema_version: 1
 contract_id: control_link_gateway_v1
+contract_version: 1
 
 gateway:
   node_fqn: /control_link/gateway

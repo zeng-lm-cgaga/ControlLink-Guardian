@@ -471,7 +471,7 @@ namespace control_link_contract
 				require_map(root, "root");
 				check_keys(
 					root,
-					{"schema_version", "contract_id", "gateway", "limits", "qos_profiles", "input",
+					{"schema_version", "contract_id", "contract_version", "gateway", "limits", "qos_profiles", "input",
 					 "output", "state_topics", "critical_endpoints"},
 					"root");
 
@@ -488,10 +488,19 @@ namespace control_link_contract
 				{
 					fail("contract_id", "empty identifier", "non-empty string", "empty", "填写 Contract 标识");
 				}
+				const auto contract_version = require_uint(
+					root, "contract_version", "contract_version");
+				if (contract_version == 0U)
+				{
+					fail(
+						"contract_version", "invalid Contract version", "positive integer", "0",
+						"行为契约发生变化时递增该人工维护版本");
+				}
 
 				GatewayContract contract{
 					schema_version,
 					contract_id,
+					contract_version,
 					parse_gateway(require_field(root, "gateway", "gateway")),
 					parse_limits(require_field(root, "limits", "limits")),
 					parse_qos_profiles(require_field(root, "qos_profiles", "qos_profiles")),
@@ -1813,7 +1822,8 @@ namespace control_link_contract
 			{
 				check_keys(
 					node,
-					{"type", "config", "canonical_input_topic", "controller_node_fqn",
+					{"type", "config", "canonical_input_topic", "controller_manager_fqn",
+					 "controller_node_fqn", "hardware_component_name",
 					 "controller_output_topic", "controller_command_type", "odometry_topic",
 					 "local_watchdog_timeout_ms"},
 					path);
@@ -1836,10 +1846,18 @@ namespace control_link_contract
 					node,
 					"canonical_input_topic",
 					child_path(path, "canonical_input_topic"));
+				const auto controller_manager_fqn = require_string(
+					node,
+					"controller_manager_fqn",
+					child_path(path, "controller_manager_fqn"));
 				const auto controller_node_fqn = require_string(
 					node,
 					"controller_node_fqn",
 					child_path(path, "controller_node_fqn"));
+				const auto hardware_component_name = require_string(
+					node,
+					"hardware_component_name",
+					child_path(path, "hardware_component_name"));
 				const auto controller_output_topic = require_string(
 					node,
 					"controller_output_topic",
@@ -1861,6 +1879,13 @@ namespace control_link_contract
 						child_path(path, "controller_node_fqn"), "invalid ROS node FQN",
 						"absolute node FQN", controller_node_fqn,
 						"填写提供 controller command subscription 的 ros2_control node FQN");
+				}
+				if (!is_valid_node_fqn(controller_manager_fqn))
+				{
+					fail(
+						child_path(path, "controller_manager_fqn"), "invalid ROS node FQN",
+						"absolute node FQN", controller_manager_fqn,
+						"填写提供 ros2_control hardware state service 的 controller manager FQN");
 				}
 				if (!is_valid_topic_name(controller_output_topic))
 				{
@@ -1897,7 +1922,9 @@ namespace control_link_contract
 				RobotAdapterConfig result{
 					config_path,
 					canonical_input_topic,
+					controller_manager_fqn,
 					controller_node_fqn,
+					hardware_component_name,
 					controller_output_topic,
 					controller_command_type,
 					odometry_topic,

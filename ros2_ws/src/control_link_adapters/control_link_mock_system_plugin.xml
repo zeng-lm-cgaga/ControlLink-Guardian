@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<library path="control_link_mock_system">
+	<class
+		name="control_link_adapters/ControlLinkMockSystem"
+		type="control_link_adapters::ControlLinkMockSystem"
+		base_class_type="hardware_interface::SystemInterface">
+		<description>
+			Deterministic two-wheel mock actuator used to validate the ControlLink ros2_control execution boundary
+		</description>
+	</class>
+</library>

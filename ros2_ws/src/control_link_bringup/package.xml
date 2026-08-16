@@ -10,6 +10,7 @@
 	<buildtool_depend>ament_cmake_python</buildtool_depend>
 	<depend>control_link_contract</depend>
 	<depend>control_link_adapters</depend>
+	<depend>control_link_gateway</depend>
 	<depend>control_link_interfaces</depend>
 	<depend>controller_manager_msgs</depend>
 	<depend>diagnostic_msgs</depend>
@@ -22,11 +23,11 @@
 	<depend>rclcpp_action</depend>
 	<depend>ros_gz_interfaces</depend>
 	<depend>rosgraph_msgs</depend>
+	<depend>sensor_msgs</depend>
 	<depend>tf2</depend>
 	<depend>tf2_ros</depend>
 	<exec_depend>ament_index_python</exec_depend>
 	<exec_depend>controller_manager</exec_depend>
-	<exec_depend>control_link_gateway</exec_depend>
 	<exec_depend>diff_drive_controller</exec_depend>
 	<exec_depend>gz_ros2_control</exec_depend>
 	<exec_depend>iproute2</exec_depend>
@@ -40,10 +41,10 @@
 	<exec_depend>ros_gz_bridge</exec_depend>
 	<exec_depend>ros_gz_sim</exec_depend>
 	<exec_depend>ros2bag</exec_depend>
-	<exec_depend>sensor_msgs</exec_depend>
 	<exec_depend>xacro</exec_depend>
 	<test_depend>launch_testing_ament_cmake</test_depend>
 	<test_depend>launch_testing_ros</test_depend>
+	<test_depend>ament_cmake_gtest</test_depend>
 	<test_depend>ament_cmake_pytest</test_depend>
 	<test_depend>python3-pytest</test_depend>
 

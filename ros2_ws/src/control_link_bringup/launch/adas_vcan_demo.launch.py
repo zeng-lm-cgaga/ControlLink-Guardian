@@ -38,6 +38,13 @@ def _positive_float_argument(context, name):
 	return parsed
 
 
+def _positive_integer_argument(context, name):
+	value = LaunchConfiguration(name).perform(context)
+	if not value.isdecimal() or int(value) <= 0:
+		raise RuntimeError(name + " must be a positive integer; actual=" + value)
+	return int(value)
+
+
 def _launch_adas_vcan(context, *args, **kwargs):
 	package_share = get_package_share_directory("control_link_bringup")
 	profile_path = os.path.realpath(
@@ -76,6 +83,13 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		"profile_path": profile_path,
 		"config_root": config_root,
 		"use_sim_time": False,
+	}
+	gateway_parameters = {
+		**common_parameters,
+		"decision_trace_path": LaunchConfiguration(
+			"decision_trace_path").perform(context),
+		"decision_trace_queue_capacity": _positive_integer_argument(
+			context, "decision_trace_queue_capacity"),
 	}
 
 	start_source = _bool_argument(context, "start_source")
@@ -177,7 +191,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			output="screen",
 			emulate_tty=True,
 			additional_env=participant_env,
-			parameters=[common_parameters],
+			parameters=[gateway_parameters],
 		))
 	if start_lifecycle_activator:
 		actions.append(
@@ -251,6 +265,16 @@ def generate_launch_description():
 			"fault_code",
 			default_value="0",
 			description="Inject a demo vehicle fault code in the range 0..255",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_path",
+			default_value="",
+			description="Absolute JSONL path for optional Gateway decision recording",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_queue_capacity",
+			default_value="4096",
+			description="Bounded Gateway decision trace queue capacity",
 		),
 		OpaqueFunction(function=_launch_adas_vcan),
 	])

@@ -12,6 +12,7 @@
 	<depend>control_link_interfaces</depend>
 	<depend>diagnostic_msgs</depend>
 	<depend>lifecycle_msgs</depend>
+	<depend>nlohmann-json-dev</depend>
 	<depend>rclcpp</depend>
 	<depend>rclcpp_lifecycle</depend>
 	<depend>rmw</depend>

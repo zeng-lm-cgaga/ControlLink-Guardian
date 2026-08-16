@@ -540,8 +540,11 @@ namespace
 					record_gateway_state(*state);
 				});
 
-			signal_map_ = control_link_contract::load_can_signal_map(
-				adas_profile_->adapter.config_path);
+			signal_map_ = bundle_->can_signal_map;
+			if (!signal_map_)
+			{
+				throw std::logic_error("ADAS ContractBundle is missing its CAN signal map");
+			}
 			can_codec_ = std::make_unique<CanCodec>(*signal_map_);
 			can_fd_ = open_can_observer(
 				can_interface_,

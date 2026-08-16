@@ -53,11 +53,56 @@ Robot 与 ADAS 复用相同的 Contract、命令校验、来源仲裁和状态�
 
 Robot Profile 使用 Nav2、AMCL、tf2、ros2_control 和 Gazebo，Gateway 的 canonical command 只能经执行 adapter 进入 `diff_drive_controller`
 
+![Robot Profile 的 Gazebo 仿真闭环](assets/机器人仿真闭环.png)
+
+## 快速运行
+
+在已安装 ROS2 Humble 与项目依赖的 Ubuntu 环境中构建工作区：
+
+```bash
+cd ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+source install/setup.bash
+```
+
+启动 Robot/Nav2/Gazebo 闭环：
+
+```bash
+ros2 launch control_link_bringup robot_demo.launch.py
+```
+
+首次创建 vcan 设备后启动 ADAS 软件闭环：
+
+```bash
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan
+sudo ip link set vcan0 up
+ros2 launch control_link_bringup adas_vcan_demo.launch.py can_interface:=vcan0
+```
+
 ## 虚拟机性能基线
 
-![三轮 VMware 和 vcan 软件闭环性能基线](assets/虚拟机性能基线.png)
+测试环境为 ROS2 Humble、Fast DDS、VMware 和 vcan，三轮独立运行均包含 30 秒 warm-up 与 300 秒 measurement，聚合结果通过配置、样本量、运行连续性和 artifact SHA-256 校验
 
-图中数据来自三轮独立的 300 秒 ROS2 Humble VMware/vcan 外部观测，统计范围只描述当前虚拟机软件闭环，不外推为实车、物理 CAN 或硬实时性能
+| 指标 | 聚合样本数 | 三轮结果范围 |
+|---|---:|---:|
+| canonical output interval mean | 44,997 | 19.99996 - 20.00023 ms |
+| canonical output interval p99 | 44,997 | 20.66683 - 20.69130 ms |
+| canonical output absolute jitter p99 | 44,997 | 0.75989 - 0.79229 ms |
+| command callback-to-output p99 | 22,500 | 6.65729 - 20.06467 ms |
+| CAN control/state round-trip p99 | 40,869 | 20.92152 - 20.96797 ms |
+| source switch external observation | 3 | 133.4353 - 739.1794 ms |
+
+| 进程 | CPU mean | CPU max | RSS max |
+|---|---:|---:|---:|
+| Gateway | 4.97% - 5.24% | 6.01% - 7.00% | 42,372 - 42,404 KiB |
+| SocketCAN Adapter | 2.51% - 2.79% | 4.00% - 4.00% | 42,216 - 42,380 KiB |
+| Vehicle Simulator | 0.58% - 0.59% | 2.00% - 2.00% | 42,004 - 42,112 KiB |
+| Control Source | 0.81% - 0.85% | 2.00% - 2.00% | 39,400 - 39,736 KiB |
+| External Observer | 2.73% - 3.00% | 4.00% - 5.00% | 43,348 - 43,608 KiB |
+
+source switch 每轮只有一个外部观察样本，起点不是 Gateway 内部 challenger 计时点，因此只展示范围，不作为稳定时延分布结论；全部数据只描述当前虚拟机软件闭环，不外推为实车、物理 CAN 或硬实时性能
 
 ## 技术栈
 

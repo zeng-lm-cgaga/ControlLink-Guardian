@@ -26,6 +26,15 @@ def _launch_gateway(context, *args, **kwargs):
 	fastdds_profile_path = load_fastdds_profile_path(
 		profile_path,
 		config_root)
+	decision_trace_path = LaunchConfiguration(
+		"decision_trace_path").perform(context)
+	trace_capacity_text = LaunchConfiguration(
+		"decision_trace_queue_capacity").perform(context)
+	if not trace_capacity_text.isdecimal() or int(trace_capacity_text) <= 0:
+		raise RuntimeError(
+			"decision_trace_queue_capacity must be a positive integer; actual=" +
+			trace_capacity_text)
+	decision_trace_queue_capacity = int(trace_capacity_text)
 
 	actions = [
 		Node(
@@ -45,6 +54,9 @@ def _launch_gateway(context, *args, **kwargs):
 				{
 					"profile_path": profile_path,
 					"config_root": config_root,
+					"decision_trace_path": decision_trace_path,
+					"decision_trace_queue_capacity":
+						decision_trace_queue_capacity,
 				}
 			],
 		)
@@ -143,6 +155,16 @@ def generate_launch_description():
 			"mock_source_id",
 			default_value="",
 			description="Enabled source used by the optional mock control source",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_path",
+			default_value="",
+			description="Absolute JSONL path for optional Gateway decision recording",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_queue_capacity",
+			default_value="4096",
+			description="Bounded Gateway decision trace queue capacity",
 		),
 		OpaqueFunction(function=_launch_gateway),
 	])

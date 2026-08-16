@@ -255,6 +255,12 @@ namespace control_link_contract
 			load_gateway_contract(common.contract_path);
 		auto source_policy =
 			load_source_policy(common.source_policy_path);
+		CanSignalMapPtr can_signal_map;
+		if (const auto *adas = std::get_if<AdasProfile>(profile.get()))
+		{
+			// ADAS codec 与配置身份必须共享同一份不可变 signal map，避免二次读取产生 TOCTOU 漂移
+			can_signal_map = load_can_signal_map(adas->adapter.config_path);
+		}
 
 		validate_sources(
 			common,
@@ -271,10 +277,21 @@ namespace control_link_contract
 			vehicle_state,
 			profile_path);
 
+		auto identity = make_runtime_config_identity(
+			*gateway_contract,
+			*source_policy,
+			*profile,
+			can_signal_map.get());
+		auto fastdds_profile_hash = sha256_file_content(
+			common.fastdds_profile_path);
+
 		ContractBundle bundle{
 			std::move(profile),
 			std::move(gateway_contract),
-			std::move(source_policy)};
+			std::move(source_policy),
+			std::move(can_signal_map),
+			std::move(fastdds_profile_hash),
+			std::move(identity)};
 
 		return std::make_shared<const ContractBundle>(
 			std::move(bundle));

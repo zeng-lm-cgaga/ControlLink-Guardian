@@ -206,6 +206,9 @@ namespace control_link_adapters
 			bundle_->gateway_contract->limits.max_future_skew_ms,
 			"limits.max_future_skew_ms",
 			true);
+		hardware_state_timeout_ = checked_milliseconds(
+			robot_profile_->health.controller_state_timeout_ms,
+			"health.controller_state_timeout_ms");
 
 		control_link_contract::QosFactory qos_factory{
 			bundle_->gateway_contract};
@@ -252,6 +255,9 @@ namespace control_link_adapters
 				checked_milliseconds(
 					robot_profile_->health.controller_state_timeout_ms,
 					"health.controller_state_timeout_ms"));
+		hardware_component_monitor_ = std::make_unique<HardwareComponentMonitor>(
+			robot_profile_->adapter.hardware_component_name,
+			hardware_state_timeout_);
 
 		tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
 		// dedicated listener thread 让带 timeout 的 lookup 不会阻塞等待同一 executor 处理 /tf
@@ -273,6 +279,9 @@ namespace control_link_adapters
 		vehicle_state_publisher_ = create_publisher<VehicleState>(
 			vehicle_state_contract.topic,
 			vehicle_state_qos);
+		hardware_component_client_ = create_client<ListHardwareComponents>(
+			robot_profile_->adapter.controller_manager_fqn +
+			"/list_hardware_components");
 
 		canonical_subscription_ = create_subscription<ControlCommand>(
 			robot_profile_->adapter.canonical_input_topic,
@@ -294,6 +303,9 @@ namespace control_link_adapters
 		const auto graph_period = checked_milliseconds(
 			bundle_->gateway_contract->gateway.graph_poll_ms,
 			"gateway.graph_poll_ms");
+		const auto vehicle_state_period = checked_milliseconds(
+			robot_profile_->health.vehicle_state_publish_period_ms,
+			"health.vehicle_state_publish_period_ms");
 		canonical_graph_timer_ = create_wall_timer(
 			graph_period,
 			[this]()
@@ -306,6 +318,12 @@ namespace control_link_adapters
 			{
 				poll_controller_endpoint();
 			});
+		hardware_component_timer_ = create_wall_timer(
+			vehicle_state_period,
+			[this]()
+			{
+				poll_hardware_component();
+			});
 		controller_output_timer_ = create_wall_timer(
 			output_period(bundle_->gateway_contract->gateway.output_rate_hz),
 			[this]()
@@ -313,9 +331,7 @@ namespace control_link_adapters
 				publish_controller_command();
 			});
 		vehicle_state_timer_ = create_wall_timer(
-			checked_milliseconds(
-				robot_profile_->health.vehicle_state_publish_period_ms,
-				"health.vehicle_state_publish_period_ms"),
+			vehicle_state_period,
 			[this]()
 			{
 				publish_vehicle_state();
@@ -323,9 +339,10 @@ namespace control_link_adapters
 
 		RCLCPP_INFO(
 			get_logger(),
-			"Ros2ControlAdapter ready: canonical=%s, controller=%s, odometry=%s, vehicle_state=%s",
+			"Ros2ControlAdapter ready: canonical=%s, controller=%s, hardware=%s, odometry=%s, vehicle_state=%s",
 			robot_profile_->adapter.canonical_input_topic.c_str(),
 			robot_profile_->adapter.controller_output_topic.c_str(),
+			robot_profile_->adapter.hardware_component_name.c_str(),
 			robot_profile_->adapter.odometry_topic.c_str(),
 			vehicle_state_contract.topic.c_str());
 	}
@@ -362,6 +379,65 @@ namespace control_link_adapters
 			robot_profile_->adapter.controller_output_topic);
 		controller_endpoint_snapshot_ = controller_endpoint_monitor_->observe(
 			subscriptions,
+			std::chrono::steady_clock::now());
+	}
+
+	void Ros2ControlAdapter::poll_hardware_component()
+	{
+		const auto now = std::chrono::steady_clock::now();
+		if (hardware_request_pending_)
+		{
+			if (!hardware_request_started_at_.has_value())
+			{
+				throw std::logic_error(
+					"pending hardware state request has no start time");
+			}
+			if (now - hardware_request_started_at_.value() > hardware_state_timeout_)
+			{
+				// 未响应 request 必须从 rclcpp client 中移除，避免 manager 失联时无界积累
+				hardware_component_client_->prune_pending_requests();
+				hardware_request_pending_ = false;
+				hardware_request_started_at_.reset();
+			}
+			return;
+		}
+
+		if (!hardware_component_client_->service_is_ready())
+		{
+			return;
+		}
+
+		hardware_request_pending_ = true;
+		hardware_request_started_at_ = now;
+		try
+		{
+			hardware_component_client_->async_send_request(
+				std::make_shared<ListHardwareComponents::Request>(),
+				[this](rclcpp::Client<ListHardwareComponents>::SharedFuture future)
+				{
+					handle_hardware_component_response(std::move(future));
+				});
+		}
+		catch (...)
+		{
+			hardware_request_pending_ = false;
+			hardware_request_started_at_.reset();
+			throw;
+		}
+	}
+
+	void Ros2ControlAdapter::handle_hardware_component_response(
+		rclcpp::Client<ListHardwareComponents>::SharedFuture future)
+	{
+		hardware_request_pending_ = false;
+		hardware_request_started_at_.reset();
+		const auto response = future.get();
+		if (response == nullptr)
+		{
+			return;
+		}
+		hardware_component_monitor_->observe(
+			response->component,
 			std::chrono::steady_clock::now());
 	}
 
@@ -463,8 +539,23 @@ namespace control_link_adapters
 
 	std::uint16_t Ros2ControlAdapter::platform_fault_code(
 		std::chrono::steady_clock::time_point now_steady,
-		std::int64_t now_ros_ns) const noexcept
+		std::int64_t now_ros_ns) const
 	{
+		const auto hardware = hardware_component_monitor_->assess(now_steady);
+		switch (hardware.health)
+		{
+		case HardwareComponentHealth::kHealthy:
+			break;
+
+		case HardwareComponentHealth::kUnavailable:
+		case HardwareComponentHealth::kTimedOut:
+			return VehicleState::FAULT_ROBOT_HARDWARE_STATE_TIMEOUT;
+
+		case HardwareComponentHealth::kInactive:
+		case HardwareComponentHealth::kInvalid:
+			return VehicleState::FAULT_ROBOT_HARDWARE_INACTIVE;
+		}
+
 		if (!controller_endpoint_snapshot_.healthy())
 		{
 			return controller_endpoint_snapshot_.state ==

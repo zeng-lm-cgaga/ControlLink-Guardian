@@ -17,6 +17,8 @@ MAX_MEASUREMENT_SECONDS=86400
 MAX_MIN_OUTPUT_TICKS=1000000000
 MAX_EXTRA_WAIT_LIMIT=86400
 SOURCE_SWITCH_SCENARIO=false
+DECISION_TRACE=false
+DECISION_TRACE_QUEUE_CAPACITY=4096
 LAUNCH_PID=""
 LAUNCH_PGID=""
 MEASUREMENT_PID=""
@@ -37,7 +39,9 @@ usage()
 		"  --measurement-seconds <integer>" \
 		"  --min-output-ticks <integer>" \
 		"  --max-extra-wait-seconds <integer>" \
-		"  --source-switch"
+		"  --source-switch" \
+		"  --decision-trace" \
+		"  --decision-trace-queue-capacity <integer>"
 }
 
 fail()
@@ -112,6 +116,15 @@ while (($# > 0)); do
 			SOURCE_SWITCH_SCENARIO=true
 			shift
 			;;
+		--decision-trace)
+			DECISION_TRACE=true
+			shift
+			;;
+		--decision-trace-queue-capacity)
+			(($# >= 2)) || fail "--decision-trace-queue-capacity requires a value"
+			DECISION_TRACE_QUEUE_CAPACITY="$2"
+			shift 2
+			;;
 		-h|--help)
 			usage
 			exit 0
@@ -129,9 +142,15 @@ require_bounded_unsigned "${WARMUP_SECONDS}" "warmup-seconds" "${MAX_WARMUP_SECO
 require_bounded_unsigned "${MEASUREMENT_SECONDS}" "measurement-seconds" "${MAX_MEASUREMENT_SECONDS}"
 require_bounded_unsigned "${MIN_OUTPUT_TICKS}" "min-output-ticks" "${MAX_MIN_OUTPUT_TICKS}"
 require_bounded_unsigned "${MAX_EXTRA_WAIT_SECONDS}" "max-extra-wait-seconds" "${MAX_EXTRA_WAIT_LIMIT}"
+require_bounded_unsigned \
+	"${DECISION_TRACE_QUEUE_CAPACITY}" \
+	"decision-trace-queue-capacity" \
+	"${MAX_MIN_OUTPUT_TICKS}"
 ((MEASUREMENT_SECONDS > 0)) || fail "measurement-seconds must be positive"
 ((MIN_OUTPUT_TICKS > 0)) || fail "min-output-ticks must be positive"
 ((MAX_EXTRA_WAIT_SECONDS > 0)) || fail "max-extra-wait-seconds must be positive"
+((DECISION_TRACE_QUEUE_CAPACITY > 0)) ||
+	fail "decision-trace-queue-capacity must be positive"
 [[ "${CAN_INTERFACE}" =~ ^vcan[0-9]+$ ]] ||
 	fail "performance baseline only accepts an explicit vcan<N> interface" 3
 
@@ -168,6 +187,9 @@ mkdir -p -- \
 	"${RUN_DIR}/contract_snapshot" \
 	"${RUN_DIR}/logs" \
 	"${RUN_DIR}/performance"
+if [[ "${DECISION_TRACE}" == true ]]; then
+	mkdir -p -- "${RUN_DIR}/decision_trace"
+fi
 : > "${RUN_DIR}/logs/secondary_source.log"
 
 PROFILE_PATH="${ROOT_DIR}/config/adas/adas_profile.yaml"
@@ -373,6 +395,15 @@ LAUNCH_COMMAND=(
 	ros2 launch control_link_bringup adas_vcan_demo.launch.py
 	"can_interface:=${CAN_INTERFACE}"
 )
+TRACE_PATH="${RUN_DIR}/decision_trace/trace.jsonl"
+TRACE_REPLAY_RESULT_PATH="${RUN_DIR}/decision_trace/replay_result.json"
+TRACE_REPLAY_EXIT_CODE="not_run"
+if [[ "${DECISION_TRACE}" == true ]]; then
+	LAUNCH_COMMAND+=(
+		"decision_trace_path:=${TRACE_PATH}"
+		"decision_trace_queue_capacity:=${DECISION_TRACE_QUEUE_CAPACITY}"
+	)
+fi
 printf 'Launch command:'
 printf ' %q' "${LAUNCH_COMMAND[@]}"
 printf '\n'
@@ -495,6 +526,19 @@ tail -n 20 "${RUN_DIR}/logs/measurement.log"
 cleanup_secondary_source
 cleanup_launch
 LAUNCH_PID=""
+
+if [[ "${DECISION_TRACE}" == true ]]; then
+	set +e
+	ros2 run control_link_bringup replay_decisions \
+		--profile-path "${PROFILE_PATH}" \
+		--config-root "${CONFIG_ROOT}" \
+		--trace "${TRACE_PATH}" \
+		--result "${TRACE_REPLAY_RESULT_PATH}" \
+		--repeat 1 > "${RUN_DIR}/logs/decision_replay.log" 2>&1
+	TRACE_REPLAY_EXIT_CODE=$?
+	set -e
+fi
+
 END_SYSTEM_TIME="$(date --iso-8601=seconds)"
 END_MONOTONIC_SECONDS="$(cut -d' ' -f1 /proc/uptime)"
 
@@ -521,6 +565,8 @@ fi
 
 if [[ "${MEASUREMENT_EXIT_CODE}" -eq 0 ]] &&
 	[[ "${LAUNCH_PROCESS_FAILURE}" == false ]] &&
+	{ [[ "${DECISION_TRACE}" == false ]] ||
+		[[ "${TRACE_REPLAY_EXIT_CODE}" -eq 0 ]]; } &&
 	jq -e '.completed == true' "${RUN_DIR}/performance/summary.json" >/dev/null 2>&1; then
 	if jq -e '.protocol.protocol_conformant_parameters == true' \
 		"${RUN_DIR}/performance/summary.json" >/dev/null; then
@@ -537,6 +583,11 @@ fi
 		environment.json \
 		performance/*.csv \
 		performance/summary.json > artifact_sha256.txt
+	if [[ "${DECISION_TRACE}" == true ]]; then
+		sha256sum \
+			decision_trace/trace.jsonl \
+			decision_trace/replay_result.json >> artifact_sha256.txt
+	fi
 )
 
 cat > "${RUN_DIR}/run_manifest.yaml" <<EOF
@@ -560,6 +611,9 @@ warmup_seconds: ${WARMUP_SECONDS}
 measurement_seconds: ${MEASUREMENT_SECONDS}
 minimum_output_ticks: ${MIN_OUTPUT_TICKS}
 source_switch_scenario: ${SOURCE_SWITCH_SCENARIO}
+decision_trace_enabled: ${DECISION_TRACE}
+decision_trace_queue_capacity: ${DECISION_TRACE_QUEUE_CAPACITY}
+decision_trace_replay_exit_code: ${TRACE_REPLAY_EXIT_CODE}
 measurement_exit_code: ${MEASUREMENT_EXIT_CODE}
 launch_command: >-
   ${LAUNCH_COMMAND_TEXT}
@@ -579,6 +633,9 @@ artifacts:
   launch_log: logs/launch.log
   measurement_log: logs/measurement.log
   secondary_source_log: logs/secondary_source.log
+  decision_trace: $([[ "${DECISION_TRACE}" == true ]] && printf 'decision_trace/trace.jsonl' || printf 'not_recorded')
+  decision_replay_result: $([[ "${DECISION_TRACE}" == true ]] && printf 'decision_trace/replay_result.json' || printf 'not_recorded')
+  decision_replay_log: $([[ "${DECISION_TRACE}" == true ]] && printf 'logs/decision_replay.log' || printf 'not_recorded')
 limitations:
   - vm_only_soft_realtime
   - canonical_interval_is_external_dds_delivery_interval

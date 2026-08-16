@@ -17,10 +17,15 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(control_link_contract REQUIRED)
 find_package(control_link_interfaces REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(hardware_interface REQUIRED)
+find_package(lifecycle_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
+find_package(pluginlib REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_lifecycle REQUIRED)
 find_package(rmw REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
@@ -35,9 +40,31 @@ add_library(${PROJECT_NAME} SHARED
 	src/canonical_input_guard.cpp
 	src/canonical_endpoint_tracker.cpp
 	src/controller_endpoint_monitor.cpp
+	src/hardware_component_monitor.cpp
 	src/tf_health_monitor.cpp
 	src/twist_ingress_adapter.cpp
 	src/ros2_control_adapter.cpp
+)
+
+add_library(control_link_mock_system SHARED
+	src/control_link_mock_system.cpp
+)
+target_include_directories(control_link_mock_system
+	PUBLIC
+		$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+		$<INSTALL_INTERFACE:include>
+)
+ament_target_dependencies(control_link_mock_system
+	PUBLIC
+		hardware_interface
+		pluginlib
+		rclcpp
+		rclcpp_lifecycle
+)
+target_compile_options(control_link_mock_system PRIVATE -Wall -Wextra -Wpedantic)
+pluginlib_export_plugin_description_file(
+	hardware_interface
+	control_link_mock_system_plugin.xml
 )
 
 add_executable(mock_control_source_node
@@ -70,8 +97,10 @@ ament_target_dependencies(${PROJECT_NAME}
 		builtin_interfaces
 		control_link_contract
 		control_link_interfaces
+		controller_manager_msgs
 		diagnostic_msgs
 		geometry_msgs
+		lifecycle_msgs
 		nav_msgs
 		rclcpp
 		rmw
@@ -136,6 +165,21 @@ if(BUILD_TESTING)
 	)
 	target_compile_options(test_can_codec PRIVATE -Wall -Wextra -Wpedantic)
 
+	ament_add_gtest(test_control_link_mock_system
+		test/test_control_link_mock_system.cpp
+	)
+	target_link_libraries(test_control_link_mock_system control_link_mock_system)
+	ament_target_dependencies(test_control_link_mock_system
+		hardware_interface
+		pluginlib
+		rclcpp
+		rclcpp_lifecycle
+	)
+	target_compile_options(
+		test_control_link_mock_system
+		PRIVATE -Wall -Wextra -Wpedantic
+	)
+
 	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
 		ament_add_gtest(test_socketcan_transport
 			test/test_socketcan_transport.cpp
@@ -153,7 +197,7 @@ install(
 	DESTINATION include
 )
 install(
-	TARGETS ${PROJECT_NAME}
+	TARGETS ${PROJECT_NAME} control_link_mock_system
 	EXPORT export_${PROJECT_NAME}
 	ARCHIVE DESTINATION lib
 	LIBRARY DESTINATION lib
@@ -170,10 +214,15 @@ ament_export_dependencies(
 	builtin_interfaces
 	control_link_contract
 	control_link_interfaces
+	controller_manager_msgs
 	diagnostic_msgs
 	geometry_msgs
+	hardware_interface
+	lifecycle_msgs
 	nav_msgs
+	pluginlib
 	rclcpp
+	rclcpp_lifecycle
 	rmw
 	tf2
 	tf2_ros

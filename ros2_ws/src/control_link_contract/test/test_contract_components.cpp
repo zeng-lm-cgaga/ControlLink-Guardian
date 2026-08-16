@@ -246,6 +246,12 @@ namespace control_link_contract
 			EXPECT_EQ(robot_profile.common.clock_mode, ClockMode::kSim);
 			EXPECT_TRUE(robot_profile.common.use_sim_time);
 			EXPECT_EQ(robot_profile.common.enabled_sources.size(), 2U);
+			EXPECT_EQ(
+				robot_profile.adapter.controller_manager_fqn,
+				"/controller_manager");
+			EXPECT_EQ(
+				robot_profile.adapter.hardware_component_name,
+				"ControlLinkExecutionSystem");
 
 			const auto adas = load_profile(adas_profile_path(), config_root());
 			ASSERT_NE(adas, nullptr);

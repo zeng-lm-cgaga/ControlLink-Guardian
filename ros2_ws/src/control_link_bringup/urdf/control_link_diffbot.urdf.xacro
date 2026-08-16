@@ -10,6 +10,11 @@
 	<xacro:arg name="base_link_frame" default="base_link"/>
 	<xacro:arg name="laser_frame" default="laser_link"/>
 	<xacro:arg name="controller_config" default=""/>
+	<xacro:arg name="hardware_plugin" default="gz_ros2_control/GazeboSimSystem"/>
+	<xacro:arg name="hardware_component_name" default="ControlLinkExecutionSystem"/>
+	<xacro:arg name="use_mock_hardware" default="false"/>
+	<xacro:arg name="mock_fail_read_after_cycles" default="0"/>
+	<xacro:arg name="mock_fail_write_after_cycles" default="0"/>
 
 	<xacro:property name="wheel_width" value="0.04"/>
 	<xacro:property name="base_length" value="0.50"/>
@@ -143,9 +148,16 @@
 		</collision>
 	</link>
 
-	<ros2_control name="GazeboSimSystem" type="system">
+	<ros2_control name="$(arg hardware_component_name)" type="system">
 		<hardware>
-			<plugin>gz_ros2_control/GazeboSimSystem</plugin>
+			<plugin>$(arg hardware_plugin)</plugin>
+			<xacro:if value="$(arg use_mock_hardware)">
+				<!-- joint 名和故障门由 launch 注入，URDF 不再拥有第二份运行配置 -->
+				<param name="left_wheel_joint">$(arg left_wheel_joint)</param>
+				<param name="right_wheel_joint">$(arg right_wheel_joint)</param>
+				<param name="fail_read_after_cycles">$(arg mock_fail_read_after_cycles)</param>
+				<param name="fail_write_after_cycles">$(arg mock_fail_write_after_cycles)</param>
+			</xacro:if>
 		</hardware>
 		<joint name="$(arg left_wheel_joint)">
 			<command_interface name="velocity"/>
@@ -185,16 +197,18 @@
 		</sensor>
 	</gazebo>
 
-	<gazebo>
-		<plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
-			<robot_param>robot_description</robot_param>
-			<robot_param_node>robot_state_publisher</robot_param_node>
-			<parameters>$(arg controller_config)</parameters>
-			<controller_manager_name>controller_manager</controller_manager_name>
-			<ros>
-				<!-- controller 的私有 odom Topic 映射到 Robot Profile 约定的执行反馈边界 -->
-				<remapping>$(arg controller_node_fqn)/odom:=$(arg odometry_topic)</remapping>
-			</ros>
-		</plugin>
-	</gazebo>
+	<xacro:unless value="$(arg use_mock_hardware)">
+		<gazebo>
+			<plugin filename="gz_ros2_control-system" name="gz_ros2_control::GazeboSimROS2ControlPlugin">
+				<robot_param>robot_description</robot_param>
+				<robot_param_node>robot_state_publisher</robot_param_node>
+				<parameters>$(arg controller_config)</parameters>
+				<controller_manager_name>controller_manager</controller_manager_name>
+				<ros>
+					<!-- controller 的私有 odom Topic 映射到 Robot Profile 约定的执行反馈边界 -->
+					<remapping>$(arg controller_node_fqn)/odom:=$(arg odometry_topic)</remapping>
+				</ros>
+			</plugin>
+		</gazebo>
+	</xacro:unless>
 </robot>

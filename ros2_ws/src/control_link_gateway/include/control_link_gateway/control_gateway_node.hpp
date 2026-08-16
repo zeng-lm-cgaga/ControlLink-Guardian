@@ -12,12 +12,11 @@
 
 #include "control_link_contract/contract_bundle.hpp"
 #include "control_link_contract/qos_factory.hpp"
-#include "control_link_gateway/command_validator.hpp"
 #include "control_link_gateway/critical_endpoint_monitor.hpp"
+#include "control_link_gateway/decision_engine.hpp"
+#include "control_link_gateway/decision_trace_recorder.hpp"
 #include "control_link_gateway/graph_monitor.hpp"
 #include "control_link_gateway/model.hpp"
-#include "control_link_gateway/source_arbiter.hpp"
-#include "control_link_gateway/state_machine.hpp"
 #include "control_link_gateway/vehicle_state_runtime.hpp"
 #include "control_link_interfaces/msg/control_command.hpp"
 #include "control_link_interfaces/msg/gateway_state.hpp"
@@ -95,28 +94,30 @@ namespace control_link_gateway
 		void update_ros_clock_health_locked(
 			std::chrono::steady_clock::time_point now_steady,
 			std::int64_t now_ros_ns);
-		// 调用方必须已经持有 runtime_mutex_，health 边界变化时清除旧 recovery evidence
-		void update_health_epoch_locked() noexcept;
-		void record_recovery_evidence_locked(
-			const std::string &source_id,
-			const PublisherGenerationKey &publisher_generation,
-			RejectReason result);
+		// 所有 event sequence 与相对 steady offset 都只能在 runtime_mutex_ 内生成
+		[[nodiscard]] std::int64_t decision_steady_offset_locked(
+			std::chrono::steady_clock::time_point now) const;
+		[[nodiscard]] std::optional<DecisionResult> submit_decision_event_locked(
+			DecisionEventPayload payload);
+		void submit_health_snapshot_locked(
+			std::chrono::steady_clock::time_point observed_at);
 		void request_lifecycle_error() noexcept;
 
 		// 所有组件共享同一份不可变 Contract 快照，cleanup 按依赖的逆序释放
 		control_link_contract::ContractBundlePtr contract_bundle_;
 		std::unique_ptr<control_link_contract::QosFactory> qos_factory_;
-		std::unique_ptr<CommandValidator> command_validator_;
-		std::unique_ptr<SourceArbiter> source_arbiter_;
-		std::unique_ptr<GatewayStateMachine> state_machine_;
+		// DecisionEngine 是 live 与 offline replay 共用的唯一确定性决策 owner
+		std::unique_ptr<DecisionEngine> decision_engine_;
+		std::unique_ptr<DecisionTraceRecorder> decision_trace_recorder_;
+		std::optional<std::chrono::steady_clock::time_point> decision_steady_origin_;
+		bool trace_recording_failed_{false};
 		// CallbackGroup 在节点构造时创建并保持到节点析构，避免 Executor spin 期间重建 wait set 拓扑
 		rclcpp::CallbackGroup::SharedPtr data_plane_group_;
 		rclcpp::CallbackGroup::SharedPtr health_group_;
-		// health_group_ 与 data_plane_group_ 会并行访问 source slot，提交阶段统一持锁
+		// health_group_ 与 data_plane_group_ 会并行提交 DecisionEvent，统一持锁排序
 		std::mutex runtime_mutex_;
 		// 防止 output tick 发布与 Lifecycle Publisher activate/deactivate/cleanup 并发交错
 		std::mutex publisher_mutex_;
-		std::map<std::string, SourceRuntimeSlot> source_slots_;
 		std::map<std::string, SourceEndpointStabilityTracker>
 			source_endpoint_trackers_;
 		std::map<std::string, CriticalEndpointStabilityTracker>
@@ -141,9 +142,6 @@ namespace control_link_gateway
 		VehicleStateRuntime vehicle_state_runtime_;
 		std::optional<PublisherGenerationKey>
 			vehicle_state_publisher_generation_;
-		std::vector<RecoveryEvidence> pending_recovery_evidences_;
-		std::uint64_t health_epoch_{0};
-		bool recovery_health_healthy_{false};
 		// last_ros_time_ns_ 是最近一次采样值，last_ros_time_progress_at_ 属于 steady clock
 		std::optional<std::int64_t> last_ros_time_ns_;
 		std::optional<std::chrono::steady_clock::time_point>
@@ -155,9 +153,8 @@ namespace control_link_gateway
 		std::uint64_t ros_clock_backward_jump_count_{0};
 		std::optional<std::chrono::steady_clock::time_point>
 			last_output_tick_at_;
-		std::uint64_t consecutive_late_output_ticks_{0};
 		bool lifecycle_error_requested_{false};
-		std::optional<StateMachineDecision> last_decision_;
+		std::optional<DecisionResult> last_decision_;
 
 		rclcpp_lifecycle::LifecyclePublisher<
 			control_link_interfaces::msg::ControlCommand>::SharedPtr

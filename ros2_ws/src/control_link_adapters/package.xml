@@ -10,10 +10,15 @@
 	<depend>builtin_interfaces</depend>
 	<depend>control_link_contract</depend>
 	<depend>control_link_interfaces</depend>
+	<depend>controller_manager_msgs</depend>
 	<depend>diagnostic_msgs</depend>
 	<depend>geometry_msgs</depend>
+	<depend>hardware_interface</depend>
+	<depend>lifecycle_msgs</depend>
 	<depend>nav_msgs</depend>
+	<depend>pluginlib</depend>
 	<depend>rclcpp</depend>
+	<depend>rclcpp_lifecycle</depend>
 	<depend>rmw</depend>
 	<depend>tf2</depend>
 	<depend>tf2_ros</depend>

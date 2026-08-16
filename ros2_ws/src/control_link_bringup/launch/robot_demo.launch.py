@@ -53,6 +53,26 @@ def _launch_flag(context, name):
 	return value == "true"
 
 
+def _launch_nonnegative_integer(context, name):
+	value = LaunchConfiguration(name).perform(context)
+	try:
+		result = int(value, 10)
+	except ValueError as error:
+		raise RuntimeError(
+			name + " must be a non-negative integer; actual=" + value) from error
+	if result < 0:
+		raise RuntimeError(
+			name + " must be a non-negative integer; actual=" + value)
+	return result
+
+
+def _launch_positive_integer(context, name):
+	result = _launch_nonnegative_integer(context, name)
+	if result == 0:
+		raise RuntimeError(name + " must be a positive integer; actual=0")
+	return result
+
+
 def _launch_robot_demo(context, *args, **kwargs):
 	package_share = get_package_share_directory("control_link_bringup")
 	installed_config_root = os.path.join(package_share, "config")
@@ -65,6 +85,12 @@ def _launch_robot_demo(context, *args, **kwargs):
 		raise RuntimeError(
 			"profile_id mismatch; expected=robot; actual=" +
 			str(profile.get("profile_id")))
+	adapter_config = _require_mapping(profile, "adapter", "adapter")
+	controller_manager_fqn = _require_string(
+		adapter_config,
+		"controller_manager_fqn",
+		"adapter.controller_manager_fqn",
+	)
 
 	resources = _require_mapping(profile, "resources", "resources")
 	resource_package = _require_string(
@@ -122,14 +148,27 @@ def _launch_robot_demo(context, *args, **kwargs):
 		"config_root": config_root,
 		"use_sim_time": True,
 	}
+	gateway_parameters = {
+		**common_parameters,
+		"decision_trace_path": LaunchConfiguration(
+			"decision_trace_path").perform(context),
+		"decision_trace_queue_capacity": _launch_positive_integer(
+			context, "decision_trace_queue_capacity"),
+	}
 
 	robot_platform = IncludeLaunchDescription(
 		PythonLaunchDescriptionSource(
 			os.path.join(package_share, "launch", "robot_platform.launch.py")),
 		launch_arguments={
 			"gui": LaunchConfiguration("gui"),
+			"hardware_backend": LaunchConfiguration("hardware_backend"),
+			"mock_fail_read_after_cycles": LaunchConfiguration(
+				"mock_fail_read_after_cycles"),
+			"mock_fail_write_after_cycles": LaunchConfiguration(
+				"mock_fail_write_after_cycles"),
 			"start_adapter": "false",
-			"standalone_tf_fixture": "false",
+			"standalone_tf_fixture": LaunchConfiguration(
+				"start_mock_hardware_failure_scenario"),
 		}.items(),
 	)
 	controllers_gate = Node(
@@ -140,6 +179,7 @@ def _launch_robot_demo(context, *args, **kwargs):
 		parameters=[{
 			"phase": "controllers",
 			"timeout_ms": 60000,
+			"controller_manager_fqn": controller_manager_fqn,
 			"use_sim_time": True,
 		}],
 	)
@@ -219,7 +259,7 @@ def _launch_robot_demo(context, *args, **kwargs):
 		output="screen",
 		emulate_tty=True,
 		additional_env=participant_env,
-		parameters=[common_parameters],
+		parameters=[gateway_parameters],
 	)
 	lifecycle_activator = Node(
 		package="control_link_bringup",
@@ -302,6 +342,25 @@ def _launch_robot_demo(context, *args, **kwargs):
 			"timeout_ms": 45000,
 		}],
 	)
+	hardware_backend = LaunchConfiguration("hardware_backend").perform(context)
+	mock_fail_read_after_cycles = _launch_nonnegative_integer(
+		context, "mock_fail_read_after_cycles")
+	mock_fail_write_after_cycles = _launch_nonnegative_integer(
+		context, "mock_fail_write_after_cycles")
+	mock_failure_mode = (
+		"read" if mock_fail_read_after_cycles > 0 else "write")
+	mock_hardware_failure_scenario = Node(
+		package="control_link_bringup",
+		executable="verify_mock_hardware_failure",
+		name="verify_mock_hardware_failure",
+		output="screen",
+		additional_env=participant_env,
+		parameters=[{
+			**common_parameters,
+			"failure_mode": mock_failure_mode,
+			"timeout_ms": 45000,
+		}],
+	)
 	start_goal = _launch_flag(context, "start_goal")
 	start_takeover_scenario = _launch_flag(context, "start_takeover_scenario")
 	start_tf_stale_scenario = _launch_flag(context, "start_tf_stale_scenario")
@@ -311,33 +370,34 @@ def _launch_robot_demo(context, *args, **kwargs):
 		context, "start_controller_loss_scenario")
 	start_command_timeout_scenario = _launch_flag(
 		context, "start_command_timeout_scenario")
+	start_mock_hardware_failure_scenario = _launch_flag(
+		context, "start_mock_hardware_failure_scenario")
 	if sum((
 		start_takeover_scenario,
 		start_tf_stale_scenario,
 		start_clock_stall_scenario,
 		start_controller_loss_scenario,
 		start_command_timeout_scenario,
+		start_mock_hardware_failure_scenario,
 	)) > 1:
 		raise RuntimeError("Robot fault/takeover scenarios must run one at a time")
 	if start_takeover_scenario and not start_goal:
 		raise RuntimeError(
 			"start_takeover_scenario requires start_goal=true so nav2 remains a live source")
 	if (start_tf_stale_scenario or start_clock_stall_scenario or
-		start_controller_loss_scenario or start_command_timeout_scenario) and start_goal:
+		start_controller_loss_scenario or start_command_timeout_scenario or
+		start_mock_hardware_failure_scenario) and start_goal:
 		raise RuntimeError(
 			"Robot fault scenarios require start_goal=false because they publish their own raw nav2 command")
-
-	def on_controllers_ready(event, launch_context):
-		if event.returncode != 0:
+	if start_mock_hardware_failure_scenario:
+		if hardware_backend != "mock":
 			raise RuntimeError(
-				"Controller readiness failed with exit code " +
-				str(event.returncode))
-		return [nav2_bringup, nav2_gate]
-
-	def on_nav2_ready(event, launch_context):
-		if event.returncode != 0:
+				"mock hardware failure scenario requires hardware_backend=mock")
+		if (mock_fail_read_after_cycles > 0) == (mock_fail_write_after_cycles > 0):
 			raise RuntimeError(
-				"Nav2 readiness failed with exit code " + str(event.returncode))
+				"mock hardware failure scenario requires exactly one positive failure threshold")
+
+	def gateway_stack_actions():
 		return [
 			adapter,
 			nav2_ingress,
@@ -345,6 +405,22 @@ def _launch_robot_demo(context, *args, **kwargs):
 			gateway,
 			lifecycle_activator,
 		]
+
+	def on_controllers_ready(event, launch_context):
+		if event.returncode != 0:
+			raise RuntimeError(
+				"Controller readiness failed with exit code " +
+				str(event.returncode))
+		# mock 故障验证由 verifier 提供 raw Nav2 命令，不依赖 AMCL/Nav2 生命周期
+		if start_mock_hardware_failure_scenario:
+			return gateway_stack_actions()
+		return [nav2_bringup, nav2_gate]
+
+	def on_nav2_ready(event, launch_context):
+		if event.returncode != 0:
+			raise RuntimeError(
+				"Nav2 readiness failed with exit code " + str(event.returncode))
+		return gateway_stack_actions()
 
 	def on_gateway_active(event, launch_context):
 		if event.returncode != 0:
@@ -364,6 +440,8 @@ def _launch_robot_demo(context, *args, **kwargs):
 			actions.append(controller_loss_scenario)
 		if start_command_timeout_scenario:
 			actions.append(command_timeout_scenario)
+		if start_mock_hardware_failure_scenario:
+			actions.append(mock_hardware_failure_scenario)
 		if actions:
 			return actions
 		return [LogInfo(msg="Robot demo is ready for a manual NavigateToPose goal")]
@@ -410,6 +488,13 @@ def _launch_robot_demo(context, *args, **kwargs):
 				str(event.returncode))
 		return [LogInfo(msg="Robot command timeout scenario completed successfully")]
 
+	def on_mock_hardware_failure_exit(event, launch_context):
+		if event.returncode != 0:
+			raise RuntimeError(
+				"Mock hardware failure scenario failed with exit code " +
+				str(event.returncode))
+		return [LogInfo(msg="Mock hardware failure scenario completed successfully")]
+
 	return [
 		SetEnvironmentVariable("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp"),
 		SetEnvironmentVariable("RMW_FASTRTPS_USE_QOS_FROM_XML", "0"),
@@ -451,6 +536,10 @@ def _launch_robot_demo(context, *args, **kwargs):
 			event_handler=OnProcessExit(
 				target_action=command_timeout_scenario,
 				on_exit=on_command_timeout_exit)),
+		RegisterEventHandler(
+			event_handler=OnProcessExit(
+				target_action=mock_hardware_failure_scenario,
+				on_exit=on_mock_hardware_failure_exit)),
 		robot_platform,
 		controllers_gate,
 	]
@@ -458,6 +547,21 @@ def _launch_robot_demo(context, *args, **kwargs):
 
 def generate_launch_description():
 	return LaunchDescription([
+		DeclareLaunchArgument(
+			"hardware_backend",
+			default_value="gazebo",
+			description="ros2_control hardware backend forwarded to robot_platform",
+		),
+		DeclareLaunchArgument(
+			"mock_fail_read_after_cycles",
+			default_value="0",
+			description="Successful mock read cycles before a persistent injected error",
+		),
+		DeclareLaunchArgument(
+			"mock_fail_write_after_cycles",
+			default_value="0",
+			description="Successful mock write cycles before a persistent injected error",
+		),
 		DeclareLaunchArgument(
 			"gui",
 			default_value="false",
@@ -492,6 +596,21 @@ def generate_launch_description():
 			"start_command_timeout_scenario",
 			default_value="false",
 			description="Verify nav2 command lease timeout safe-stop and recovery",
+		),
+		DeclareLaunchArgument(
+			"start_mock_hardware_failure_scenario",
+			default_value="false",
+			description="Verify mock SystemInterface failure propagation into Guardian",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_path",
+			default_value="",
+			description="Absolute JSONL path for optional Gateway decision recording",
+		),
+		DeclareLaunchArgument(
+			"decision_trace_queue_capacity",
+			default_value="4096",
+			description="Bounded Gateway decision trace queue capacity",
 		),
 		OpaqueFunction(function=_launch_robot_demo),
 	])

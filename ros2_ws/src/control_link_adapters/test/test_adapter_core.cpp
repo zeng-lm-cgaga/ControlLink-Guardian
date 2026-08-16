@@ -6,9 +6,11 @@
 #include <gtest/gtest.h>
 
 #include "control_link_adapters/canonical_input_guard.hpp"
+#include "control_link_adapters/hardware_component_monitor.hpp"
 #include "control_link_adapters/local_watchdog.hpp"
 #include "control_link_contract/parser.hpp"
 #include "control_link_interfaces/msg/control_command.hpp"
+#include "lifecycle_msgs/msg/state.hpp"
 
 namespace control_link_adapters
 {
@@ -238,6 +240,37 @@ namespace control_link_adapters
 		{
 			EXPECT_THROW(
 				CanonicalInputGuard{control_link_contract::GatewayContractPtr{}},
+				std::invalid_argument);
+		}
+
+		TEST(HardwareComponentMonitorTest, TracksActiveInactiveInvalidAndTimeout)
+		{
+			HardwareComponentMonitor monitor{"ControlLinkExecutionSystem", 150ms};
+			const auto base = std::chrono::steady_clock::time_point{10s};
+			EXPECT_EQ(
+				monitor.assess(base).health,
+				HardwareComponentHealth::kUnavailable);
+
+			controller_manager_msgs::msg::HardwareComponentState component;
+			component.name = "ControlLinkExecutionSystem";
+			component.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_ACTIVE;
+			EXPECT_TRUE(monitor.observe({component}, base).healthy());
+			EXPECT_TRUE(monitor.assess(base + 150ms).healthy());
+			EXPECT_EQ(
+				monitor.assess(base + 151ms).health,
+				HardwareComponentHealth::kTimedOut);
+
+			component.state.id = lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE;
+			const auto inactive = monitor.observe({component}, base + 200ms);
+			EXPECT_EQ(inactive.health, HardwareComponentHealth::kInactive);
+			EXPECT_EQ(
+				inactive.lifecycle_state,
+				lifecycle_msgs::msg::State::PRIMARY_STATE_INACTIVE);
+			EXPECT_EQ(
+				monitor.observe({}, base + 201ms).health,
+				HardwareComponentHealth::kInvalid);
+			EXPECT_THROW(
+				(void)monitor.observe({component}, base),
 				std::invalid_argument);
 		}
 	}

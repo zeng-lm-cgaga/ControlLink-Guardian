@@ -343,8 +343,6 @@ namespace
 			node->declare_parameter<std::string>("profile_path", "")};
 		const auto config_root = std::filesystem::path{
 			node->declare_parameter<std::string>("config_root", "")};
-		const auto controller_manager_fqn = node->declare_parameter<std::string>(
-			"controller_manager_fqn", "/controller_manager");
 		const auto timeout_ms = node->declare_parameter<std::int64_t>(
 			"timeout_ms", 45000);
 		const auto nav2_publish_hz = node->declare_parameter<double>(
@@ -357,11 +355,6 @@ namespace
 		{
 			throw std::invalid_argument(
 				"profile_path and config_root must be non-empty");
-		}
-		if (controller_manager_fqn.empty() || controller_manager_fqn.front() != '/')
-		{
-			throw std::invalid_argument(
-				"controller_manager_fqn must be an absolute node FQN");
 		}
 		if (timeout_ms <= 0)
 		{
@@ -387,6 +380,8 @@ namespace
 			throw std::invalid_argument(
 				"controller loss scenario requires Robot Profile");
 		}
+		const auto &controller_manager_fqn =
+			robot_profile->adapter.controller_manager_fqn;
 		if (!std::isfinite(nav2_linear_velocity) ||
 			std::abs(nav2_linear_velocity) >
 			bundle->gateway_contract->limits.max_abs_linear_velocity_mps)

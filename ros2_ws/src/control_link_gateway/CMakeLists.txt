@@ -140,6 +140,18 @@ if(BUILD_TESTING)
 		CONTROL_LINK_TEST_DECISION_TRACE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/decision_traces/robot_nominal.jsonl"
 	)
 	target_compile_options(test_decision_trace_recorder PRIVATE -Wall -Wextra -Wpedantic)
+
+	ament_add_gtest(test_property_invariants
+		test/test_property_invariants.cpp
+	)
+	target_link_libraries(test_property_invariants ${PROJECT_NAME})
+	target_compile_definitions(test_property_invariants PRIVATE
+		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
+		CONTROL_LINK_TEST_SOURCE_POLICY_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/source_policy.yaml"
+		CONTROL_LINK_TEST_CONFIG_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../config"
+		CONTROL_LINK_TEST_ADAS_PROFILE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/adas_profile.yaml"
+	)
+	target_compile_options(test_property_invariants PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 install(

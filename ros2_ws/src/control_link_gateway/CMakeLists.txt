@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(control_link_gateway)
 
+option(
+	CONTROL_LINK_ENABLE_FUZZ_TARGETS
+	"Build bounded decision trace fuzz-smoke targets with ASan and UBSan"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -95,6 +101,24 @@ target_compile_definitions(${PROJECT_NAME} PRIVATE
 	CONTROL_LINK_GIT_COMMIT="${CONTROL_LINK_GIT_COMMIT}"
 	CONTROL_LINK_GIT_DIRTY=${CONTROL_LINK_GIT_DIRTY}
 )
+if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
+	target_compile_options(${PROJECT_NAME} PRIVATE
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+
+	add_executable(control_link_fuzz_trace_decoder
+		fuzz/fuzz_trace_decoder.cpp
+	)
+	target_link_libraries(control_link_fuzz_trace_decoder ${PROJECT_NAME})
+	target_compile_options(control_link_fuzz_trace_decoder PRIVATE
+		-Wall -Wextra -Wpedantic
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(control_link_fuzz_trace_decoder PRIVATE -fsanitize=address,undefined)
+endif()
 target_compile_options(${PROJECT_NAME}_node PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(${PROJECT_NAME}_node ${PROJECT_NAME})
 ament_target_dependencies(${PROJECT_NAME}_node

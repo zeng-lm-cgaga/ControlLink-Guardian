@@ -1,6 +1,12 @@
 cmake_minimum_required(VERSION 3.8)
 project(control_link_contract)
 
+option(
+	CONTROL_LINK_ENABLE_FUZZ_TARGETS
+	"Build bounded parser fuzz-smoke targets with ASan and UBSan"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -30,6 +36,25 @@ target_include_directories(${PROJECT_NAME}
 )
 target_link_libraries(${PROJECT_NAME} PUBLIC yaml-cpp OpenSSL::Crypto)
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
+
+if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
+	target_compile_options(${PROJECT_NAME} PRIVATE
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+
+	add_executable(control_link_fuzz_contract_parser
+		fuzz/fuzz_contract_parser.cpp
+	)
+	target_link_libraries(control_link_fuzz_contract_parser ${PROJECT_NAME})
+	target_compile_options(control_link_fuzz_contract_parser PRIVATE
+		-Wall -Wextra -Wpedantic
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(control_link_fuzz_contract_parser PRIVATE -fsanitize=address,undefined)
+endif()
 
 install(
 	DIRECTORY include/

@@ -7,6 +7,12 @@ option(
 	OFF
 )
 
+option(
+	CONTROL_LINK_ENABLE_FUZZ_TARGETS
+	"Build bounded CAN codec fuzz-smoke targets with ASan and UBSan"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -109,6 +115,28 @@ ament_target_dependencies(${PROJECT_NAME}
 )
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
+
+if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
+	target_compile_options(${PROJECT_NAME} PRIVATE
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+
+	add_executable(control_link_fuzz_can_codec
+		fuzz/fuzz_can_codec.cpp
+	)
+	target_link_libraries(control_link_fuzz_can_codec ${PROJECT_NAME})
+	target_compile_definitions(control_link_fuzz_can_codec PRIVATE
+		CONTROL_LINK_FUZZ_CAN_SIGNAL_MAP_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/can_signal_map.yaml"
+	)
+	target_compile_options(control_link_fuzz_can_codec PRIVATE
+		-Wall -Wextra -Wpedantic
+		-fsanitize=address,undefined
+		-fno-omit-frame-pointer
+	)
+	target_link_options(control_link_fuzz_can_codec PRIVATE -fsanitize=address,undefined)
+endif()
 
 target_compile_options(mock_control_source_node PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(mock_vehicle_adapter_node PRIVATE -Wall -Wextra -Wpedantic)

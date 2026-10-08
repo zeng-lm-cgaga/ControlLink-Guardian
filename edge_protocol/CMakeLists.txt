@@ -8,15 +8,22 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	option(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT
 		"Build the standalone EdgeRuntime planning client"
 		ON)
+	option(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR
+		"Build the standalone EdgeRuntime producer supervisor"
+		ON)
 	option(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS
 		"Build the ROS-free protocol tests"
 		ON)
-	if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT)
+	if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OR
+		CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR)
 		find_package(EdgeRuntime CONFIG REQUIRED)
 	endif()
 else()
 	if(NOT DEFINED CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT)
 		set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF)
+	endif()
+	if(NOT DEFINED CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR)
+		set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR OFF)
 	endif()
 	if(NOT DEFINED CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS)
 		set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS OFF)
@@ -43,6 +50,18 @@ if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT)
 	target_link_libraries(edge_planning_client
 		PRIVATE
 		control_link_edge_protocol
+		EdgeRuntime::edge_runtime
+	)
+endif()
+
+if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR)
+	add_executable(edge_planning_supervisor
+		src/edge_planning_supervisor.cpp
+	)
+	target_compile_features(edge_planning_supervisor PRIVATE cxx_std_17)
+	target_compile_options(edge_planning_supervisor PRIVATE -Wall -Wextra -Wpedantic)
+	target_link_libraries(edge_planning_supervisor
+		PRIVATE
 		EdgeRuntime::edge_runtime
 	)
 endif()
@@ -74,6 +93,9 @@ install(
 )
 if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT)
 	install(TARGETS edge_planning_client RUNTIME DESTINATION bin)
+endif()
+if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR)
+	install(TARGETS edge_planning_supervisor RUNTIME DESTINATION bin)
 endif()
 install(
 	EXPORT control_link_edge_protocol_targets

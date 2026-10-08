@@ -169,7 +169,7 @@ namespace
 			<< " gateway=" << static_cast<unsigned>(feedback.gateway_state)
 			<< " active_source=" << static_cast<unsigned>(feedback.active_source)
 			<< " planning_accepted=" << feedback.planning_accepted_count
-			<< " planning_rejected=" << feedback.planning_rejected_count << '\n';
+			<< " planning_rejected=" << feedback.planning_rejected_count << '\n' << std::flush;
 	}
 }
 
@@ -204,6 +204,15 @@ int main(int argc, char **argv)
 		std::chrono::steady_clock::now() + std::chrono::seconds(30);
 	while (!feedback_consumer && !stop_requested)
 	{
+		// 等待 bridge/token 期间只续 transport heartbeat，不生成业务命令。
+		auto heartbeat = command_producer.heartbeat();
+		if (!heartbeat)
+		{
+			std::cerr << "command heartbeat failed while waiting for feedback: "
+				<< error_text(heartbeat.error()) << '\n';
+			(void)command_producer.remove_if_owner();
+			return 4;
+		}
 		auto opened = FeedbackConsumer::open(
 			feedback_channel_options, edge_runtime::feedback_schema());
 		if (opened)
@@ -260,7 +269,8 @@ int main(int argc, char **argv)
 					// token 变化使旧业务目标失效；客户端必须重新生成 sequence 和目标时间。
 					active_token = value.session_token;
 					next_command_sequence = 0U;
-					std::cout << "new bridge session token observed; old command target discarded\n";
+					std::cout << "new bridge session token observed; old command target discarded\n"
+						<< std::flush;
 				}
 				feedback_session_ready =
 					(value.validity_flags & control_link_edge_protocol::kSessionReady) != 0U;
@@ -289,7 +299,8 @@ int main(int argc, char **argv)
 				feedback_session_ready = false;
 				feedback_transport_allowed = false;
 				last_feedback_boot_ns = 0U;
-				std::cout << "feedback channel reconnected; waiting for new token\n";
+				std::cout << "feedback channel reconnected; waiting for new token\n"
+					<< std::flush;
 			}
 		}
 

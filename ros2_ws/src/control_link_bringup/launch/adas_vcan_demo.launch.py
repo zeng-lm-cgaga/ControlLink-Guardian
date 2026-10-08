@@ -228,15 +228,24 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			"lib",
 			"control_link_adapters",
 			"edge_planning_client")
-		if not os.path.isfile(edge_client_path) or not os.access(edge_client_path, os.X_OK):
+		edge_supervisor_path = os.path.join(
+			get_package_prefix("control_link_adapters"),
+			"lib",
+			"control_link_adapters",
+			"edge_planning_supervisor")
+		if (not os.path.isfile(edge_client_path) or
+				not os.access(edge_client_path, os.X_OK) or
+			not os.path.isfile(edge_supervisor_path) or
+			not os.access(edge_supervisor_path, os.X_OK)):
 			raise RuntimeError(
 				"planning_transport=edge requires control_link_adapters built with "
-				"-DCONTROL_LINK_ENABLE_EDGE_RUNTIME=ON; missing=" + edge_client_path)
-		edge_client = ExecuteProcess(
+				"-DCONTROL_LINK_ENABLE_EDGE_RUNTIME=ON; missing=" + edge_supervisor_path)
+		edge_supervisor = ExecuteProcess(
 			cmd=[
-				edge_client_path,
+				edge_supervisor_path,
 				"--command-channel", command_channel,
 				"--feedback-channel", feedback_channel,
+				"--client", edge_client_path,
 				"--linear-velocity-mps",
 				str(edge_linear_velocity_mps),
 				"--angular-velocity-radps",
@@ -254,7 +263,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	if planning_transport == "edge":
 		actions.append(bridge_node)
 		if start_source:
-			actions.append(edge_client)
+			actions.append(edge_supervisor)
 	elif start_source:
 		actions.append(source_node)
 	if start_secondary_source:

@@ -47,6 +47,8 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	find_package(EdgeRuntime CONFIG REQUIRED)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF CACHE BOOL
 		"" FORCE)
+	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR OFF CACHE BOOL
+		"" FORCE)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS OFF CACHE BOOL
 		"" FORCE)
 	add_subdirectory(
@@ -117,6 +119,9 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	)
 	add_executable(edge_planning_client
 		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol/src/edge_planning_client.cpp
+	)
+	add_executable(edge_planning_supervisor
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol/src/edge_planning_supervisor.cpp
 	)
 endif()
 
@@ -202,12 +207,16 @@ ament_target_dependencies(socketcan_adapter_node
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	target_compile_options(edge_planning_bridge_node PRIVATE -Wall -Wextra -Wpedantic)
 	target_compile_options(edge_planning_client PRIVATE -Wall -Wextra -Wpedantic)
+	target_compile_options(edge_planning_supervisor PRIVATE -Wall -Wextra -Wpedantic)
 	target_link_libraries(edge_planning_bridge_node
 		control_link_edge_protocol
 		EdgeRuntime::edge_runtime
 	)
 	target_link_libraries(edge_planning_client
 		control_link_edge_protocol
+		EdgeRuntime::edge_runtime
+	)
+	target_link_libraries(edge_planning_supervisor
 		EdgeRuntime::edge_runtime
 	)
 	ament_target_dependencies(edge_planning_bridge_node
@@ -283,9 +292,9 @@ install(
 	RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
-	install(
-		TARGETS edge_planning_bridge_node edge_planning_client
-		RUNTIME DESTINATION lib/${PROJECT_NAME}
+		install(
+			TARGETS edge_planning_bridge_node edge_planning_client edge_planning_supervisor
+			RUNTIME DESTINATION lib/${PROJECT_NAME}
 	)
 endif()
 

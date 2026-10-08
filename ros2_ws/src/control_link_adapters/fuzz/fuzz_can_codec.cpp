@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <fstream>
 #include <iostream>
@@ -79,6 +80,51 @@ namespace
 				byte_at(8U),
 				byte_at(9U)});
 	}
+
+	std::string mutate(const std::string &seed, std::uint32_t round)
+	{
+		std::uint32_t state = 0x85EBCA6BU ^ round;
+		state = state * 1'664'525U + 1'013'904'223U;
+		std::string result = seed;
+		if (result.empty())
+		{
+			result.push_back(static_cast<char>(state & 0xFFU));
+			return result;
+		}
+
+		const auto position = static_cast<std::size_t>(state % result.size());
+		switch (round % 4U)
+		{
+		case 0U:
+			result[position] = static_cast<char>(
+				static_cast<unsigned char>(result[position]) ^
+				static_cast<unsigned char>(1U << (state % 8U)));
+			break;
+		case 1U:
+			if (result.size() > 1U)
+				result.erase(position, 1U);
+			break;
+		case 2U:
+			result.insert(
+				position,
+				1U,
+				static_cast<char>(state & 0xFFU));
+			break;
+		case 3U:
+			result[position] = '\0';
+			break;
+		}
+		return result;
+	}
+
+	void exercise_seed(
+		const std::string &input,
+		const control_link_adapters::CanCodec &codec)
+	{
+		exercise(input, codec);
+		for (std::uint32_t round = 0U; round < 64U; ++round)
+			exercise(mutate(input, round), codec);
+	}
 }
 
 int main(int argc, char **argv)
@@ -90,7 +136,7 @@ int main(int argc, char **argv)
 		control_link_adapters::CanCodec codec{*signal_map};
 		if (argc == 1)
 		{
-			exercise(
+			exercise_seed(
 				std::string(
 					std::istreambuf_iterator<char>(std::cin),
 					std::istreambuf_iterator<char>()),
@@ -101,7 +147,7 @@ int main(int argc, char **argv)
 		for (int index = 1; index < argc; ++index)
 		{
 			const std::string path{argv[index]};
-			exercise(read_file(path), codec);
+			exercise_seed(read_file(path), codec);
 		}
 		return 0;
 	}

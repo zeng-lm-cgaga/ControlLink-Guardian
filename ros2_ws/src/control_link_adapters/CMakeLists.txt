@@ -13,6 +13,12 @@ option(
 	OFF
 )
 
+option(
+	CONTROL_LINK_ENABLE_EDGE_RUNTIME
+	"Build the optional EdgeRuntime planning bridge and standalone client"
+	OFF
+)
+
 if(NOT CMAKE_CXX_STANDARD)
 	set(CMAKE_CXX_STANDARD 17)
 endif()
@@ -36,6 +42,18 @@ find_package(rmw REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Threads REQUIRED)
+
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+	find_package(EdgeRuntime CONFIG REQUIRED)
+	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF CACHE BOOL
+		"" FORCE)
+	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS OFF CACHE BOOL
+		"" FORCE)
+	add_subdirectory(
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol
+		${CMAKE_CURRENT_BINARY_DIR}/edge_protocol
+	)
+endif()
 
 
 add_library(${PROJECT_NAME} SHARED
@@ -92,6 +110,15 @@ add_executable(twist_ingress_adapter_node
 add_executable(socketcan_adapter_node
 	src/socketcan_adapter_main.cpp
 )
+
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+	add_executable(edge_planning_bridge_node
+		src/edge_planning_bridge.cpp
+	)
+	add_executable(edge_planning_client
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol/src/edge_planning_client.cpp
+	)
+endif()
 
 target_include_directories(${PROJECT_NAME}
 	PUBLIC
@@ -172,6 +199,25 @@ ament_target_dependencies(socketcan_adapter_node
 	rclcpp
 )
 
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+	target_compile_options(edge_planning_bridge_node PRIVATE -Wall -Wextra -Wpedantic)
+	target_compile_options(edge_planning_client PRIVATE -Wall -Wextra -Wpedantic)
+	target_link_libraries(edge_planning_bridge_node
+		control_link_edge_protocol
+		EdgeRuntime::edge_runtime
+	)
+	target_link_libraries(edge_planning_client
+		control_link_edge_protocol
+		EdgeRuntime::edge_runtime
+	)
+	ament_target_dependencies(edge_planning_bridge_node
+		builtin_interfaces
+		control_link_contract
+		control_link_interfaces
+		rclcpp
+	)
+endif()
+
 if(BUILD_TESTING)
 	find_package(ament_cmake_gtest REQUIRED)
 
@@ -236,6 +282,12 @@ install(
 	TARGETS mock_control_source_node mock_vehicle_adapter_node ros2_control_adapter_node twist_ingress_adapter_node socketcan_adapter_node
 	RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+	install(
+		TARGETS edge_planning_bridge_node edge_planning_client
+		RUNTIME DESTINATION lib/${PROJECT_NAME}
+	)
+endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
 ament_export_dependencies(

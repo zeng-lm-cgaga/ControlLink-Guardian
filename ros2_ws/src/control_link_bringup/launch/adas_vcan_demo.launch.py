@@ -1,14 +1,15 @@
 import math
 import os
+import re
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from control_link_bringup.profile_bootstrap import (
 	load_fastdds_profile_path,
 	load_yaml_mapping,
 	require_up_vcan_interface,
 )
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, LogInfo, OpaqueFunction, TimerAction
+from launch.actions import DeclareLaunchArgument, ExecuteProcess, LogInfo, OpaqueFunction, TimerAction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
@@ -38,11 +39,31 @@ def _positive_float_argument(context, name):
 	return parsed
 
 
+def _finite_float_argument(context, name):
+	value = LaunchConfiguration(name).perform(context)
+	try:
+		parsed = float(value)
+	except ValueError as exception:
+		raise RuntimeError(name + " must be finite") from exception
+	if not math.isfinite(parsed):
+		raise RuntimeError(name + " must be finite")
+	return parsed
+
+
 def _positive_integer_argument(context, name):
 	value = LaunchConfiguration(name).perform(context)
 	if not value.isdecimal() or int(value) <= 0:
 		raise RuntimeError(name + " must be a positive integer; actual=" + value)
 	return int(value)
+
+
+def _channel_argument(context, name):
+	value = LaunchConfiguration(name).perform(context)
+	if (not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", value) or
+		".." in value):
+		raise RuntimeError(
+			name + " must match EdgeRuntime channel-name rules; actual=" + value)
+	return value
 
 
 def _launch_adas_vcan(context, *args, **kwargs):
@@ -96,6 +117,10 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	start_lifecycle_activator = _bool_argument(
 		context, "start_lifecycle_activator")
 	start_secondary_source = _bool_argument(context, "start_secondary_source")
+	planning_transport = LaunchConfiguration("planning_transport").perform(context).lower()
+	if planning_transport not in ("ros2", "edge"):
+		raise RuntimeError(
+			"planning_transport must be ros2 or edge; actual=" + planning_transport)
 	source_id = LaunchConfiguration("source_id").perform(context)
 	secondary_source_id = LaunchConfiguration("secondary_source_id").perform(context)
 	enabled_sources = profile.get("enabled_sources")
@@ -106,8 +131,12 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	if source_id not in enabled_sources:
 		raise RuntimeError(
 			"source_id must be enabled by ADAS Profile; actual=" + source_id)
+	if planning_transport == "edge" and source_id != "planning":
+		raise RuntimeError(
+			"planning_transport=edge fixes the Edge source binding to planning; actual=" +
+			source_id)
 	if start_secondary_source:
-		if not start_source:
+		if not start_source and planning_transport != "edge":
 			raise RuntimeError(
 				"start_secondary_source requires start_source=true")
 		if secondary_source_id not in enabled_sources:
@@ -120,6 +149,9 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		secondary_source_delay_seconds = _positive_float_argument(
 			context,
 			"secondary_source_delay_seconds")
+		if planning_transport == "edge" and secondary_source_id == "planning":
+			raise RuntimeError(
+				"planning_transport=edge cannot start a second ROS planning publisher")
 
 	simulator_parameters = {
 		**common_parameters,
@@ -169,19 +201,67 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		additional_env=participant_env,
 		parameters=[{**common_parameters, "source_id": secondary_source_id}],
 	)
+	if planning_transport == "edge":
+		command_channel = _channel_argument(context, "edge_command_channel")
+		feedback_channel = _channel_argument(context, "edge_feedback_channel")
+		edge_linear_velocity_mps = _finite_float_argument(
+			context, "edge_linear_velocity_mps")
+		edge_angular_velocity_radps = _finite_float_argument(
+			context, "edge_angular_velocity_radps")
+		bridge_node = Node(
+			package="control_link_adapters",
+			executable="edge_planning_bridge_node",
+			name="edge_planning_bridge",
+			namespace="control_link",
+			output="screen",
+			emulate_tty=True,
+			additional_env=participant_env,
+			parameters=[{
+				**common_parameters,
+				"command_channel": command_channel,
+				"feedback_channel": feedback_channel,
+				"source_id": "planning",
+			}],
+		)
+		edge_client_path = os.path.join(
+			get_package_prefix("control_link_adapters"),
+			"lib",
+			"control_link_adapters",
+			"edge_planning_client")
+		if not os.path.isfile(edge_client_path) or not os.access(edge_client_path, os.X_OK):
+			raise RuntimeError(
+				"planning_transport=edge requires control_link_adapters built with "
+				"-DCONTROL_LINK_ENABLE_EDGE_RUNTIME=ON; missing=" + edge_client_path)
+		edge_client = ExecuteProcess(
+			cmd=[
+				edge_client_path,
+				"--command-channel", command_channel,
+				"--feedback-channel", feedback_channel,
+				"--linear-velocity-mps",
+				str(edge_linear_velocity_mps),
+				"--angular-velocity-radps",
+				str(edge_angular_velocity_radps),
+			],
+			output="screen",
+			emulate_tty=True,
+		)
 
 	actions = [
 		LogInfo(msg="ADAS vcan demo requires an existing and up " + requested_interface),
 		simulator,
 		adapter_node,
 	]
-	if start_source:
+	if planning_transport == "edge":
+		actions.append(bridge_node)
+		if start_source:
+			actions.append(edge_client)
+	elif start_source:
 		actions.append(source_node)
-		if start_secondary_source:
-			actions.append(
-				TimerAction(
-					period=secondary_source_delay_seconds,
-					actions=[secondary_source_node]))
+	if start_secondary_source:
+		actions.append(
+			TimerAction(
+				period=secondary_source_delay_seconds,
+				actions=[secondary_source_node]))
 	actions.append(
 		Node(
 			package="control_link_gateway",
@@ -227,9 +307,34 @@ def generate_launch_description():
 			description="Start the normal Gateway Lifecycle activation gate",
 		),
 		DeclareLaunchArgument(
+			"planning_transport",
+			default_value="ros2",
+			description="Planning ingress transport: ros2 or optional EdgeRuntime edge",
+		),
+		DeclareLaunchArgument(
 			"source_id",
 			default_value="planning",
-			description="Enabled SourcePolicy source used by the mock source",
+			description="ROS2 source used in ros2 mode; edge mode fixes this to planning",
+		),
+		DeclareLaunchArgument(
+			"edge_command_channel",
+			default_value="control_link_planning_command",
+			description="EdgeRuntime command channel name for planning transport",
+		),
+		DeclareLaunchArgument(
+			"edge_feedback_channel",
+			default_value="control_link_planning_feedback",
+			description="EdgeRuntime feedback channel name for planning transport",
+		),
+		DeclareLaunchArgument(
+			"edge_linear_velocity_mps",
+			default_value="0.25",
+			description="Standalone Edge planning client linear velocity",
+		),
+		DeclareLaunchArgument(
+			"edge_angular_velocity_radps",
+			default_value="0.10",
+			description="Standalone Edge planning client angular velocity",
 		),
 		DeclareLaunchArgument(
 			"start_secondary_source",

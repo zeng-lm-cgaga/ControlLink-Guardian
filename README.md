@@ -52,6 +52,24 @@ planning / teleop
 
 Robot 与 ADAS 复用相同的 Contract、命令校验、来源仲裁和状态治理核心，平台差异只留在 ingress、执行 adapter 与 bringup 边界
 
+## 外部规划程序接入
+
+ADAS Profile 可选使用 EdgeRuntime 将外部规划或轨迹跟踪结果接入同一条控制链：
+
+```text
+外部规划程序
+  -> control_link_edge_client SDK
+  -> EdgeRuntime SPSC latest-value channel
+  -> edge_planning_bridge_node
+  -> /control_link/input/planning
+  -> Guardian -> SocketCAN/vcan -> vehicle feedback
+  -> EdgeRuntime feedback channel -> 外部规划程序
+```
+
+`control_link_edge_protocol` 是不依赖 ROS2 的定长 codec；可选的 `control_link_edge_client` 是由已安装 EdgeRuntime 支撑的 C++ SDK，提供 `open`、反馈读取、`current_session`、`status`、`submit`、`heartbeat` 和 `close`。`edge_protocol/examples/edge_planning_sdk_consumer` 是独立 CMake consumer，可在未 source ROS2 的环境中通过 `find_package(control_link_edge_client CONFIG REQUIRED)` 消费安装 SDK。
+
+SDK 默认单 owner。每个目标必须绑定当前 session、由调用者提供 SYSTEM 时间戳和该 session 内递增的业务 sequence；session 变化时旧目标拒绝且不会自动重发或重新盖章。输入值是固定车体坐标中的 `linear_velocity_mps` 与 `angular_velocity_radps`，`NORMAL/HOLD` 映射沿用现有 Contract。它不实现规划算法、轨迹跟踪、Ackermann steering angle/acceleration 转换，也不宣称 Autoware 或 Apollo 接入；`planning_transport=ros2|edge` 仍互斥，ROS teleop 仍由同一 Gateway 接管。
+
 ## Robot 仿真闭环
 
 Robot Profile 使用 Nav2、AMCL、tf2、ros2_control 和 Gazebo，Gateway 的 canonical command 只能经执行 adapter 进入 `diff_drive_controller`

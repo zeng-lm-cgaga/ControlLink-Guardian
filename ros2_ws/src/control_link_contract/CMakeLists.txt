@@ -42,7 +42,8 @@ if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
 		-fsanitize=address,undefined
 		-fno-omit-frame-pointer
 	)
-	target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+	# FUZZ 构建的共享库必须把 sanitizer 运行时传递给所有测试和节点消费者。
+	target_link_options(${PROJECT_NAME} PUBLIC -fsanitize=address,undefined)
 
 	add_executable(control_link_fuzz_contract_parser
 		fuzz/fuzz_contract_parser.cpp

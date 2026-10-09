@@ -34,3 +34,19 @@ float64 command_age_ms
 # 当前来源累计接受和拒绝的命令数量。
 uint64 accepted_count
 uint64 rejected_count
+
+# 以下字段是 Gateway 对本来源 Graph endpoint 的稳定观察，不是调用者自行推断的 readiness。
+# 只有 endpoint_stable=true 时 endpoint_state 才是去抖后的结论；否则表示仍在等待稳定窗口。
+uint8 ENDPOINT_PENDING=255
+uint8 ENDPOINT_MISSING=0
+uint8 ENDPOINT_AMBIGUOUS=1
+uint8 ENDPOINT_UNEXPECTED_DIRECTION=2
+uint8 ENDPOINT_TYPE_MISMATCH=3
+uint8 ENDPOINT_QOS_MISMATCH=4
+uint8 ENDPOINT_USABLE=5
+bool endpoint_stable
+uint8 endpoint_state
+uint32 endpoint_publisher_count
+# 仅在 endpoint_state=ENDPOINT_USABLE 时填充当前稳定 publisher 的 RMW GID。
+bool endpoint_generation_valid
+uint8[24] endpoint_publisher_gid

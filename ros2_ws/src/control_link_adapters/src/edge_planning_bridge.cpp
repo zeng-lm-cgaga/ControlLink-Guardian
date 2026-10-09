@@ -15,6 +15,7 @@
 #include <thread>
 #include <utility>
 #include <variant>
+#include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
 #include "control_link_contract/contract_bundle.hpp"
@@ -28,6 +29,7 @@
 #include "edge_runtime/channel/producer.hpp"
 #include "edge_runtime/common/error.hpp"
 #include "rclcpp/rclcpp.hpp"
+#include "rmw/types.h"
 
 namespace
 {
@@ -63,6 +65,30 @@ namespace
 		std::uint64_t edge_sequence{0U};
 		std::uint64_t epoch{0U};
 	};
+
+	enum class GraphAdmissionProbeResult
+	{
+		kWaiting,
+		kReady,
+		kTimedOut,
+		kStopped,
+		kSuperseded,
+	};
+
+	bool graph_publisher_set_matches(
+		const std::vector<rclcpp::TopicEndpointInfo> &publishers,
+		bool verify_own_publisher,
+		bool expected_gid_valid,
+		const std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> &expected_gid) noexcept
+	{
+		if (!verify_own_publisher)
+		{
+			return publishers.empty();
+		}
+
+		return expected_gid_valid && publishers.size() == 1U &&
+			publishers.front().endpoint_gid() == expected_gid;
+	}
 
 	std::string edge_error_text(const edge_runtime::Error &error)
 	{
@@ -141,6 +167,10 @@ namespace
 			declare_parameter<std::string>("command_channel", "control_link_planning_command");
 			declare_parameter<std::string>("feedback_channel", "control_link_planning_feedback");
 			declare_parameter<std::string>("source_id", "planning");
+			declare_parameter<std::int64_t>("graph_admission_timeout_ms", 30'000);
+			declare_parameter<std::int64_t>("graph_admission_quiet_ms", 250);
+			declare_parameter<std::int64_t>("graph_admission_poll_ms", 50);
+			declare_parameter<std::int64_t>("gateway_readiness_timeout_ms", 1'000);
 
 			load_configuration();
 			if (!control_link_edge_protocol::generate_session_token(&session_token_))
@@ -154,14 +184,25 @@ namespace
 				throw std::runtime_error("EdgePlanningBridge cannot read CLOCK_BOOTTIME");
 			}
 
-			publisher_ = create_publisher<ControlCommand>(source_topic_, input_qos_);
+				{
+					std::lock_guard<std::mutex> lock(mutex_);
+					publisher_rebuild_requested_ = true;
+					graph_admission_phase_ = "startup";
+				}
+
+			feedback_callback_group_ = create_callback_group(
+				rclcpp::CallbackGroupType::MutuallyExclusive);
+			publisher_callback_group_ = create_callback_group(
+				rclcpp::CallbackGroupType::MutuallyExclusive);
 			create_feedback_subscriptions();
-			publish_timer_ = create_wall_timer(5ms, [this]() { publish_pending_command(); });
+			publish_timer_ = create_wall_timer(
+				5ms, [this]() { publish_pending_command(); }, publisher_callback_group_);
 			worker_ = std::thread([this]() { edge_worker_loop(); });
 
 			RCLCPP_INFO(
 				get_logger(),
-				"Edge planning bridge ready: source=%s topic=%s command_channel=%s feedback_channel=%s",
+				"Edge planning bridge started: source=%s topic=%s command_channel=%s feedback_channel=%s; "
+				"Graph admission is asynchronous",
 				source_id_.c_str(), source_topic_.c_str(), command_channel_.c_str(),
 				feedback_channel_.c_str());
 		}
@@ -171,11 +212,19 @@ namespace
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				stop_requested_ = true;
+				graph_admission_pending_ = false;
+				graph_admission_verify_own_publisher_ = false;
+				publisher_rebuild_requested_ = false;
+				gateway_source_ready_ = false;
 			}
+			publish_timer_.reset();
 			stop_condition_.notify_all();
 			if (worker_.joinable()) worker_.join();
-			publish_timer_.reset();
-			publisher_.reset();
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				publisher_.reset();
+				publisher_gid_valid_ = false;
+			}
 		}
 
 	private:
@@ -186,10 +235,18 @@ namespace
 			const auto config_root = std::filesystem::path{
 				get_parameter("config_root").as_string()};
 			command_channel_ = get_parameter("command_channel").as_string();
-			feedback_channel_ = get_parameter("feedback_channel").as_string();
-			source_id_ = get_parameter("source_id").as_string();
-			if (profile_path.empty() || config_root.empty() || command_channel_.empty() ||
-				feedback_channel_.empty())
+		feedback_channel_ = get_parameter("feedback_channel").as_string();
+		source_id_ = get_parameter("source_id").as_string();
+		const auto graph_admission_timeout_ms =
+			get_parameter("graph_admission_timeout_ms").as_int();
+		const auto graph_admission_quiet_ms =
+			get_parameter("graph_admission_quiet_ms").as_int();
+		const auto graph_admission_poll_ms =
+			get_parameter("graph_admission_poll_ms").as_int();
+		const auto gateway_readiness_timeout_ms =
+			get_parameter("gateway_readiness_timeout_ms").as_int();
+		if (profile_path.empty() || config_root.empty() || command_channel_.empty() ||
+			feedback_channel_.empty())
 			{
 				throw std::invalid_argument(
 					"EdgePlanningBridge requires profile_path, config_root and channel names");
@@ -197,10 +254,49 @@ namespace
 			if (source_id_ != "planning")
 			{
 				throw std::invalid_argument(
-					"EdgePlanningBridge only exposes the existing planning source in A2");
-			}
+				"EdgePlanningBridge only exposes the existing planning source in A2");
+		}
+		if (graph_admission_timeout_ms <= 0 || graph_admission_timeout_ms > 120'000 ||
+			graph_admission_quiet_ms <= 0 ||
+			graph_admission_quiet_ms > graph_admission_timeout_ms ||
+			graph_admission_poll_ms <= 0 || graph_admission_poll_ms > 1'000)
+		{
+			throw std::invalid_argument(
+				"EdgePlanningBridge graph admission timing parameters are out of range");
+		}
+		if (gateway_readiness_timeout_ms <= 0 ||
+			gateway_readiness_timeout_ms > graph_admission_timeout_ms)
+		{
+			throw std::invalid_argument(
+				"EdgePlanningBridge gateway readiness timeout is out of range");
+		}
+		graph_admission_timeout_ = std::chrono::milliseconds(graph_admission_timeout_ms);
+		graph_admission_quiet_ = std::chrono::milliseconds(graph_admission_quiet_ms);
+			graph_admission_poll_ = std::chrono::milliseconds(graph_admission_poll_ms);
+		gateway_readiness_timeout_ =
+			std::chrono::milliseconds(gateway_readiness_timeout_ms);
 
 			bundle_ = control_link_contract::load_contract_bundle(profile_path, config_root);
+			const auto gateway_stable_ms =
+				bundle_->gateway_contract->gateway.graph_stable_window_ms;
+			const auto gateway_poll_ms = bundle_->gateway_contract->gateway.graph_poll_ms;
+			if (gateway_stable_ms >
+				std::numeric_limits<std::uint64_t>::max() - gateway_poll_ms)
+			{
+				throw std::out_of_range(
+					"Gateway Graph stability window cannot be represented by bridge timing");
+			}
+			const auto gateway_admission_quiet_ms = gateway_stable_ms + gateway_poll_ms;
+			if (gateway_admission_quiet_ms >
+				static_cast<std::uint64_t>(graph_admission_timeout_ms))
+			{
+				throw std::invalid_argument(
+					"graph_admission_timeout_ms is shorter than the Gateway Graph stability window");
+			}
+			graph_admission_quiet_ = std::max(
+				graph_admission_quiet_,
+				std::chrono::milliseconds{
+					static_cast<std::chrono::milliseconds::rep>(gateway_admission_quiet_ms)});
 			if (!profile_enables_source(*bundle_->profile, source_id_))
 			{
 				throw std::invalid_argument(
@@ -241,8 +337,29 @@ namespace
 			vehicle_state_topic_ = vehicle_state_topic.topic;
 		}
 
+		// 只有 Gateway 在稳定窗口后报告了当前 bridge GID，才允许对外宣告 SessionReady。
+		// 本地 Graph 的空窗/自有 GID 检查不能替代 Gateway 的实际准入结论。
+		bool gateway_source_status_matches_publisher_locked(
+			const SourceStatus &status) const noexcept
+		{
+			if (publisher_rebuild_requested_ || !publisher_gid_valid_ ||
+				publisher_ == nullptr || !status.endpoint_stable ||
+				status.endpoint_state != SourceStatus::ENDPOINT_USABLE ||
+				status.endpoint_publisher_count != 1U ||
+				!status.endpoint_generation_valid)
+			{
+				return false;
+			}
+			return std::equal(
+				status.endpoint_publisher_gid.begin(),
+				status.endpoint_publisher_gid.end(),
+				publisher_gid_.begin());
+		}
+
 		void create_feedback_subscriptions()
 		{
+			rclcpp::SubscriptionOptions subscription_options;
+			subscription_options.callback_group = feedback_callback_group_;
 			gateway_state_subscription_ = create_subscription<GatewayState>(
 				gateway_state_topic_, gateway_state_qos_,
 				[this](GatewayState::ConstSharedPtr message)
@@ -253,7 +370,7 @@ namespace
 					std::lock_guard<std::mutex> lock(mutex_);
 					gateway_state_ = *message;
 					gateway_receive_boot_ns_ = received_boot_ns;
-				});
+					}, subscription_options);
 			source_status_subscription_ = create_subscription<SourceStatus>(
 				source_status_topic_, source_status_qos_,
 				[this](SourceStatus::ConstSharedPtr message)
@@ -261,10 +378,28 @@ namespace
 					if (message == nullptr || message->source_id != source_id_) return;
 					const auto received_boot_ns =
 						control_link_edge_protocol::boottime_now_ns();
-					std::lock_guard<std::mutex> lock(mutex_);
-					source_status_ = *message;
-					source_status_receive_boot_ns_ = received_boot_ns;
-				});
+					bool readiness_changed = false;
+					bool ready = false;
+					{
+						std::lock_guard<std::mutex> lock(mutex_);
+						source_status_ = *message;
+						source_status_receive_boot_ns_ = received_boot_ns;
+						ready = gateway_source_status_matches_publisher_locked(*message);
+						readiness_changed = ready != gateway_source_ready_;
+						gateway_source_ready_ = ready;
+					}
+					if (readiness_changed)
+					{
+						RCLCPP_INFO(
+							get_logger(),
+							"Gateway source admission changed: ready=%s endpoint_state=%u "
+							"publishers=%u generation_match=%s",
+							ready ? "true" : "false",
+							static_cast<unsigned int>(message->endpoint_state),
+							static_cast<unsigned int>(message->endpoint_publisher_count),
+							ready ? "true" : "false");
+					}
+					}, subscription_options);
 			vehicle_state_subscription_ = create_subscription<VehicleState>(
 				vehicle_state_topic_, vehicle_state_qos_,
 				[this](VehicleState::ConstSharedPtr message)
@@ -275,7 +410,7 @@ namespace
 					std::lock_guard<std::mutex> lock(mutex_);
 					vehicle_state_ = *message;
 					vehicle_receive_boot_ns_ = received_boot_ns;
-				});
+					}, subscription_options);
 		}
 
 		edge_runtime::ChannelOptions command_channel_options() const
@@ -307,6 +442,230 @@ namespace
 		{
 			std::unique_lock<std::mutex> lock(mutex_);
 			stop_condition_.wait_for(lock, duration, [this]() { return stop_requested_; });
+		}
+
+		void wait_for_stop_until(std::chrono::steady_clock::time_point deadline)
+		{
+			std::unique_lock<std::mutex> lock(mutex_);
+			stop_condition_.wait_until(lock, deadline, [this]() { return stop_requested_; });
+		}
+
+		void start_graph_admission_locked(
+			const char *phase,
+			bool verify_own_publisher = false)
+		{
+			const auto now = std::chrono::steady_clock::now();
+			graph_admission_pending_ = true;
+			graph_admission_phase_ = phase != nullptr ? phase : "unknown";
+			graph_admission_epoch_ = epoch_;
+			graph_admission_verify_own_publisher_ = verify_own_publisher;
+			graph_admission_started_ = now;
+			graph_admission_deadline_ = now + graph_admission_timeout_;
+			graph_admission_quiet_since_ =
+				std::chrono::steady_clock::time_point::min();
+			graph_admission_next_probe_ = now;
+			graph_admission_next_report_ = now;
+			graph_admission_last_publisher_count_ = std::numeric_limits<std::size_t>::max();
+			graph_admission_zero_logged_ = false;
+
+			RCLCPP_INFO(
+				get_logger(),
+				"Graph admission waiting: phase=%s topic=%s timeout_ms=%lld quiet_ms=%lld",
+				graph_admission_phase_.c_str(), source_topic_.c_str(),
+				static_cast<long long>(graph_admission_timeout_.count()),
+				static_cast<long long>(graph_admission_quiet_.count()));
+		}
+
+		GraphAdmissionProbeResult probe_graph_admission()
+		{
+			std::string phase;
+			std::uint64_t admission_epoch = 0U;
+			bool verify_own_publisher = false;
+			bool expected_gid_valid = false;
+			std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> expected_gid{};
+			std::chrono::steady_clock::time_point deadline;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (!graph_admission_pending_)
+				{
+					return GraphAdmissionProbeResult::kReady;
+				}
+				const auto now = std::chrono::steady_clock::now();
+				if (now < graph_admission_next_probe_)
+				{
+					return GraphAdmissionProbeResult::kWaiting;
+				}
+				phase = graph_admission_phase_;
+				admission_epoch = graph_admission_epoch_;
+				verify_own_publisher = graph_admission_verify_own_publisher_;
+				expected_gid_valid = publisher_gid_valid_;
+				if (expected_gid_valid)
+				{
+					expected_gid = publisher_gid_;
+				}
+				deadline = graph_admission_deadline_;
+			}
+
+			if (!rclcpp::ok() || stopping())
+			{
+				return GraphAdmissionProbeResult::kStopped;
+			}
+
+			std::vector<rclcpp::TopicEndpointInfo> publishers;
+			try
+			{
+				publishers = get_publishers_info_by_topic(source_topic_);
+			}
+			catch (const std::exception &exception)
+			{
+				RCLCPP_WARN_THROTTLE(
+					get_logger(), *get_clock(), 1000,
+					"Graph admission probe failed for phase=%s: %s",
+					phase.c_str(), exception.what());
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
+				{
+					graph_admission_next_probe_ =
+						std::chrono::steady_clock::now() + graph_admission_poll_;
+				}
+				return GraphAdmissionProbeResult::kWaiting;
+			}
+
+			const auto now = std::chrono::steady_clock::now();
+			bool final_probe = false;
+			bool timed_out = now >= deadline;
+			bool report_zero = false;
+			bool report_blocked = false;
+			std::size_t publisher_count = publishers.size();
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (!graph_admission_pending_ || graph_admission_epoch_ != admission_epoch)
+				{
+					return GraphAdmissionProbeResult::kSuperseded;
+				}
+				graph_admission_next_probe_ = now + graph_admission_poll_;
+				if (graph_publisher_set_matches(
+					publishers, verify_own_publisher, expected_gid_valid, expected_gid))
+				{
+					if (graph_admission_quiet_since_ ==
+						std::chrono::steady_clock::time_point::min())
+					{
+						graph_admission_quiet_since_ = now;
+					}
+					if (!graph_admission_zero_logged_)
+					{
+						graph_admission_zero_logged_ = true;
+						report_zero = true;
+					}
+					final_probe = now - graph_admission_quiet_since_ >= graph_admission_quiet_;
+				}
+				else
+				{
+					graph_admission_quiet_since_ =
+						std::chrono::steady_clock::time_point::min();
+					graph_admission_zero_logged_ = false;
+					if (publishers.size() != graph_admission_last_publisher_count_ ||
+						now >= graph_admission_next_report_)
+					{
+						graph_admission_last_publisher_count_ = publishers.size();
+						graph_admission_next_report_ = now + 1s;
+						report_blocked = true;
+					}
+				}
+			}
+
+			if (report_zero)
+				{
+						RCLCPP_INFO(
+							get_logger(),
+							"Graph admission observed expected publisher set; settling: phase=%s "
+							"verify_own_publisher=%s",
+							phase.c_str(), verify_own_publisher ? "true" : "false");
+				}
+			if (report_blocked)
+			{
+				RCLCPP_WARN(
+					get_logger(),
+					"Graph admission blocked: phase=%s planning_publishers=%zu",
+					phase.c_str(), publisher_count);
+			}
+
+			if (final_probe && !timed_out && rclcpp::ok() && !stopping())
+			{
+				std::vector<rclcpp::TopicEndpointInfo> final_publishers;
+				try
+				{
+					final_publishers = get_publishers_info_by_topic(source_topic_);
+				}
+				catch (const std::exception &exception)
+				{
+					RCLCPP_WARN_THROTTLE(
+						get_logger(), *get_clock(), 1000,
+						"Final Graph admission probe failed for phase=%s: %s",
+						phase.c_str(), exception.what());
+					return GraphAdmissionProbeResult::kWaiting;
+				}
+				const auto final_now = std::chrono::steady_clock::now();
+				if (!rclcpp::ok() || stopping())
+				{
+					return GraphAdmissionProbeResult::kStopped;
+				}
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (!graph_admission_pending_ || graph_admission_epoch_ != admission_epoch)
+				{
+					return GraphAdmissionProbeResult::kSuperseded;
+				}
+					if (graph_publisher_set_matches(
+							final_publishers,
+							verify_own_publisher,
+							expected_gid_valid,
+							expected_gid) &&
+						final_now < graph_admission_deadline_)
+					{
+						graph_admission_pending_ = false;
+						if (graph_admission_verify_own_publisher_)
+						{
+							publisher_rebuild_requested_ = false;
+							graph_admission_verify_own_publisher_ = false;
+							gateway_source_ready_ = false;
+							publisher_graph_ready_boot_ns_ =
+								control_link_edge_protocol::boottime_now_ns();
+							RCLCPP_INFO(
+								get_logger(),
+								"Local publisher Graph admission complete; waiting for Gateway "
+								"stable generation before SessionReady");
+						}
+					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+						final_now - graph_admission_started_);
+					RCLCPP_INFO(
+						get_logger(),
+						"Graph admission ready: phase=%s elapsed_ms=%lld",
+						phase.c_str(), static_cast<long long>(elapsed.count()));
+					return GraphAdmissionProbeResult::kReady;
+				}
+				publisher_count = final_publishers.size();
+				graph_admission_quiet_since_ =
+					std::chrono::steady_clock::time_point::min();
+				graph_admission_zero_logged_ = false;
+				graph_admission_next_probe_ = final_now + graph_admission_poll_;
+				timed_out = final_now >= graph_admission_deadline_;
+			}
+
+			if (timed_out)
+			{
+					std::lock_guard<std::mutex> lock(mutex_);
+					if (graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
+					{
+						graph_admission_pending_ = false;
+						graph_admission_verify_own_publisher_ = false;
+					}
+				RCLCPP_ERROR(
+					get_logger(),
+					"Graph admission timeout: phase=%s planning_publishers=%zu; staying fail-closed",
+					phase.c_str(), publisher_count);
+				return GraphAdmissionProbeResult::kTimedOut;
+			}
+			return GraphAdmissionProbeResult::kWaiting;
 		}
 
 		void log_edge_error(const char *operation, const edge_runtime::Error &error)
@@ -341,6 +700,12 @@ namespace
 			session_cutoff_boot_ns_ = cutoff_boot_ns;
 			++epoch_;
 			publisher_rebuild_requested_ = true;
+			gateway_source_ready_ = false;
+			publisher_graph_ready_boot_ns_ = 0U;
+			source_status_.reset();
+			source_status_receive_boot_ns_ = 0U;
+			graph_admission_pending_ = false;
+			graph_admission_phase_ = "publisher_rebuild";
 			pending_command_.reset();
 			forwarding_ = false;
 			return true;
@@ -367,15 +732,15 @@ namespace
 			RCLCPP_INFO(get_logger(), "Edge feedback producer is ready");
 		}
 
-		void try_open_command_consumer()
+		bool try_open_command_consumer()
 		{
-			if (command_consumer_ != nullptr || feedback_producer_ == nullptr) return;
+			if (command_consumer_ != nullptr || feedback_producer_ == nullptr) return false;
 			auto opened = CommandConsumer::open(
 				command_channel_options(), edge_runtime::command_schema());
 			if (!opened)
 			{
 				log_edge_error("command consumer open", opened.error());
-				return;
+				return false;
 			}
 			command_consumer_ = std::make_unique<CommandConsumer>(
 				std::move(opened.value()));
@@ -385,16 +750,17 @@ namespace
 				(void)begin_new_session_locked(control_link_edge_protocol::boottime_now_ns());
 			}
 			RCLCPP_INFO(get_logger(), "Edge command consumer is connected");
+			return true;
 		}
 
-		void reconnect_command_consumer()
+		bool reconnect_command_consumer()
 		{
-			if (command_consumer_ == nullptr) return;
+			if (command_consumer_ == nullptr) return false;
 			auto reconnected = command_consumer_->reconnect();
 			if (!reconnected)
 			{
 				log_edge_error("command consumer reconnect", reconnected.error());
-				return;
+				return false;
 			}
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
@@ -404,11 +770,12 @@ namespace
 					RCLCPP_ERROR(get_logger(), "new Edge session token generation failed");
 				}
 			}
-			RCLCPP_INFO(
-				get_logger(), "Edge command consumer reconnected; old session is invalid");
+		RCLCPP_INFO(
+			get_logger(), "Edge command consumer reconnected; old session is invalid");
+			return true;
 		}
 
-		void handle_command_error(const edge_runtime::Error &error)
+		bool handle_command_error(const edge_runtime::Error &error)
 		{
 			log_edge_error("command read", error);
 			{
@@ -422,21 +789,22 @@ namespace
 			case edge_runtime::ErrorCode::kProducerOffline:
 			case edge_runtime::ErrorCode::kTransportFailed:
 			case edge_runtime::ErrorCode::kRecoveryBlocked:
-				reconnect_command_consumer();
-				break;
+				return reconnect_command_consumer();
 			case edge_runtime::ErrorCode::kPayloadCorrupt:
 			case edge_runtime::ErrorCode::kPayloadDecodeFailed:
 			case edge_runtime::ErrorCode::kSchemaMismatch:
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
-				if (!begin_new_session_locked(control_link_edge_protocol::boottime_now_ns()))
+				const bool session_reset =
+					begin_new_session_locked(control_link_edge_protocol::boottime_now_ns());
+				if (!session_reset)
 				{
 					RCLCPP_ERROR(get_logger(), "protocol error left Edge bridge fail-closed");
 				}
-				break;
+				return false;
 			}
 			default:
-				break;
+				return false;
 			}
 		}
 
@@ -488,57 +856,128 @@ namespace
 
 		void publish_pending_command()
 		{
-			// publisher 切换和实际 publish 同一把锁，避免检查旧 epoch 后向新资源发送。
-			std::lock_guard<std::mutex> lock(mutex_);
-			if (publisher_rebuild_requested_ && publisher_epoch_ != epoch_)
+			if (!rclcpp::ok() || stopping()) return;
+
 			{
-				try
-				{
-					publisher_.reset();
-					publisher_ = create_publisher<ControlCommand>(source_topic_, input_qos_);
-					publisher_epoch_ = epoch_;
-					publisher_rebuild_requested_ = false;
-					fatal_error_ = false;
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (fatal_error_) return;
+					if (publisher_rebuild_requested_ && !graph_admission_pending_)
+					{
+						// 先释放旧 GID，再由后续 timer tick 在锁外做一次有限 Graph 探测。
+						publisher_.reset();
+						publisher_gid_valid_ = false;
+						gateway_source_ready_ = false;
+						publisher_graph_ready_boot_ns_ = 0U;
+						start_graph_admission_locked(graph_admission_phase_.c_str());
 				}
-				catch (const std::exception &exception)
+			}
+
+			GraphAdmissionProbeResult admission = GraphAdmissionProbeResult::kReady;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (publisher_rebuild_requested_ && graph_admission_pending_)
 				{
+					admission = GraphAdmissionProbeResult::kWaiting;
+				}
+			}
+			if (admission == GraphAdmissionProbeResult::kWaiting)
+			{
+				admission = probe_graph_admission();
+				if (admission == GraphAdmissionProbeResult::kStopped ||
+					admission == GraphAdmissionProbeResult::kSuperseded ||
+					admission == GraphAdmissionProbeResult::kWaiting)
+				{
+					return;
+				}
+				if (admission == GraphAdmissionProbeResult::kTimedOut)
+				{
+					std::lock_guard<std::mutex> lock(mutex_);
 					fatal_error_ = true;
-					RCLCPP_ERROR(
-						get_logger(), "Edge publisher rebuild failed: %s", exception.what());
+					publisher_rebuild_requested_ = false;
+						publisher_.reset();
+						publisher_gid_valid_ = false;
+						gateway_source_ready_ = false;
+						publisher_graph_ready_boot_ns_ = 0U;
+						pending_command_.reset();
+					forwarding_ = false;
 					return;
 				}
 			}
-			if (fatal_error_ || !publisher_ || !pending_command_.has_value() ||
-				publisher_epoch_ != epoch_ || pending_command_->epoch != epoch_ ||
-				pending_command_->frame.session_token != session_token_)
-			{
-				return;
-			}
 
-			ControlCommand command;
-			if (!to_ros_time(
-				pending_command_->frame.source_stamp_ns, &command.source_stamp))
 			{
-				pending_command_.reset();
-				return;
-			}
-			command.source_id = source_id_;
-			command.source_sequence = pending_command_->frame.command_sequence;
-			command.mode = static_cast<std::uint8_t>(pending_command_->frame.mode);
-			command.linear_velocity_mps = pending_command_->frame.linear_velocity_mps;
-			command.angular_velocity_radps = pending_command_->frame.angular_velocity_radps;
-			try
-			{
-				publisher_->publish(command);
-				forwarding_ = true;
-				pending_command_.reset();
-			}
-			catch (const std::exception &exception)
-			{
-				pending_command_.reset();
-				forwarding_ = false;
-				fatal_error_ = true;
-				RCLCPP_ERROR(get_logger(), "Edge command publish failed: %s", exception.what());
+				// publisher 切换和实际 publish 同一把锁，避免检查旧 epoch 后向新资源发送。
+				std::lock_guard<std::mutex> lock(mutex_);
+				if (!rclcpp::ok() || fatal_error_ ||
+					(publisher_rebuild_requested_ && graph_admission_pending_))
+				{
+					return;
+				}
+				if (publisher_rebuild_requested_)
+				{
+					if (publisher_ != nullptr)
+					{
+						// 当前 publisher 仍处于 post-create GID verification，不能发布。
+						return;
+					}
+					try
+					{
+						publisher_ = create_publisher<ControlCommand>(source_topic_, input_qos_);
+						publisher_epoch_ = epoch_;
+						const auto &gid = publisher_->get_gid();
+						std::copy_n(
+							gid.data,
+							RMW_GID_STORAGE_SIZE,
+							publisher_gid_.begin());
+						publisher_gid_valid_ = true;
+						// 创建后再次要求 Graph 只看到本次 publisher 的 GID，
+						// 并保持至少 Gateway 的 stable window，避免旧 lease 造成 TOCTOU。
+						start_graph_admission_locked("publisher_verify", true);
+						return;
+					}
+					catch (const std::exception &exception)
+					{
+						publisher_.reset();
+						publisher_gid_valid_ = false;
+						gateway_source_ready_ = false;
+						publisher_graph_ready_boot_ns_ = 0U;
+						fatal_error_ = true;
+						RCLCPP_ERROR(
+							get_logger(), "Edge publisher rebuild failed: %s", exception.what());
+						return;
+					}
+				}
+			if (fatal_error_ || !publisher_ || !pending_command_.has_value() ||
+					publisher_epoch_ != epoch_ || pending_command_->epoch != epoch_ ||
+					pending_command_->frame.session_token != session_token_)
+				{
+					return;
+				}
+
+				ControlCommand command;
+				if (!to_ros_time(
+					pending_command_->frame.source_stamp_ns, &command.source_stamp))
+				{
+					pending_command_.reset();
+					return;
+				}
+				command.source_id = source_id_;
+				command.source_sequence = pending_command_->frame.command_sequence;
+				command.mode = static_cast<std::uint8_t>(pending_command_->frame.mode);
+				command.linear_velocity_mps = pending_command_->frame.linear_velocity_mps;
+				command.angular_velocity_radps = pending_command_->frame.angular_velocity_radps;
+				try
+				{
+					publisher_->publish(command);
+					forwarding_ = true;
+					pending_command_.reset();
+				}
+				catch (const std::exception &exception)
+				{
+					pending_command_.reset();
+					forwarding_ = false;
+					fatal_error_ = true;
+					RCLCPP_ERROR(get_logger(), "Edge command publish failed: %s", exception.what());
+				}
 			}
 		}
 
@@ -601,7 +1040,20 @@ namespace
 					frame.vehicle_receive_boot_ns = vehicle_receive_boot_ns_;
 				}
 			}
-			if (!fatal_error_)
+			const bool source_status_current =
+				gateway_source_ready_ && publisher_graph_ready_boot_ns_ != 0U &&
+				source_status_receive_boot_ns_ >= publisher_graph_ready_boot_ns_ &&
+				now_boot_ns >= source_status_receive_boot_ns_ &&
+				now_boot_ns - source_status_receive_boot_ns_ <=
+					static_cast<std::uint64_t>(gateway_readiness_timeout_.count()) * 1'000'000U;
+			const bool gateway_state_current =
+				gateway_state_.has_value() && gateway_receive_boot_ns_ != 0U &&
+				now_boot_ns >= gateway_receive_boot_ns_ &&
+				now_boot_ns - gateway_receive_boot_ns_ <=
+					static_cast<std::uint64_t>(gateway_readiness_timeout_.count()) * 1'000'000U &&
+					gateway_state_->state != GatewayState::ERROR;
+			if (!fatal_error_ && !publisher_rebuild_requested_ && publisher_ != nullptr &&
+				source_status_current && gateway_state_current)
 			{
 				frame.validity_flags |= control_link_edge_protocol::kSessionReady;
 			}
@@ -634,23 +1086,56 @@ namespace
 			auto next_feedback = std::chrono::steady_clock::now();
 			auto next_heartbeat = next_feedback;
 			auto next_reconnect = next_feedback;
+			auto next_command_open = next_feedback;
+			auto command_open_backoff = 20ms;
+			auto command_reconnect_backoff = 100ms;
 			while (!stopping())
 			{
 				try_create_feedback_producer();
-				try_open_command_consumer();
-				if (command_consumer_ != nullptr)
+				const auto before_command_open = std::chrono::steady_clock::now();
+				if (feedback_producer_ != nullptr && command_consumer_ == nullptr &&
+					before_command_open >= next_command_open)
+				{
+					if (try_open_command_consumer())
+					{
+						command_open_backoff = 20ms;
+						command_reconnect_backoff = 100ms;
+						next_command_open = before_command_open;
+						next_reconnect = before_command_open;
+					}
+					else
+					{
+						next_command_open = before_command_open + command_open_backoff;
+						command_open_backoff = std::min(command_open_backoff * 2, 1000ms);
+					}
+				}
+				const auto before_command_wait = std::chrono::steady_clock::now();
+				if (command_consumer_ != nullptr && before_command_wait >= next_reconnect)
 				{
 					auto sample = command_consumer_->wait_latest(50ms);
 					if (sample)
 					{
 						process_sample(sample.value());
+						command_reconnect_backoff = 100ms;
+						next_reconnect = std::chrono::steady_clock::now();
 					}
 					else if (sample.error().code != edge_runtime::ErrorCode::kNoNewSample &&
 							sample.error().code != edge_runtime::ErrorCode::kTimeout &&
 							std::chrono::steady_clock::now() >= next_reconnect)
 					{
-						next_reconnect = std::chrono::steady_clock::now() + 100ms;
-						handle_command_error(sample.error());
+						const auto attempt_at = std::chrono::steady_clock::now();
+						const bool recovered = handle_command_error(sample.error());
+						if (recovered)
+						{
+							command_reconnect_backoff = 100ms;
+							next_reconnect = attempt_at;
+						}
+						else
+						{
+							next_reconnect = attempt_at + command_reconnect_backoff;
+							command_reconnect_backoff = std::min(
+								command_reconnect_backoff * 2, 1000ms);
+						}
 					}
 				}
 				const auto now = std::chrono::steady_clock::now();
@@ -665,7 +1150,17 @@ namespace
 					if (!heartbeat) log_edge_error("feedback heartbeat", heartbeat.error());
 					next_heartbeat = now + 100ms;
 				}
-				if (feedback_producer_ == nullptr) wait_for_stop(100ms);
+				if (feedback_producer_ == nullptr)
+				{
+					wait_for_stop(100ms);
+				}
+				else
+				{
+					const auto wake_at = command_consumer_ == nullptr
+						? std::min(std::min(next_feedback, next_heartbeat), next_command_open)
+						: std::min(std::min(next_feedback, next_heartbeat), next_reconnect);
+					if (wake_at > now) wait_for_stop_until(wake_at);
+				}
 			}
 			if (feedback_producer_ != nullptr)
 			{
@@ -687,16 +1182,22 @@ namespace
 		std::string gateway_state_topic_;
 		std::string source_status_topic_;
 		std::string vehicle_state_topic_;
+		std::chrono::milliseconds graph_admission_timeout_{30'000};
+		std::chrono::milliseconds graph_admission_quiet_{250};
+		std::chrono::milliseconds graph_admission_poll_{50};
+		std::chrono::milliseconds gateway_readiness_timeout_{1'000};
 		rclcpp::QoS input_qos_{rclcpp::KeepLast(1U)};
 		rclcpp::QoS gateway_state_qos_{rclcpp::KeepLast(1U)};
 		rclcpp::QoS source_status_qos_{rclcpp::KeepLast(1U)};
 		rclcpp::QoS vehicle_state_qos_{rclcpp::KeepLast(1U)};
 
-		rclcpp::Publisher<ControlCommand>::SharedPtr publisher_;
+			rclcpp::Publisher<ControlCommand>::SharedPtr publisher_;
 		rclcpp::Subscription<GatewayState>::SharedPtr gateway_state_subscription_;
 		rclcpp::Subscription<SourceStatus>::SharedPtr source_status_subscription_;
 		rclcpp::Subscription<VehicleState>::SharedPtr vehicle_state_subscription_;
 		rclcpp::TimerBase::SharedPtr publish_timer_;
+		rclcpp::CallbackGroup::SharedPtr feedback_callback_group_;
+		rclcpp::CallbackGroup::SharedPtr publisher_callback_group_;
 
 		std::unique_ptr<CommandConsumer> command_consumer_;
 		std::unique_ptr<FeedbackProducer> feedback_producer_;
@@ -709,8 +1210,25 @@ namespace
 		SessionToken session_token_{};
 		std::uint64_t session_cutoff_boot_ns_{0U};
 		std::uint64_t epoch_{1U};
-		std::uint64_t publisher_epoch_{1U};
+		std::uint64_t publisher_epoch_{0U};
 		bool publisher_rebuild_requested_{false};
+		bool graph_admission_pending_{false};
+		bool graph_admission_verify_own_publisher_{false};
+		std::string graph_admission_phase_;
+		std::uint64_t graph_admission_epoch_{0U};
+		std::chrono::steady_clock::time_point graph_admission_started_{};
+		std::chrono::steady_clock::time_point graph_admission_deadline_{};
+		std::chrono::steady_clock::time_point graph_admission_quiet_since_{
+			std::chrono::steady_clock::time_point::min()};
+		std::chrono::steady_clock::time_point graph_admission_next_probe_{};
+		std::chrono::steady_clock::time_point graph_admission_next_report_{};
+		std::size_t graph_admission_last_publisher_count_{
+			std::numeric_limits<std::size_t>::max()};
+		bool graph_admission_zero_logged_{false};
+		std::array<std::uint8_t, RMW_GID_STORAGE_SIZE> publisher_gid_{};
+		bool publisher_gid_valid_{false};
+		std::uint64_t publisher_graph_ready_boot_ns_{0U};
+		bool gateway_source_ready_{false};
 		std::optional<TransportIdentity> transport_identity_;
 		std::uint64_t last_edge_sequence_{0U};
 		bool forwarding_{false};
@@ -735,7 +1253,11 @@ int main(int argc, char **argv)
 	try
 	{
 		auto node = std::make_shared<EdgePlanningBridge>();
-		rclcpp::spin(node);
+		rclcpp::executors::MultiThreadedExecutor executor(
+			rclcpp::ExecutorOptions(), 2U);
+		executor.add_node(node);
+		executor.spin();
+		executor.remove_node(node);
 	}
 	catch (const std::exception &exception)
 	{

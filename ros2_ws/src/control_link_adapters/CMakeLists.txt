@@ -47,6 +47,8 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	find_package(EdgeRuntime CONFIG REQUIRED)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF CACHE BOOL
 		"" FORCE)
+	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SDK ON CACHE BOOL
+		"" FORCE)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR OFF CACHE BOOL
 		"" FORCE)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS OFF CACHE BOOL
@@ -153,7 +155,8 @@ if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
 		-fsanitize=address,undefined
 		-fno-omit-frame-pointer
 	)
-	target_link_options(${PROJECT_NAME} PRIVATE -fsanitize=address,undefined)
+	# FUZZ 构建的共享库必须把 sanitizer 运行时传递给所有测试和节点消费者。
+	target_link_options(${PROJECT_NAME} PUBLIC -fsanitize=address,undefined)
 
 	add_executable(control_link_fuzz_can_codec
 		fuzz/fuzz_can_codec.cpp
@@ -213,8 +216,7 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 		EdgeRuntime::edge_runtime
 	)
 	target_link_libraries(edge_planning_client
-		control_link_edge_protocol
-		EdgeRuntime::edge_runtime
+		control_link_edge_client
 	)
 	target_link_libraries(edge_planning_supervisor
 		EdgeRuntime::edge_runtime

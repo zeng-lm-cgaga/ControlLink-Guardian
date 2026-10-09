@@ -1,5 +1,6 @@
 #include "control_link_gateway/control_gateway_node.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -1101,6 +1102,34 @@ namespace control_link_gateway
 					status.lease_valid = source_result.lease_valid;
 					status.command_age_ms = nanoseconds_to_milliseconds(
 						source_result.command_age_ns);
+					const auto endpoint_tracker = source_endpoint_trackers_.find(
+						source_result.source_id);
+					if (endpoint_tracker != source_endpoint_trackers_.end() &&
+						endpoint_tracker->second.stable_assessment.has_value())
+					{
+						const auto &assessment =
+							endpoint_tracker->second.stable_assessment.value();
+						status.endpoint_stable = true;
+						status.endpoint_state = static_cast<std::uint8_t>(assessment.state);
+						status.endpoint_publisher_count = static_cast<std::uint32_t>(
+							std::min<std::size_t>(
+								assessment.publisher_count,
+								std::numeric_limits<std::uint32_t>::max()));
+						if (assessment.usable() && assessment.publisher_generation.has_value())
+						{
+							status.endpoint_generation_valid = true;
+							std::copy_n(
+								assessment.publisher_generation->publisher_gid.begin(),
+								status.endpoint_publisher_gid.size(),
+								status.endpoint_publisher_gid.begin());
+						}
+					}
+					else
+					{
+						status.endpoint_stable = false;
+						status.endpoint_state =
+							control_link_interfaces::msg::SourceStatus::ENDPOINT_PENDING;
+					}
 
 					source_status_messages.push_back(std::move(status));
 				}

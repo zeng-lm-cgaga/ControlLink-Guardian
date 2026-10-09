@@ -1,32 +1,24 @@
-#include "control_link_edge_protocol/edge_payload.hpp"
+#include "control_link_edge_protocol/client.hpp"
 
-#include <chrono>
-#include <cmath>
 #include <cerrno>
 #include <csignal>
-#include <cstdint>
 #include <cstdlib>
-#include <cstring>
+#include <cmath>
+#include <cstdint>
 #include <iostream>
-#include <limits>
-#include <memory>
-#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
 
-#include "edge_runtime/channel/channel_options.hpp"
-#include "edge_runtime/channel/consumer.hpp"
-#include "edge_runtime/channel/producer.hpp"
-#include "edge_runtime/common/error.hpp"
-
 namespace
 {
-	using control_link_edge_protocol::CommandFrame;
-	using control_link_edge_protocol::FeedbackFrame;
-	using control_link_edge_protocol::SessionToken;
-	using FeedbackConsumer = edge_runtime::Consumer<FeedbackFrame>;
-	using CommandProducer = edge_runtime::Producer<CommandFrame>;
+	using control_link_edge_client::Client;
+	using control_link_edge_client::ClientOptions;
+	using control_link_edge_client::ClientState;
+	using control_link_edge_client::CommandTarget;
+	using control_link_edge_client::FeedbackSnapshot;
+	using control_link_edge_client::SessionId;
+	using control_link_edge_protocol::CommandMode;
 
 	volatile std::sig_atomic_t stop_requested = 0;
 
@@ -71,8 +63,10 @@ namespace
 		char *end = nullptr;
 		errno = 0;
 		const auto parsed = std::strtod(text, &end);
-		if (errno != 0 || end == text || *end != '\0') return false;
-		if (!std::isfinite(parsed)) return false;
+		if (errno != 0 || end == text || *end != '\0' || !std::isfinite(parsed))
+		{
+			return false;
+		}
 		*value = parsed;
 		return true;
 	}
@@ -130,46 +124,45 @@ namespace
 		return stream.str();
 	}
 
-	edge_runtime::ChannelOptions command_options(const Options &options)
+	void print_feedback(const FeedbackSnapshot &snapshot)
 	{
-		edge_runtime::ChannelOptions result;
-		result.name = options.command_channel;
-		result.stale_timeout = std::chrono::milliseconds(500);
-		result.reconnect_timeout = std::chrono::milliseconds(500);
-		result.heartbeat_interval = std::chrono::milliseconds(100);
-		return result;
-	}
-
-	edge_runtime::ChannelOptions feedback_options(const Options &options)
-	{
-		edge_runtime::ChannelOptions result;
-		result.name = options.feedback_channel;
-		result.stale_timeout = std::chrono::milliseconds(500);
-		result.reconnect_timeout = std::chrono::milliseconds(500);
-		return result;
-	}
-
-	bool same_token(const SessionToken &left, const SessionToken &right) noexcept
-	{
-		return left == right;
-	}
-
-	bool should_reconnect(edge_runtime::ErrorCode code) noexcept
-	{
-		return code == edge_runtime::ErrorCode::kStaleHandle ||
-			code == edge_runtime::ErrorCode::kProducerOffline ||
-			code == edge_runtime::ErrorCode::kTransportFailed ||
-			code == edge_runtime::ErrorCode::kRecoveryBlocked;
-	}
-
-	void print_feedback(const FeedbackFrame &feedback)
-	{
-		std::cout << "feedback sequence=" << feedback.feedback_sequence
+		const auto &feedback = snapshot.frame;
+		std::cout << "feedback=" << feedback.feedback_sequence
 			<< " transport=" << static_cast<unsigned>(feedback.transport_state)
+			<< " transport_fresh=" << (snapshot.fresh ? "yes" : "no")
 			<< " gateway=" << static_cast<unsigned>(feedback.gateway_state)
-			<< " active_source=" << static_cast<unsigned>(feedback.active_source)
+			<< " gateway_reason=" << feedback.gateway_reason_code
+			<< " gateway_current=" << (snapshot.gateway_state_current() ? "yes" : "no")
 			<< " planning_accepted=" << feedback.planning_accepted_count
-			<< " planning_rejected=" << feedback.planning_rejected_count << '\n' << std::flush;
+			<< " planning_rejected=" << feedback.planning_rejected_count
+			<< " planning_current=" << (snapshot.planning_status_current() ? "yes" : "no")
+			<< " active_source=" << static_cast<unsigned>(feedback.active_source)
+			<< " vehicle_state=" << static_cast<unsigned>(feedback.vehicle_state)
+			<< " vehicle_fault=" << feedback.vehicle_fault_code
+			<< " vehicle_current=" << (snapshot.vehicle_state_current() ? "yes" : "no")
+			<< '\n' << std::flush;
+	}
+
+	const char *client_state_name(ClientState state) noexcept
+	{
+		switch (state)
+		{
+		case ClientState::kOpening: return "opening";
+		case ClientState::kWaitingForSession: return "waiting_for_session";
+		case ClientState::kReady: return "ready";
+		case ClientState::kFeedbackStale: return "feedback_stale";
+		case ClientState::kTransportLost: return "transport_lost";
+		case ClientState::kProtocolError: return "protocol_error";
+		case ClientState::kClosed: return "closed";
+		}
+		return "unknown";
+	}
+
+	bool session_changed(
+		const std::optional<SessionId> &previous,
+		const SessionId &current) noexcept
+	{
+		return !previous.has_value() || previous.value() != current;
 	}
 }
 
@@ -188,63 +181,24 @@ int main(int argc, char **argv)
 		return 2;
 	}
 
-	const auto command_channel_options = command_options(options);
-	const auto feedback_channel_options = feedback_options(options);
-	auto command_result = CommandProducer::create(
-		command_channel_options, edge_runtime::command_schema());
-	if (!command_result)
+	ClientOptions client_options;
+	client_options.command_channel = options.command_channel;
+	client_options.feedback_channel = options.feedback_channel;
+	client_options.feedback_open_timeout = std::chrono::seconds(30);
+	client_options.reconnect_period = std::chrono::milliseconds(100);
+	client_options.feedback_freshness = std::chrono::milliseconds(500);
+		auto opened = Client::open(client_options);
+	if (!opened)
 	{
-		std::cerr << "command channel create failed: " << error_text(command_result.error()) << '\n';
+		std::cerr << "edge client open failed: " << error_text(opened.error()) << '\n';
 		return 3;
 	}
-	CommandProducer command_producer = std::move(command_result.value());
+	Client client = std::move(opened.value());
 
-	std::unique_ptr<FeedbackConsumer> feedback_consumer;
-	const auto feedback_retry_deadline =
-		std::chrono::steady_clock::now() + std::chrono::seconds(30);
-	while (!feedback_consumer && !stop_requested)
-	{
-		// 等待 bridge/token 期间只续 transport heartbeat，不生成业务命令。
-		auto heartbeat = command_producer.heartbeat();
-		if (!heartbeat)
-		{
-			std::cerr << "command heartbeat failed while waiting for feedback: "
-				<< error_text(heartbeat.error()) << '\n';
-			(void)command_producer.remove_if_owner();
-			return 4;
-		}
-		auto opened = FeedbackConsumer::open(
-			feedback_channel_options, edge_runtime::feedback_schema());
-		if (opened)
-		{
-			feedback_consumer = std::make_unique<FeedbackConsumer>(
-				std::move(opened.value()));
-			break;
-		}
-		if (std::chrono::steady_clock::now() >= feedback_retry_deadline)
-		{
-			std::cerr << "feedback channel open timed out: "
-				<< error_text(opened.error()) << '\n';
-			(void)command_producer.remove_if_owner();
-			return 4;
-		}
-		std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	}
-	if (!feedback_consumer)
-	{
-		(void)command_producer.remove_if_owner();
-		return 0;
-	}
-
-	std::optional<SessionToken> active_token;
-	bool feedback_session_ready = false;
-	bool feedback_transport_allowed = false;
+	std::optional<SessionId> target_session;
 	std::uint64_t next_command_sequence = 0U;
-	std::uint64_t last_feedback_boot_ns = 0U;
-	std::uint64_t last_feedback_sequence = 0U;
 	const auto started_at = std::chrono::steady_clock::now();
 	auto next_publish = started_at;
-	auto next_reconnect_attempt = started_at;
 
 	while (!stop_requested)
 	{
@@ -255,106 +209,70 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		const auto feedback = feedback_consumer->wait_latest(std::chrono::milliseconds(50));
+		const auto feedback = client.wait_feedback(std::chrono::milliseconds(50));
 		if (feedback)
 		{
-			const auto &sample = feedback.value();
-			const auto &value = sample.value;
-			last_feedback_boot_ns = sample.receive_boot_ns;
-			if (last_feedback_sequence != value.feedback_sequence)
+			const auto current_session = client.current_session();
+			if (session_changed(target_session, current_session.id))
 			{
-				last_feedback_sequence = value.feedback_sequence;
-				if (!active_token.has_value() || !same_token(active_token.value(), value.session_token))
+				target_session = current_session.id;
+				next_command_sequence = 0U;
+				std::cout << "new SDK session observed; old target discarded\n" << std::flush;
+			}
+			print_feedback(feedback.value());
+
+			if (feedback.value().fresh && current_session.ready &&
+				current_session.transport_allowed &&
+				std::chrono::steady_clock::now() >= next_publish)
+			{
+				CommandTarget target;
+				target.session = current_session.id;
+				target.command_sequence = ++next_command_sequence;
+				target.source_stamp_ns =
+					control_link_edge_protocol::system_time_now_ns();
+				target.clock_domain = control_link_edge_protocol::ClockDomain::kSystem;
+				target.mode = CommandMode::kNormal;
+				target.linear_velocity_mps = options.linear_velocity_mps;
+				target.angular_velocity_radps = options.angular_velocity_radps;
+				auto submitted = client.submit(target);
+				if (!submitted)
 				{
-					// token 变化使旧业务目标失效；客户端必须重新生成 sequence 和目标时间。
-					active_token = value.session_token;
-					next_command_sequence = 0U;
-					std::cout << "new bridge session token observed; old command target discarded\n"
-						<< std::flush;
+					std::cerr << "SDK target submit rejected: "
+						<< error_text(submitted.error()) << '\n';
 				}
-				feedback_session_ready =
-					(value.validity_flags & control_link_edge_protocol::kSessionReady) != 0U;
-				feedback_transport_allowed =
-					value.transport_state != control_link_edge_protocol::TransportState::kStopped &&
-					value.transport_state != control_link_edge_protocol::TransportState::kProtocolError;
-				print_feedback(value);
+				next_publish = std::chrono::steady_clock::now() +
+					std::chrono::milliseconds(options.period_ms);
 			}
 		}
-		else if (should_reconnect(feedback.error().code) &&
-			std::chrono::steady_clock::now() >= next_reconnect_attempt)
+		else if (feedback.error().code == edge_runtime::ErrorCode::kDataStale ||
+			feedback.error().code == edge_runtime::ErrorCode::kProducerStalled)
 		{
-			next_reconnect_attempt = std::chrono::steady_clock::now() +
-				std::chrono::milliseconds(100);
-			auto reconnected = feedback_consumer->reconnect();
-			if (!reconnected)
+			const auto status = client.status();
+			if (status.state == ClientState::kFeedbackStale)
 			{
-				active_token.reset();
-				feedback_session_ready = false;
-				feedback_transport_allowed = false;
-				last_feedback_boot_ns = 0U;
+				std::cerr << "SDK feedback stale: state="
+					<< client_state_name(status.state) << " transport_fresh=no\n";
 			}
-			else
-			{
-				active_token.reset();
-				feedback_session_ready = false;
-				feedback_transport_allowed = false;
-				last_feedback_boot_ns = 0U;
-				std::cout << "feedback channel reconnected; waiting for new token\n"
-					<< std::flush;
-			}
+		}
+		else if (feedback.error().code != edge_runtime::ErrorCode::kTimeout &&
+			feedback.error().code != edge_runtime::ErrorCode::kNoNewSample)
+		{
+			std::cerr << "SDK feedback read failed: " << error_text(feedback.error()) << '\n';
 		}
 
-		const auto now_boot_ns = control_link_edge_protocol::boottime_now_ns();
-		const bool feedback_fresh = last_feedback_boot_ns != 0U &&
-			now_boot_ns >= last_feedback_boot_ns &&
-			now_boot_ns - last_feedback_boot_ns <= 500'000'000U;
-		const bool transport_ready = active_token.has_value() && feedback_fresh &&
-			feedback_session_ready && feedback_transport_allowed;
-		if (transport_ready && std::chrono::steady_clock::now() >= next_publish)
-		{
-			CommandFrame command;
-			command.session_token = active_token.value();
-			command.command_sequence = ++next_command_sequence;
-			command.source_stamp_ns = control_link_edge_protocol::system_time_now_ns();
-			command.linear_velocity_mps = options.linear_velocity_mps;
-			command.angular_velocity_radps = options.angular_velocity_radps;
-			if (command.source_stamp_ns <= 0)
-			{
-				std::cerr << "system clock unavailable; command forwarding stopped\n";
-				active_token.reset();
-				feedback_session_ready = false;
-				feedback_transport_allowed = false;
-			}
-			else
-			{
-				auto published = command_producer.publish(command);
-				if (!published)
-				{
-					std::cerr << "command publish failed: " << error_text(published.error()) << '\n';
-					active_token.reset();
-					feedback_session_ready = false;
-					feedback_transport_allowed = false;
-				}
-			}
-			next_publish = std::chrono::steady_clock::now() +
-				std::chrono::milliseconds(options.period_ms);
-		}
-
-		auto heartbeat = command_producer.heartbeat();
+		auto heartbeat = client.heartbeat();
 		if (!heartbeat)
 		{
-			std::cerr << "command heartbeat failed: " << error_text(heartbeat.error()) << '\n';
-			active_token.reset();
-			feedback_session_ready = false;
-			feedback_transport_allowed = false;
+			std::cerr << "SDK transport heartbeat failed: "
+				<< error_text(heartbeat.error()) << '\n';
+			break;
 		}
 	}
 
-	feedback_consumer.reset();
-	const auto removed = command_producer.remove_if_owner();
-	if (!removed)
+	const auto closed = client.close();
+	if (!closed)
 	{
-		std::cerr << "command channel cleanup failed: " << error_text(removed.error()) << '\n';
+		std::cerr << "SDK close failed: " << error_text(closed.error()) << '\n';
 		return 5;
 	}
 	return 0;

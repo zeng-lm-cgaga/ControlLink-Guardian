@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(EdgeRuntime CONFIG REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/../control_link_edge_protocol/control_link_edge_protocolTargets.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/control_link_edge_clientTargets.cmake")
+check_required_components(control_link_edge_client)

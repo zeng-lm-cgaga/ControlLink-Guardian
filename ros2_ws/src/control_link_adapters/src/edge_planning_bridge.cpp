@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
+#include "control_link_adapters/graph_admission_policy.hpp"
 #include "control_link_contract/contract_bundle.hpp"
 #include "control_link_contract/qos_factory.hpp"
 #include "control_link_interfaces/msg/control_command.hpp"
@@ -66,14 +67,7 @@ namespace
 		std::uint64_t epoch{0U};
 	};
 
-	enum class GraphAdmissionProbeResult
-	{
-		kWaiting,
-		kReady,
-		kTimedOut,
-		kStopped,
-		kSuperseded,
-	};
+	using control_link_adapters::GraphAdmissionProbeResult;
 
 	bool graph_publisher_set_matches(
 		const std::vector<rclcpp::TopicEndpointInfo> &publishers,
@@ -476,6 +470,49 @@ namespace
 				static_cast<long long>(graph_admission_quiet_.count()));
 		}
 
+		GraphAdmissionProbeResult handle_graph_admission_probe_failure(
+			const std::string &phase,
+			std::uint64_t admission_epoch,
+			std::chrono::steady_clock::time_point deadline,
+			bool final_probe)
+		{
+			const auto failure_now = std::chrono::steady_clock::now();
+			GraphAdmissionProbeResult result;
+			{
+				std::lock_guard<std::mutex> lock(mutex_);
+				result = control_link_adapters::graph_admission_probe_failure_result(
+					failure_now,
+					deadline,
+					graph_admission_pending_,
+					graph_admission_epoch_ == admission_epoch,
+					!rclcpp::ok() || stop_requested_);
+				if (result == GraphAdmissionProbeResult::kWaiting)
+				{
+					graph_admission_next_probe_ = failure_now + graph_admission_poll_;
+					// 查询失败使此前 quiet-window 观测失去连续性，必须重新稳定观察。
+					graph_admission_quiet_since_ =
+						std::chrono::steady_clock::time_point::min();
+					graph_admission_zero_logged_ = false;
+				}
+				else if (result == GraphAdmissionProbeResult::kTimedOut &&
+					graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
+				{
+					graph_admission_pending_ = false;
+					graph_admission_verify_own_publisher_ = false;
+				}
+			}
+			if (result == GraphAdmissionProbeResult::kTimedOut)
+			{
+				RCLCPP_ERROR(
+					get_logger(),
+					"Graph admission timeout after %sprobe exception: phase=%s; "
+					"staying fail-closed",
+					final_probe ? "final " : "",
+					phase.c_str());
+			}
+			return result;
+		}
+
 		GraphAdmissionProbeResult probe_graph_admission()
 		{
 			std::string phase;
@@ -522,13 +559,8 @@ namespace
 					get_logger(), *get_clock(), 1000,
 					"Graph admission probe failed for phase=%s: %s",
 					phase.c_str(), exception.what());
-				std::lock_guard<std::mutex> lock(mutex_);
-				if (graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
-				{
-					graph_admission_next_probe_ =
-						std::chrono::steady_clock::now() + graph_admission_poll_;
-				}
-				return GraphAdmissionProbeResult::kWaiting;
+				return handle_graph_admission_probe_failure(
+					phase, admission_epoch, deadline, false);
 			}
 
 			const auto now = std::chrono::steady_clock::now();
@@ -557,7 +589,12 @@ namespace
 						graph_admission_zero_logged_ = true;
 						report_zero = true;
 					}
-					final_probe = now - graph_admission_quiet_since_ >= graph_admission_quiet_;
+					final_probe = control_link_adapters::graph_admission_quiet_window_complete(
+						true,
+						graph_admission_quiet_since_,
+						now,
+						graph_admission_quiet_,
+						graph_admission_deadline_);
 				}
 				else
 				{
@@ -597,14 +634,15 @@ namespace
 				{
 					final_publishers = get_publishers_info_by_topic(source_topic_);
 				}
-				catch (const std::exception &exception)
-				{
-					RCLCPP_WARN_THROTTLE(
-						get_logger(), *get_clock(), 1000,
-						"Final Graph admission probe failed for phase=%s: %s",
-						phase.c_str(), exception.what());
-					return GraphAdmissionProbeResult::kWaiting;
-				}
+					catch (const std::exception &exception)
+					{
+						RCLCPP_WARN_THROTTLE(
+							get_logger(), *get_clock(), 1000,
+							"Final Graph admission probe failed for phase=%s: %s",
+							phase.c_str(), exception.what());
+						return handle_graph_admission_probe_failure(
+							phase, admission_epoch, deadline, true);
+					}
 				const auto final_now = std::chrono::steady_clock::now();
 				if (!rclcpp::ok() || stopping())
 				{

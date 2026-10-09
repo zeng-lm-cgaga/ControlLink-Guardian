@@ -208,6 +208,7 @@ ament_target_dependencies(socketcan_adapter_node
 )
 
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+	target_include_directories(edge_planning_bridge_node PRIVATE include)
 	target_compile_options(edge_planning_bridge_node PRIVATE -Wall -Wextra -Wpedantic)
 	target_compile_options(edge_planning_client PRIVATE -Wall -Wextra -Wpedantic)
 	target_compile_options(edge_planning_supervisor PRIVATE -Wall -Wextra -Wpedantic)
@@ -264,6 +265,12 @@ if(BUILD_TESTING)
 		test_control_link_mock_system
 		PRIVATE -Wall -Wextra -Wpedantic
 	)
+
+	ament_add_gtest(test_graph_admission_policy
+		test/test_graph_admission_policy.cpp
+	)
+	target_include_directories(test_graph_admission_policy PRIVATE include)
+	target_compile_options(test_graph_admission_policy PRIVATE -Wall -Wextra -Wpedantic)
 
 	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
 		ament_add_gtest(test_socketcan_transport

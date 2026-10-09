@@ -494,12 +494,6 @@ namespace
 						std::chrono::steady_clock::time_point::min();
 					graph_admission_zero_logged_ = false;
 				}
-				else if (result == GraphAdmissionProbeResult::kTimedOut &&
-					graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
-				{
-					graph_admission_pending_ = false;
-					graph_admission_verify_own_publisher_ = false;
-				}
 			}
 			if (result == GraphAdmissionProbeResult::kTimedOut)
 			{
@@ -612,13 +606,13 @@ namespace
 			}
 
 			if (report_zero)
-				{
-						RCLCPP_INFO(
-							get_logger(),
-							"Graph admission observed expected publisher set; settling: phase=%s "
-							"verify_own_publisher=%s",
-							phase.c_str(), verify_own_publisher ? "true" : "false");
-				}
+			{
+				RCLCPP_INFO(
+					get_logger(),
+					"Graph admission observed expected publisher set; settling: phase=%s "
+					"verify_own_publisher=%s",
+					phase.c_str(), verify_own_publisher ? "true" : "false");
+			}
 			if (report_blocked)
 			{
 				RCLCPP_WARN(
@@ -634,15 +628,15 @@ namespace
 				{
 					final_publishers = get_publishers_info_by_topic(source_topic_);
 				}
-					catch (const std::exception &exception)
-					{
-						RCLCPP_WARN_THROTTLE(
-							get_logger(), *get_clock(), 1000,
-							"Final Graph admission probe failed for phase=%s: %s",
-							phase.c_str(), exception.what());
-						return handle_graph_admission_probe_failure(
-							phase, admission_epoch, deadline, true);
-					}
+				catch (const std::exception &exception)
+				{
+					RCLCPP_WARN_THROTTLE(
+						get_logger(), *get_clock(), 1000,
+						"Final Graph admission probe failed for phase=%s: %s",
+						phase.c_str(), exception.what());
+					return handle_graph_admission_probe_failure(
+						phase, admission_epoch, deadline, true);
+				}
 				const auto final_now = std::chrono::steady_clock::now();
 				if (!rclcpp::ok() || stopping())
 				{
@@ -653,26 +647,26 @@ namespace
 				{
 					return GraphAdmissionProbeResult::kSuperseded;
 				}
-					if (graph_publisher_set_matches(
-							final_publishers,
-							verify_own_publisher,
-							expected_gid_valid,
-							expected_gid) &&
-						final_now < graph_admission_deadline_)
+				if (graph_publisher_set_matches(
+						final_publishers,
+						verify_own_publisher,
+						expected_gid_valid,
+						expected_gid) &&
+					final_now < graph_admission_deadline_)
+				{
+					graph_admission_pending_ = false;
+					if (graph_admission_verify_own_publisher_)
 					{
-						graph_admission_pending_ = false;
-						if (graph_admission_verify_own_publisher_)
-						{
-							publisher_rebuild_requested_ = false;
-							graph_admission_verify_own_publisher_ = false;
-							gateway_source_ready_ = false;
-							publisher_graph_ready_boot_ns_ =
-								control_link_edge_protocol::boottime_now_ns();
-							RCLCPP_INFO(
-								get_logger(),
-								"Local publisher Graph admission complete; waiting for Gateway "
-								"stable generation before SessionReady");
-						}
+						publisher_rebuild_requested_ = false;
+						graph_admission_verify_own_publisher_ = false;
+						gateway_source_ready_ = false;
+						publisher_graph_ready_boot_ns_ =
+							control_link_edge_protocol::boottime_now_ns();
+						RCLCPP_INFO(
+							get_logger(),
+							"Local publisher Graph admission complete; waiting for Gateway "
+							"stable generation before SessionReady");
+					}
 					const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 						final_now - graph_admission_started_);
 					RCLCPP_INFO(
@@ -691,12 +685,6 @@ namespace
 
 			if (timed_out)
 			{
-					std::lock_guard<std::mutex> lock(mutex_);
-					if (graph_admission_pending_ && graph_admission_epoch_ == admission_epoch)
-					{
-						graph_admission_pending_ = false;
-						graph_admission_verify_own_publisher_ = false;
-					}
 				RCLCPP_ERROR(
 					get_logger(),
 					"Graph admission timeout: phase=%s planning_publishers=%zu; staying fail-closed",
@@ -899,23 +887,25 @@ namespace
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				if (fatal_error_) return;
-					if (publisher_rebuild_requested_ && !graph_admission_pending_)
-					{
-						// 先释放旧 GID，再由后续 timer tick 在锁外做一次有限 Graph 探测。
-						publisher_.reset();
-						publisher_gid_valid_ = false;
-						gateway_source_ready_ = false;
-						publisher_graph_ready_boot_ns_ = 0U;
-						start_graph_admission_locked(graph_admission_phase_.c_str());
+				if (publisher_rebuild_requested_ && !graph_admission_pending_)
+				{
+					// 先释放旧 GID，再由后续 timer tick 在锁外做一次有限 Graph 探测。
+					publisher_.reset();
+					publisher_gid_valid_ = false;
+					gateway_source_ready_ = false;
+					publisher_graph_ready_boot_ns_ = 0U;
+					start_graph_admission_locked(graph_admission_phase_.c_str());
 				}
 			}
 
 			GraphAdmissionProbeResult admission = GraphAdmissionProbeResult::kReady;
+			std::uint64_t admission_epoch = 0U;
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				if (publisher_rebuild_requested_ && graph_admission_pending_)
 				{
 					admission = GraphAdmissionProbeResult::kWaiting;
+					admission_epoch = graph_admission_epoch_;
 				}
 			}
 			if (admission == GraphAdmissionProbeResult::kWaiting)
@@ -930,13 +920,21 @@ namespace
 				if (admission == GraphAdmissionProbeResult::kTimedOut)
 				{
 					std::lock_guard<std::mutex> lock(mutex_);
+					if (!control_link_adapters::graph_admission_timeout_commit_allowed(
+							graph_admission_pending_, graph_admission_epoch_, admission_epoch) ||
+						!rclcpp::ok() || stop_requested_)
+					{
+						return;
+					}
+					graph_admission_pending_ = false;
+					graph_admission_verify_own_publisher_ = false;
 					fatal_error_ = true;
 					publisher_rebuild_requested_ = false;
-						publisher_.reset();
-						publisher_gid_valid_ = false;
-						gateway_source_ready_ = false;
-						publisher_graph_ready_boot_ns_ = 0U;
-						pending_command_.reset();
+					publisher_.reset();
+					publisher_gid_valid_ = false;
+					gateway_source_ready_ = false;
+					publisher_graph_ready_boot_ns_ = 0U;
+					pending_command_.reset();
 					forwarding_ = false;
 					return;
 				}

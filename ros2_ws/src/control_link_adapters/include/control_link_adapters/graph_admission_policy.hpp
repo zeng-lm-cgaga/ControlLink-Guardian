@@ -32,6 +32,14 @@ inline GraphAdmissionProbeResult graph_admission_probe_failure_result(
 	return GraphAdmissionProbeResult::kWaiting;
 }
 
+inline bool graph_admission_timeout_commit_allowed(
+	bool admission_pending,
+	std::uint64_t current_epoch,
+	std::uint64_t admission_epoch) noexcept
+{
+	return admission_pending && current_epoch == admission_epoch;
+}
+
 inline bool graph_admission_quiet_window_complete(
 	bool expected_publisher_set,
 	std::chrono::steady_clock::time_point quiet_since,

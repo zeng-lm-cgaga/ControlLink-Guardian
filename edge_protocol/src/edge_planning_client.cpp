@@ -209,7 +209,7 @@ int main(int argc, char **argv)
 			break;
 		}
 
-		const auto feedback = client.wait_feedback(std::chrono::milliseconds(50));
+		const auto feedback = client.wait_feedback(std::chrono::milliseconds(10));
 		if (feedback)
 		{
 			const auto current_session = client.current_session();
@@ -221,28 +221,6 @@ int main(int argc, char **argv)
 			}
 			print_feedback(feedback.value());
 
-			if (feedback.value().fresh && current_session.ready &&
-				current_session.transport_allowed &&
-				std::chrono::steady_clock::now() >= next_publish)
-			{
-				CommandTarget target;
-				target.session = current_session.id;
-				target.command_sequence = ++next_command_sequence;
-				target.source_stamp_ns =
-					control_link_edge_protocol::system_time_now_ns();
-				target.clock_domain = control_link_edge_protocol::ClockDomain::kSystem;
-				target.mode = CommandMode::kNormal;
-				target.linear_velocity_mps = options.linear_velocity_mps;
-				target.angular_velocity_radps = options.angular_velocity_radps;
-				auto submitted = client.submit(target);
-				if (!submitted)
-				{
-					std::cerr << "SDK target submit rejected: "
-						<< error_text(submitted.error()) << '\n';
-				}
-				next_publish = std::chrono::steady_clock::now() +
-					std::chrono::milliseconds(options.period_ms);
-			}
 		}
 		else if (feedback.error().code == edge_runtime::ErrorCode::kDataStale ||
 			feedback.error().code == edge_runtime::ErrorCode::kProducerStalled)
@@ -258,6 +236,30 @@ int main(int argc, char **argv)
 			feedback.error().code != edge_runtime::ErrorCode::kNoNewSample)
 		{
 			std::cerr << "SDK feedback read failed: " << error_text(feedback.error()) << '\n';
+		}
+
+		const auto status = client.status();
+		if (status.session.ready && status.session.transport_allowed &&
+			status.session.feedback_fresh &&
+			std::chrono::steady_clock::now() >= next_publish)
+		{
+			CommandTarget target;
+			target.session = status.session.id;
+			target.command_sequence = ++next_command_sequence;
+			target.source_stamp_ns =
+				control_link_edge_protocol::system_time_now_ns();
+			target.clock_domain = control_link_edge_protocol::ClockDomain::kSystem;
+			target.mode = CommandMode::kNormal;
+			target.linear_velocity_mps = options.linear_velocity_mps;
+			target.angular_velocity_radps = options.angular_velocity_radps;
+			auto submitted = client.submit(target);
+			if (!submitted)
+			{
+				std::cerr << "SDK target submit rejected: "
+					<< error_text(submitted.error()) << '\n';
+			}
+			next_publish = std::chrono::steady_clock::now() +
+				std::chrono::milliseconds(options.period_ms);
 		}
 
 		auto heartbeat = client.heartbeat();

@@ -10,6 +10,7 @@ namespace
 using control_link_adapters::GraphAdmissionProbeResult;
 using control_link_adapters::graph_admission_probe_failure_result;
 using control_link_adapters::graph_admission_quiet_window_complete;
+using control_link_adapters::graph_admission_timeout_commit_allowed;
 using namespace std::chrono_literals;
 
 TEST(GraphAdmissionPolicyTest, RepeatedInitialProbeExceptionsEventuallyTimeout)
@@ -52,6 +53,30 @@ TEST(GraphAdmissionPolicyTest, StopAndSupersededAdmissionNeverReclaimsNewEpoch)
 	EXPECT_EQ(
 		graph_admission_probe_failure_result(now + 200ms, deadline, false, true, false),
 		GraphAdmissionProbeResult::kSuperseded);
+}
+
+TEST(GraphAdmissionPolicyTest, TimeoutCommitRejectsSessionSwitchBeforeCleanup)
+{
+	bool admission_pending = true;
+	std::uint64_t current_epoch = 7U;
+	const auto timeout_epoch = current_epoch;
+
+	// 模拟 probe 已经判定超时，但尚未取得最终清理临界区。
+	ASSERT_TRUE(graph_admission_timeout_commit_allowed(
+		admission_pending, current_epoch, timeout_epoch));
+
+	// worker 在 timeout 返回与最终提交之间切换到新 session。
+	++current_epoch;
+	if (graph_admission_timeout_commit_allowed(
+		admission_pending, current_epoch, timeout_epoch))
+	{
+		admission_pending = false;
+	}
+
+	EXPECT_TRUE(admission_pending);
+	EXPECT_FALSE(graph_admission_timeout_commit_allowed(
+		admission_pending, current_epoch, timeout_epoch));
+	EXPECT_FALSE(graph_admission_timeout_commit_allowed(false, 7U, 7U));
 }
 
 TEST(GraphAdmissionPolicyTest, QuietWindowAllowsNormalRecoveryBeforeDeadline)

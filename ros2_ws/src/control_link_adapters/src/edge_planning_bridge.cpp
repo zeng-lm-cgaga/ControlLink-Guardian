@@ -1147,33 +1147,14 @@ namespace
 					}
 				}
 				const auto before_command_wait = std::chrono::steady_clock::now();
-				if (command_consumer_ != nullptr && before_command_wait >= next_reconnect)
+				if (command_consumer_ != nullptr)
 				{
-					auto sample = command_consumer_->wait_latest(50ms);
-					if (sample)
-					{
-						process_sample(sample.value());
-						command_reconnect_backoff = 100ms;
-						next_reconnect = std::chrono::steady_clock::now();
-					}
-					else if (!control_link_adapters::is_command_wait_without_new_sample(
-							sample.error().code) &&
-							std::chrono::steady_clock::now() >= next_reconnect)
-					{
-						const auto attempt_at = std::chrono::steady_clock::now();
-						const bool recovered = handle_command_error(sample.error());
-						if (recovered)
-						{
-							command_reconnect_backoff = 100ms;
-							next_reconnect = attempt_at;
-						}
-						else
-						{
-							next_reconnect = attempt_at + command_reconnect_backoff;
-							command_reconnect_backoff = std::min(
-								command_reconnect_backoff * 2, 1000ms);
-						}
-					}
+					control_link_adapters::poll_edge_command_consumer(
+						*command_consumer_, before_command_wait,
+						next_reconnect, command_reconnect_backoff,
+						[] { return std::chrono::steady_clock::now(); },
+						[this](const auto &sample) { process_sample(sample); },
+						[this](const auto &error) { return handle_command_error(error); });
 				}
 				const auto now = std::chrono::steady_clock::now();
 				if (feedback_producer_ != nullptr && now >= next_feedback)

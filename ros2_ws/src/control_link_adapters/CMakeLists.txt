@@ -272,6 +272,15 @@ if(BUILD_TESTING)
 	target_include_directories(test_graph_admission_policy PRIVATE include)
 	target_compile_options(test_graph_admission_policy PRIVATE -Wall -Wextra -Wpedantic)
 
+	if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+		ament_add_gtest(test_edge_command_wait_policy
+			test/test_edge_command_wait_policy.cpp
+		)
+		target_include_directories(test_edge_command_wait_policy PRIVATE include)
+		target_link_libraries(test_edge_command_wait_policy EdgeRuntime::edge_runtime)
+		target_compile_options(test_edge_command_wait_policy PRIVATE -Wall -Wextra -Wpedantic)
+	endif()
+
 	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
 		ament_add_gtest(test_socketcan_transport
 			test/test_socketcan_transport.cpp

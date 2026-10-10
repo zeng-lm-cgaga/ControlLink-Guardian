@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
+#include "control_link_adapters/edge_command_wait_policy.hpp"
 #include "control_link_adapters/graph_admission_policy.hpp"
 #include "control_link_contract/contract_bundle.hpp"
 #include "control_link_contract/qos_factory.hpp"
@@ -1155,8 +1156,8 @@ namespace
 						command_reconnect_backoff = 100ms;
 						next_reconnect = std::chrono::steady_clock::now();
 					}
-					else if (sample.error().code != edge_runtime::ErrorCode::kNoNewSample &&
-							sample.error().code != edge_runtime::ErrorCode::kTimeout &&
+					else if (!control_link_adapters::is_command_wait_without_new_sample(
+							sample.error().code) &&
 							std::chrono::steady_clock::now() >= next_reconnect)
 					{
 						const auto attempt_at = std::chrono::steady_clock::now();

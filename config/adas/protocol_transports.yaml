@@ -1,0 +1,90 @@
+schema_version: 1
+configuration_role: contract_only
+# P0 仅安装/校验本契约；现有 launch 不加载此文件或启用网络协议。
+planning:
+  source_id: planning
+  transport: ros2
+  allowed_transports: [ros2, edge, someip, grpc]
+  runtime_available_transports: [ros2, edge]
+  exclusive: true
+
+safety_owners:
+  contract: common/gateway_contract.yaml
+  source_policy: common/source_policy.yaml
+  profile: adas/adas_profile.yaml
+  timestamp_domain: SYSTEM
+  reference_frame: body
+  command_codec: control_link_edge_protocol/command_v1
+  network_schema: control_link_network_v1.proto
+  fingerprint_algorithm: sha256_proto_source_bytes
+
+someip:
+  enabled: false
+  application_name: control_link_someip_planning
+  bind_address: 127.0.0.1
+  reliable_port: 30510
+  service_discovery:
+    enabled: true
+    multicast_address: 224.224.224.245
+    port: 30490
+  service_id: 0x6c10
+  instance_id: 0x0001
+  major_version: 1
+  minor_version: 0
+  methods:
+    open_session: 0x0001
+    submit: 0x0002
+    get_status: 0x0003
+  events:
+    gateway_status: 0x8001
+    vehicle_status: 0x8002
+  eventgroups:
+    gateway_status: 0x0001
+    vehicle_status: 0x0002
+  command_payload_bytes: 64
+  max_payload_bytes: 4096
+  pending_latest_capacity: 1
+  readonly_inflight_limit: 4
+  reconnect_initial_ms: 100
+  reconnect_max_ms: 2000
+
+grpc:
+  enabled: false
+  listen_address: 127.0.0.1:50051
+  service: control_link.network.v1.PlanningIngress
+  max_message_bytes: 4096
+  pending_latest_capacity: 1
+  readonly_inflight_limit: 4
+  max_status_subscribers: 4
+  subscriber_latest_capacity: 1
+  # 仅限制网络资源存活时间，不替代 Contract 中的业务命令时效。
+  max_rpc_deadline_ms: 2000
+  reconnect_initial_ms: 100
+  reconnect_max_ms: 2000
+
+mqtt:
+  enabled: false
+  broker_uri: tcp://127.0.0.1:1883
+  protocol_version: '3.1.1'
+  client_id: control_link_telemetry
+  clean_session: true
+  topic_prefix: control_link/v1
+  topics:
+    gateway: gateway/state
+    source: source/{source_id}/status
+    vehicle: vehicle/state
+    alerts: alerts
+    availability: availability
+  telemetry_qos: 1
+  telemetry_retain: false
+  alert_qos: 1
+  alert_retain: false
+  availability_qos: 1
+  availability_retain: true
+  max_message_bytes: 4096
+  latest_capacity_per_group: 1
+  alert_queue_capacity: 32
+  disconnected_buffering: false
+  reconnect_initial_ms: 100
+  reconnect_max_ms: 2000
+  control_subscriptions: []

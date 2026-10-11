@@ -70,6 +70,10 @@ ADAS Profile 可选使用 EdgeRuntime 将外部规划或轨迹跟踪结果接入
 
 SDK 默认单 owner。每个目标必须绑定当前 session、由调用者提供 SYSTEM 时间戳和该 session 内递增的业务 sequence；session 变化时旧目标拒绝且不会自动重发或重新盖章。输入值是固定车体坐标中的 `linear_velocity_mps` 与 `angular_velocity_radps`，`NORMAL/HOLD` 映射沿用现有 Contract。它不实现规划算法、轨迹跟踪、Ackermann steering angle/acceleration 转换，也不宣称 Autoware 或 Apollo 接入；`planning_transport=ros2|edge` 仍互斥，ROS teleop 仍由同一 Gateway 接管。
 
+### 可选网络依赖配置
+
+SOME/IP、gRPC、MQTT 的前置接口定义见 [网络schema](protocols/control_link_network_v1.proto)，构建入口见 [独立依赖探测](tools/protocol_dependency_probe/CMakeLists.txt)。`CONTROL_LINK_ENABLE_SOMEIP`、`CONTROL_LINK_ENABLE_GRPC`、`CONTROL_LINK_ENABLE_MQTT` 默认关闭；开启目前只探测锁定依赖，不提供生产协议服务、client或新的launch transport。SOME/IP/gRPC预留同一planning入口，MQTT限定只读telemetry，不直接控制车辆。独立 `tools/protocol_dependency_probe` 使用普通CMake，原ROS2/Edge构建不强依赖这些网络库。
+
 ## Robot 仿真闭环
 
 Robot Profile 使用 Nav2、AMCL、tf2、ros2_control 和 Gazebo，Gateway 的 canonical command 只能经执行 adapter 进入 `diff_drive_controller`

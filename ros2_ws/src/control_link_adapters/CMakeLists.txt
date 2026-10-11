@@ -25,6 +25,10 @@ endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# 默认关闭的网络选项仅探测依赖；P0 不创建协议数据面 target 或强依赖。
+include(cmake/ControlLinkNetworkDependencies.cmake)
+control_link_probe_network_dependencies()
+
 find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(control_link_contract REQUIRED)
@@ -232,6 +236,16 @@ endif()
 
 if(BUILD_TESTING)
 	find_package(ament_cmake_gtest REQUIRED)
+	find_package(Python3 REQUIRED COMPONENTS Interpreter)
+	add_test(NAME test_network_dependency_configuration
+		COMMAND ${Python3_EXECUTABLE} -B
+			${CMAKE_CURRENT_SOURCE_DIR}/test/test_network_dependency_configuration.py -v
+	)
+	set_tests_properties(test_network_dependency_configuration PROPERTIES TIMEOUT 300)
+	add_test(NAME test_protocol_transport_contract
+		COMMAND ${Python3_EXECUTABLE} -B
+			${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/protocol_dependency_probe/test_transport_contract.py -v
+	)
 
 	ament_add_gtest(test_adapter_core
 		test/test_adapter_core.cpp
@@ -296,6 +310,16 @@ endif()
 install(
 	DIRECTORY include/
 	DESTINATION include
+)
+install(FILES
+	cmake/ControlLinkNetworkDependencies.cmake
+	cmake/ControlLinkNetworkDependencyLock.cmake
+	DESTINATION share/${PROJECT_NAME}/cmake
+)
+install(FILES
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../protocols/control_link_network_v1.proto
+	${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/protocol_transports.yaml
+	DESTINATION share/${PROJECT_NAME}/network_contracts
 )
 install(
 	TARGETS ${PROJECT_NAME} control_link_mock_system

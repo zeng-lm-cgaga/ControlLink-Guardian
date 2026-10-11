@@ -1,0 +1,341 @@
+syntax = "proto3";
+
+package control_link.network.v1;
+
+// P0 仅定义网络边界；后续 C++ 服务必须使用异步执行，不在回调内驱动控制决策。
+// OpenSession 的来源固定由生产配置绑定 planning，任何请求都不能授予 teleop 优先级。
+service PlanningIngress {
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc Submit(SubmitRequest) returns (SubmitReceipt);
+  rpc SubscribeStatus(SubscribeStatusRequest) returns (stream StatusEnvelope);
+  rpc GetStatus(GetStatusRequest) returns (StatusEnvelope);
+  rpc GetCapabilities(GetCapabilitiesRequest) returns (Capabilities);
+}
+
+enum ClockDomain {
+  CLOCK_DOMAIN_UNSPECIFIED = 0;
+  CLOCK_DOMAIN_SYSTEM = 1;
+}
+
+// 仅这两个业务模式映射 ControlCommand.msg；未知枚举仍交 Gateway 判断。
+enum CommandMode {
+  COMMAND_MODE_NORMAL = 0;
+  COMMAND_MODE_HOLD = 1;
+}
+
+enum PlanningTransport {
+  PLANNING_TRANSPORT_UNSPECIFIED = 0;
+  PLANNING_TRANSPORT_ROS2 = 1;
+  PLANNING_TRANSPORT_EDGE = 2;
+  PLANNING_TRANSPORT_SOMEIP = 3;
+  PLANNING_TRANSPORT_GRPC = 4;
+}
+
+// 仅描述适配器连接事实，不替代 Lifecycle、GatewayState 或 source binding。
+enum ConnectionState {
+  CONNECTION_STATE_UNKNOWN = 0;
+  CONNECTION_STATE_DISCONNECTED = 1;
+  CONNECTION_STATE_CONNECTING = 2;
+  CONNECTION_STATE_CONNECTED = 3;
+  CONNECTION_STATE_CLOSING = 4;
+  CONNECTION_STATE_FAULTED = 5;
+}
+
+enum ObservationValidity {
+  OBSERVATION_VALIDITY_UNKNOWN = 0;
+  OBSERVATION_VALIDITY_VALID = 1;
+  OBSERVATION_VALIDITY_MISSING = 2;
+  OBSERVATION_VALIDITY_STALE = 3;
+  OBSERVATION_VALIDITY_INVALID = 4;
+}
+
+enum ForwardingState {
+  FORWARDING_STATE_UNKNOWN = 0;
+  FORWARDING_STATE_PENDING = 1;
+  FORWARDING_STATE_FORWARDED = 2;
+  FORWARDING_STATE_DROPPED = 3;
+  FORWARDING_STATE_REJECTED = 4;
+}
+
+enum GatewayAcceptanceState {
+  GATEWAY_ACCEPTANCE_STATE_UNKNOWN = 0;
+  GATEWAY_ACCEPTANCE_STATE_LATEST_KEY_OBSERVED = 1;
+}
+
+enum AvailabilityPresenceHint {
+  AVAILABILITY_PRESENCE_HINT_UNSPECIFIED = 0;
+  AVAILABILITY_PRESENCE_HINT_ONLINE = 1;
+  AVAILABILITY_PRESENCE_HINT_OFFLINE = 2;
+}
+
+message CommandKey {
+  // 恰好 16 字节；服务器签发的接入 session，不是认证凭据或 ROS GID。
+  bytes session_token = 1;
+  // 每个 session 内递增；缺失不能默认为首条 sequence=0，拒绝不重置基线。
+  oneof source_sequence_presence {
+    uint64 source_sequence = 2;
+  }
+}
+
+message CommandTarget {
+  reserved "source_id", "priority";
+
+  // V1 必须显式为 1；oneof 兼容 Protobuf 3.12.4，不依赖实验 optional。
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+  CommandKey key = 2;
+  // 调用者计算目标时的 CLOCK_REALTIME 纳秒原值；禁止转发时重新盖章。
+  oneof source_stamp_presence {
+    int64 source_stamp_ns = 3;
+  }
+  oneof clock_domain_presence {
+    ClockDomain clock_domain = 4;
+  }
+  oneof mode_presence {
+    CommandMode mode = 5;
+  }
+  // 固定车体坐标中的前向 m/s 与绕车体竖直轴 rad/s，不是转向角或加速度。
+  oneof linear_velocity_presence {
+    double linear_velocity_mps = 6;
+  }
+  oneof angular_velocity_presence {
+    double angular_velocity_radps = 7;
+  }
+  // 适配器仅校验布局、presence、大小、代表范围、SYSTEM 与 session。
+  // finite、模式、速度、重复 sequence 和 stamp 时效规则仍由 Gateway 唯一判断。
+}
+
+message PublisherIdentity {
+  string rmw_implementation = 1;
+  // 恰好 24 字节，与 session_token 的 16 字节身份不可互换。
+  bytes gid = 2;
+}
+
+message ObservationMetadata {
+  // 每组保留自己的原始 ROS SYSTEM observed_at，不表示原子控制 tick。
+  oneof observed_system_presence {
+    int64 observed_system_ns = 1;
+  }
+  // 本适配器首次收到该 Topic 样本的 BOOTTIME；不得在查询或重发时刷新。
+  oneof received_boottime_presence {
+    uint64 received_boottime_ns = 2;
+  }
+  ObservationValidity validity = 3;
+}
+
+message SessionInfo {
+  bytes session_token = 1;
+  PlanningTransport planning_transport = 2;
+  ConnectionState connection_state = 3;
+  // true 须将当前 token 绑定到 Gateway 已真实准入的当前 ingress GID。
+  // 仅允许提交本会话目标，不承诺 Gateway ACTIVE 或控制权，不以远端 ID 作认证。
+  bool submission_ready = 4;
+  PublisherIdentity ingress_publisher = 5;
+  ClockDomain clock_domain = 6;
+}
+
+message TransportCounters {
+  uint64 rpc_received_count = 1;
+  uint64 forwarded_count = 2;
+  uint64 missed_count = 3;
+  uint64 dropped_count = 4;
+  uint64 protocol_rejected_count = 5;
+  ConnectionState connection_state = 6;
+}
+
+message GatewayObservation {
+  ObservationMetadata observation = 1;
+  // state/reason_code 取值 owner 为 control_link_interfaces/msg/GatewayState.msg。
+  uint32 state = 2;
+  uint32 reason_code = 3;
+  string active_source_id = 4;
+  uint64 active_source_sequence = 5;
+  double active_command_age_ms = 6;
+  uint32 recovery_valid_count = 7;
+  uint64 transition_sequence = 8;
+}
+
+message SourceStatusObservation {
+  ObservationMetadata observation = 1;
+  // 以下字段来自 SourceStatus.msg；source_id/priority 是观察，不是调用者的选择。
+  string source_id = 2;
+  uint32 priority = 3;
+  bool enabled = 4;
+  bool lease_valid = 5;
+  bool command_valid = 6;
+  uint32 last_reject_reason = 7;
+  uint64 last_source_sequence = 8;
+  double command_age_ms = 9;
+  uint64 accepted_count = 10;
+  uint64 rejected_count = 11;
+  bool endpoint_stable = 12;
+  uint32 endpoint_state = 13;
+  uint32 endpoint_publisher_count = 14;
+  bool endpoint_generation_valid = 15;
+  // RMW 名称从本地运行时取得，GID 来自同条 SourceStatus 的稳定 generation。
+  PublisherIdentity endpoint_publisher = 16;
+}
+
+message VehicleObservation {
+  ObservationMetadata observation = 1;
+  // state/fault_code 取值 owner 为 control_link_interfaces/msg/VehicleState.msg。
+  uint32 state = 2;
+  uint32 fault_code = 3;
+  double linear_velocity_mps = 4;
+  double angular_velocity_radps = 5;
+  uint32 rolling_counter = 6;
+}
+
+message DiagnosticKeyValue {
+  string key = 1;
+  string value = 2;
+}
+
+message DiagnosticObservation {
+  // DiagnosticStatus 自身无 stamp；原始 SYSTEM 时间取所属 DiagnosticArray.header。
+  // received_BOOTTIME 是本适配器首次接收该数组样本的时间，不由诊断文本重造健康状态。
+  ObservationMetadata observation = 1;
+  // 字段/level 常量的唯一 owner 为 diagnostic_msgs/msg/DiagnosticStatus.msg。
+  uint32 level = 2;
+  string name = 3;
+  string message = 4;
+  string hardware_id = 5;
+  // 对应 diagnostic_msgs/KeyValue[]，保留顺序及重复 key，不改成会覆盖事实的 map。
+  repeated DiagnosticKeyValue values = 6;
+}
+
+message ForwardedCommandObservation {
+  CommandKey key = 1;
+  PublisherIdentity publisher = 2;
+  oneof forwarded_boottime_presence {
+    uint64 forwarded_boottime_ns = 3;
+  }
+}
+
+message GatewayAcceptanceObservation {
+  GatewayAcceptanceState state = 1;
+  CommandKey key = 2;
+  PublisherIdentity publisher = 3;
+  ObservationMetadata source_observation = 4;
+  uint64 accepted_count = 5;
+  // 仅同稳定 GID 的 SourceStatus.last_source_sequence 匹配已转发 key 时可关联。
+  // latest 观察不能证明 sequence gap 内每条接受，更不是执行完成或任务 ACK。
+}
+
+message StatusSnapshot {
+  SessionInfo session = 1;
+  TransportCounters transport = 2;
+  ForwardedCommandObservation latest_forwarded = 3;
+  GatewayObservation gateway = 4;
+  repeated SourceStatusObservation sources = 5;
+  VehicleObservation vehicle = 6;
+  GatewayAcceptanceObservation latest_gateway_acceptance = 7;
+  repeated DiagnosticObservation alerts = 8;
+}
+
+// gRPC 状态、未来 SOME/IP 状态事件及 MQTT JSON 映射共用此字段 owner。
+// SOME/IP 命令仍使用已发布 64B codec，不把此 Protobuf schema 当作其替代布局。
+message StatusEnvelope {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+  // 恰好 16 字节，标识本次适配器进程发布代次；独立于接入 session 和 GID。
+  bytes publisher_instance_token = 2;
+  oneof publication_sequence_presence {
+    uint64 publication_sequence = 3;
+  }
+  oneof published_system_presence {
+    int64 published_system_ns = 4;
+  }
+  // 发布者本机 BOOTTIME 仅供同机时间域使用，不与远端接收 BOOTTIME 直接相减。
+  oneof published_boottime_presence {
+    uint64 published_boottime_ns = 5;
+  }
+  StatusSnapshot status = 6;
+  // 恰好 32 字节：原 control_link_network_v1.proto 源字节的 SHA-256，不是 descriptor hash。
+  bytes schema_fingerprint = 7;
+  // 重发/retained 消息保留原代次、sequence 与各组时间，不能冒充新观测。
+}
+
+// 只用于 MQTT availability/LWT JSON；不是 Gateway readiness、健康或控制权。
+message AvailabilityEnvelope {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+  // 与 StatusEnvelope 相同的原 .proto 源字节 SHA-256，恰好 32 字节。
+  bytes schema_fingerprint = 2;
+  // 恰好 16 字节，标识产生此 presence 提示的适配器实例，不作远端认证。
+  bytes publisher_instance_token = 3;
+  oneof presence_hint_presence {
+    AvailabilityPresenceHint presence_hint = 4;
+  }
+  // LWT 中此时间是预先准备 payload 的原始 SYSTEM 时间，不是 broker 发出时间。
+  oneof published_system_presence {
+    int64 published_system_ns = 5;
+  }
+}
+
+message Capabilities {
+  uint32 schema_version = 1;
+  string contract_id = 2;
+  // 沿用 ConfigIdentity 的规范 SHA-256 hex，不重写 Contract/hash 实现。
+  string contract_hash = 3;
+  string decision_config_hash = 4;
+  PlanningTransport planning_transport = 5;
+  // 网络结构/资源限额由网络配置提供，非第二套命令 freshness 或速度阈值。
+  uint32 max_command_bytes = 6;
+  uint32 max_status_bytes = 7;
+  uint32 max_pending_targets = 8;
+  uint32 max_status_subscribers = 9;
+  // 恰好 32 字节，原 .proto 源字节 SHA-256；独立于 Contract/config hash。
+  bytes schema_fingerprint = 10;
+}
+
+message OpenSessionRequest {
+  reserved "source_id", "priority", "planning_transport";
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+}
+
+message OpenSessionResponse {
+  SessionInfo session = 1;
+  Capabilities capabilities = 2;
+}
+
+message SubmitRequest {
+  CommandTarget target = 1;
+}
+
+message SubmitReceipt {
+  CommandKey key = 1;
+  // true 只说明服务回调收到 RPC，不表示 ROS publish 或 Gateway 接受。
+  bool rpc_received = 2;
+  ForwardingState forwarding_state = 3;
+  ForwardedCommandObservation forwarded = 4;
+  // 初始必须 UNKNOWN；稍后反馈可能携带同 GID 的最近接受观察。
+  GatewayAcceptanceObservation gateway_acceptance = 5;
+  oneof rpc_received_boottime_presence {
+    uint64 rpc_received_boottime_ns = 6;
+  }
+  oneof schema_version_presence {
+    uint32 schema_version = 7;
+  }
+}
+
+message SubscribeStatusRequest {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+}
+message GetStatusRequest {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+}
+message GetCapabilitiesRequest {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+}

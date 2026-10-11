@@ -1,0 +1,10 @@
+cmake_minimum_required(VERSION 3.16)
+project(someip_planning_consumer LANGUAGES CXX)
+
+find_package(control_link_someip_transport CONFIG REQUIRED)
+
+add_executable(someip_planning_consumer main.cpp)
+target_compile_features(someip_planning_consumer PRIVATE cxx_std_17)
+target_compile_options(someip_planning_consumer PRIVATE -Wall -Wextra -Wpedantic)
+target_link_libraries(someip_planning_consumer PRIVATE ControlLink::control_link_someip_transport)
+install(TARGETS someip_planning_consumer RUNTIME DESTINATION bin)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0 静态契约检查，不是尚未实现的运行时配置 parser。"""
+"""静态能力与配置 owner 检查；生产 SOME/IP parser 另有 C++ focused 回归。"""
 
 import copy
 import pathlib
@@ -21,18 +21,18 @@ def positive_resource(section, field):
 def check_contract(configuration):
     if configuration.get("schema_version") != 1:
         raise ValueError("unsupported schema")
-    if configuration.get("configuration_role") != "contract_only":
-        raise ValueError("P0 cannot enable runtime protocol consumers")
+    if configuration.get("configuration_role") != "runtime_someip_and_future_contracts":
+        raise ValueError("unexpected runtime/contract role")
     planning = configuration["planning"]
     if planning != {
         "source_id": "planning", "transport": "ros2",
         "allowed_transports": ["ros2", "edge", "someip", "grpc"],
-        "runtime_available_transports": ["ros2", "edge"], "exclusive": True,
+        "runtime_available_transports": ["ros2", "edge", "someip"], "exclusive": True,
     }:
         raise ValueError("planning transport selection must stay exclusive and truthful")
     for protocol in ("someip", "grpc", "mqtt"):
         if configuration[protocol]["enabled"] is not False:
-            raise ValueError("P0 has no runtime protocol target")
+            raise ValueError("protocols stay disabled unless explicitly selected at launch")
     owners = configuration["safety_owners"]
     for field in ("contract", "source_policy", "profile"):
         if not (ROOT / "config" / owners[field]).is_file():
@@ -76,6 +76,7 @@ def check_contract(configuration):
                   "shutdown_timeout_ms"):
         positive_resource(grpc, field)
     positive_resource(someip, "readonly_inflight_limit")
+    positive_resource(someip, "shutdown_timeout_ms")
     if positive_resource(someip, "max_payload_bytes") < someip["command_payload_bytes"]:
         raise ValueError("SOME/IP payload limit excludes its command codec")
     if grpc["max_message_bytes"] < someip["command_payload_bytes"]:

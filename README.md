@@ -54,7 +54,9 @@ Robot 与 ADAS 复用相同的 Contract、命令校验、来源仲裁和状态�
 
 ## 外部规划程序接入
 
-ADAS Profile 可选使用 EdgeRuntime 将外部规划或轨迹跟踪结果接入同一条控制链：
+ADAS Profile 可选使用 EdgeRuntime 或 SOME/IP 将外部规划或轨迹跟踪结果接入同一条控制链；`planning_transport=ros2|edge|someip` 显式互斥，ROS teleop 仍经同一 Gateway 仲裁。
+
+### EdgeRuntime 同机接入
 
 ```text
 外部规划程序
@@ -68,11 +70,27 @@ ADAS Profile 可选使用 EdgeRuntime 将外部规划或轨迹跟踪结果接入
 
 `control_link_edge_protocol` 是不依赖 ROS2 的定长 codec；可选的 `control_link_edge_client` 是由已安装 EdgeRuntime 支撑的 C++ SDK，提供 `open`、反馈读取、`current_session`、`status`、`submit`、`heartbeat` 和 `close`。`edge_protocol/examples/edge_planning_sdk_consumer` 是独立 CMake consumer，可在未 source ROS2 的环境中通过 `find_package(control_link_edge_client CONFIG REQUIRED)` 消费安装 SDK。
 
-SDK 默认单 owner。每个目标必须绑定当前 session、由调用者提供 SYSTEM 时间戳和该 session 内递增的业务 sequence；session 变化时旧目标拒绝且不会自动重发或重新盖章。输入值是固定车体坐标中的 `linear_velocity_mps` 与 `angular_velocity_radps`，`NORMAL/HOLD` 映射沿用现有 Contract。它不实现规划算法、轨迹跟踪、Ackermann steering angle/acceleration 转换，也不宣称 Autoware 或 Apollo 接入；`planning_transport=ros2|edge` 仍互斥，ROS teleop 仍由同一 Gateway 接管。
+SDK 默认单 owner。每个目标必须绑定当前 session、由调用者提供 SYSTEM 时间戳和该 session 内递增的业务 sequence；session 变化时旧目标拒绝且不会自动重发或重新盖章。输入值是固定车体坐标中的 `linear_velocity_mps` 与 `angular_velocity_radps`，`NORMAL/HOLD` 映射沿用现有 Contract。它不实现规划算法、轨迹跟踪、Ackermann steering angle/acceleration 转换，也不宣称 Autoware 或 Apollo 接入。
 
-### 可选网络依赖配置
+### SOME/IP 网络接入
 
-SOME/IP、gRPC、MQTT 的前置接口定义见 [网络schema](protocols/control_link_network_v1.proto)，构建入口见 [独立依赖探测](tools/protocol_dependency_probe/CMakeLists.txt)。`CONTROL_LINK_ENABLE_SOMEIP`、`CONTROL_LINK_ENABLE_GRPC`、`CONTROL_LINK_ENABLE_MQTT` 默认关闭；开启目前只探测锁定依赖，不提供生产协议服务、client或新的launch transport。SOME/IP/gRPC预留同一planning入口，MQTT限定只读telemetry，不直接控制车辆。独立 `tools/protocol_dependency_probe` 使用普通CMake，原ROS2/Edge构建不强依赖这些网络库。
+```text
+外部规划程序 -> control_link_someip_transport SDK
+  -> SOME/IP TCP + Service Discovery
+  -> someip_planning_bridge_node -> /control_link/input/planning
+  -> Guardian -> SocketCAN/vcan -> 独立 Gateway/Source/Vehicle 状态
+  -> SOME/IP status events / GetStatus -> 外部规划程序
+```
+
+可选 C++ SDK 使用 vsomeip 与 Protobuf，复用同一 ROS-free 64B command codec；提供 `start`、`wait_available`、`open`、`keep`、`submit`、`get_status`、`status`、`set_status_subscription`、`close` 和 `stop`。SDK 单 owner，独立示例 [someip_planning_consumer](someip_transport/examples/someip_planning_consumer/CMakeLists.txt) 可在未 source ROS2 的环境中通过 `find_package(control_link_someip_transport CONFIG REQUIRED)` 链接 `ControlLink::control_link_someip_transport`，不依赖 EdgeRuntime。
+
+示例默认每 50ms 计算新目标、每 1000ms 发送独立 Keep；Keep 只维护网络 holder，不刷新命令时间或 lease。目标保留调用者的原始 SYSTEM 时间戳和当前 session 的业务 sequence；换 session 后重新计算目标，不为旧目标换 token、重盖时间或自动重发。SD available、`submission_ready`、协议回复均不等于 Gateway 接受或 planning ACTIVE；Gateway、SourceStatus、VehicleState 反馈保留各自时间与 validity，不是原子状态或任务 ACK。
+
+adapters 构建时显式开启 `CONTROL_LINK_ENABLE_SOMEIP=ON` 才提供 bridge；launch 使用 `planning_transport:=someip`，必须提供 server 的绝对 `vsomeip_config_path`，并使用完整 `config_root` 下的网络 YAML。外部 client 另行提供自己的 JSON、application identity 与网络配置，`someip_configure` 可从唯一 YAML 生成 JSON。SDK/构建/启动接口、网络夹具条件与限制见 [网络接入契约](docs/17_network_protocol_contracts.md)。
+
+### 默认关闭与未实现协议
+
+`CONTROL_LINK_ENABLE_SOMEIP`、`CONTROL_LINK_ENABLE_GRPC`、`CONTROL_LINK_ENABLE_MQTT` 默认关闭；关闭时原 ROS2/Edge 链不查找或链接这些网络依赖。SOME/IP 开启提供上述实际 target；gRPC/MQTT 仍只有契约和依赖探测，没有生产服务或 client，`grpc` 尚不能作为 launch transport。gRPC 契约限定同一 planning 入口，MQTT 契约限定只读 telemetry，不直接控制车辆。独立 [依赖探测](tools/protocol_dependency_probe/CMakeLists.txt) 始终只做依赖检查，不证明服务发现、网络通信或车辆控制闭环已通过验收。
 
 ## Robot 仿真闭环
 

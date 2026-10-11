@@ -123,6 +123,18 @@ namespace control_link_edge_protocol
 
 	const char *to_string(DecodeError error) noexcept;
 
+	// 仅校验固定布局、SYSTEM 与非零 token；业务值须交给 Gateway，不能视为已接受。
+	// 64B 帧不携带外层 schema fingerprint；sequence、原 stamp、mode 和浮点位原样保留。
+	bool encode_command_layout(
+		const CommandFrame &frame,
+		std::byte *output,
+		std::size_t output_size) noexcept;
+	bool decode_command_layout(
+		const std::byte *input,
+		std::size_t input_size,
+		CommandFrame *output,
+		DecodeError *error = nullptr) noexcept;
+
 	// 编解码拒绝非法 token、sequence、时间域、保留位和非 finite 数值。
 	bool encode_command(
 		const CommandFrame &frame,

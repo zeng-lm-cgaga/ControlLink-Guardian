@@ -419,7 +419,8 @@ void control_response_facts()
   }
   for (auto result : {network::SESSION_OPERATION_RESULT_OPENING, network::SESSION_OPERATION_RESULT_ADMITTED,
       network::SESSION_OPERATION_RESULT_IDEMPOTENT, network::SESSION_OPERATION_RESULT_BUSY,
-      network::SESSION_OPERATION_RESULT_REVOKED, network::SESSION_OPERATION_RESULT_REJECTED}) {
+      network::SESSION_OPERATION_RESULT_REVOKED, network::SESSION_OPERATION_RESULT_REJECTED,
+      network::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED}) {
     network::OpenSessionResponse response;
     response.set_result(result);
     response.set_open_request_id(std::string(16, 'r'));
@@ -432,8 +433,9 @@ void control_response_facts()
     }
     auto parsed = round_trip(response);
     require(parsed.result() == result && parsed.open_request_id() == response.open_request_id(), "result and request echo exact");
-    if (result == network::SESSION_OPERATION_RESULT_BUSY || result == network::SESSION_OPERATION_RESULT_REJECTED) {
-      require(!parsed.has_session() && parsed.session().session_token().empty(), "BUSY/REJECTED fixture does not disclose incumbent session");
+    if (result == network::SESSION_OPERATION_RESULT_BUSY || result == network::SESSION_OPERATION_RESULT_REJECTED ||
+        result == network::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED) {
+      require(!parsed.has_session() && parsed.session().session_token().empty(), "rejected fixture does not disclose incumbent session");
       require(parsed.open_request_id() == std::string(16, 'r'), "only own request key echoed");
     }
   }
@@ -695,7 +697,7 @@ class ProtocolSchemaTest(unittest.TestCase):
                 ("UNKNOWN", "IDLE", "OPENING", "ADMITTED", "REVOKING"))})
         self.assertEqual(enums["SessionOperationResult"], {
             "SESSION_OPERATION_RESULT_" + name: index for index, name in enumerate(
-                ("UNKNOWN", "OPENING", "ADMITTED", "IDEMPOTENT", "BUSY", "REVOKED", "REJECTED"))})
+                ("UNKNOWN", "OPENING", "ADMITTED", "IDEMPOTENT", "BUSY", "REVOKED", "REJECTED", "RESOURCE_EXHAUSTED"))})
 
     def test_cpp_control_operation_oneof_and_identity_presence(self):
         run_logged([str(self.executable), "control-operation-presence"], self.output,

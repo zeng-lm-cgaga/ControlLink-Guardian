@@ -1,11 +1,11 @@
 schema_version: 1
-configuration_role: contract_only
-# P0 仅安装/校验本契约；现有 launch 不加载此文件或启用网络协议。
+configuration_role: runtime_someip_and_future_contracts
+# 默认 launch 仍为 ros2；只有显式 selector 与已安装 SOME/IP target 可启用入口。
 planning:
   source_id: planning
   transport: ros2
   allowed_transports: [ros2, edge, someip, grpc]
-  runtime_available_transports: [ros2, edge]
+  runtime_available_transports: [ros2, edge, someip]
   exclusive: true
 
 safety_owners:
@@ -54,8 +54,13 @@ someip:
   # 应用存活握手限定网络 holder 资源，不替代 Gateway 命令 freshness/lease。
   session_keepalive_period_ms: 1000
   session_idle_timeout_ms: 5000
+  status_event_period_ms: 100
   reconnect_initial_ms: 100
   reconnect_max_ms: 2000
+  shutdown_timeout_ms: 2000
+  graph_admission_timeout_ms: 30000
+  graph_admission_quiet_ms: 250
+  graph_admission_poll_ms: 50
 
 grpc:
   enabled: false

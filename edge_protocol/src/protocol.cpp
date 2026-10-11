@@ -184,6 +184,75 @@ namespace control_link_edge_protocol
 			return true;
 		}
 
+		bool decode_command_impl(
+			const std::byte *input,
+			std::size_t input_size,
+			CommandFrame *output,
+			DecodeError *error,
+			bool strict_business_values) noexcept
+		{
+			set_error(error, DecodeError::kNone);
+			if (output == nullptr)
+			{
+				set_error(error, DecodeError::kNullOutput);
+				return false;
+			}
+			if (!check_frame_header(input, input_size, kCommandFrameSize, kCommandMagic, error))
+			{
+				return false;
+			}
+			if (!bytes_zero(input, kCommandReservedOffset, kCommandReservedSize))
+			{
+				set_error(error, DecodeError::kReserved);
+				return false;
+			}
+			CommandFrame frame;
+			read_token(input, 8U, &frame.session_token);
+			frame.command_sequence = get_u64(input, 24U);
+			frame.source_stamp_ns = static_cast<std::int64_t>(get_u64(input, 32U));
+			frame.clock_domain = static_cast<ClockDomain>(
+				std::to_integer<std::uint8_t>(input[40U]));
+			frame.mode = static_cast<CommandMode>(
+				std::to_integer<std::uint8_t>(input[41U]));
+			frame.linear_velocity_mps = get_double(input, 48U);
+			frame.angular_velocity_radps = get_double(input, 56U);
+			if (is_zero(frame.session_token))
+			{
+				set_error(error, DecodeError::kToken);
+				return false;
+			}
+			if (strict_business_values && frame.command_sequence == 0U)
+			{
+				set_error(error, DecodeError::kSequence);
+				return false;
+			}
+			if (strict_business_values && frame.source_stamp_ns <= 0)
+			{
+				set_error(error, DecodeError::kTimestamp);
+				return false;
+			}
+			if (frame.clock_domain != ClockDomain::kSystem)
+			{
+				set_error(error, DecodeError::kClockDomain);
+				return false;
+			}
+			if (strict_business_values &&
+				frame.mode != CommandMode::kNormal && frame.mode != CommandMode::kHold)
+			{
+				set_error(error, DecodeError::kMode);
+				return false;
+			}
+			if (strict_business_values &&
+				(!std::isfinite(frame.linear_velocity_mps) ||
+				 !std::isfinite(frame.angular_velocity_radps)))
+			{
+				set_error(error, DecodeError::kNonFinite);
+				return false;
+			}
+			*output = frame;
+			return true;
+		}
+
 		bool read_clock(clockid_t clock_id, std::uint64_t *value) noexcept
 		{
 			if (value == nullptr) return false;
@@ -235,12 +304,13 @@ namespace control_link_edge_protocol
 		return true;
 	}
 
-	bool encode_command(
+	bool encode_command_layout(
 		const CommandFrame &frame,
 		std::byte *output,
 		std::size_t output_size) noexcept
 	{
-		if (output == nullptr || output_size != kCommandFrameSize || !valid_command(frame))
+		if (output == nullptr || output_size != kCommandFrameSize ||
+			is_zero(frame.session_token) || frame.clock_domain != ClockDomain::kSystem)
 		{
 			return false;
 		}
@@ -258,70 +328,34 @@ namespace control_link_edge_protocol
 		return true;
 	}
 
+	bool encode_command(
+		const CommandFrame &frame,
+		std::byte *output,
+		std::size_t output_size) noexcept
+	{
+		if (output == nullptr || output_size != kCommandFrameSize || !valid_command(frame))
+		{
+			return false;
+		}
+		return encode_command_layout(frame, output, output_size);
+	}
+
+	bool decode_command_layout(
+		const std::byte *input,
+		std::size_t input_size,
+		CommandFrame *output,
+		DecodeError *error) noexcept
+	{
+		return decode_command_impl(input, input_size, output, error, false);
+	}
+
 	bool decode_command(
 		const std::byte *input,
 		std::size_t input_size,
 		CommandFrame *output,
 		DecodeError *error) noexcept
 	{
-		set_error(error, DecodeError::kNone);
-		if (output == nullptr)
-		{
-			set_error(error, DecodeError::kNullOutput);
-			return false;
-		}
-		if (!check_frame_header(input, input_size, kCommandFrameSize, kCommandMagic, error))
-		{
-			return false;
-		}
-		if (!bytes_zero(input, kCommandReservedOffset, kCommandReservedSize))
-		{
-			set_error(error, DecodeError::kReserved);
-			return false;
-		}
-		CommandFrame frame;
-		read_token(input, 8U, &frame.session_token);
-		frame.command_sequence = get_u64(input, 24U);
-		frame.source_stamp_ns = static_cast<std::int64_t>(get_u64(input, 32U));
-		frame.clock_domain = static_cast<ClockDomain>(
-			std::to_integer<std::uint8_t>(input[40U]));
-		frame.mode = static_cast<CommandMode>(
-			std::to_integer<std::uint8_t>(input[41U]));
-		frame.linear_velocity_mps = get_double(input, 48U);
-		frame.angular_velocity_radps = get_double(input, 56U);
-		if (is_zero(frame.session_token))
-		{
-			set_error(error, DecodeError::kToken);
-			return false;
-		}
-		if (frame.command_sequence == 0U)
-		{
-			set_error(error, DecodeError::kSequence);
-			return false;
-		}
-		if (frame.source_stamp_ns <= 0)
-		{
-			set_error(error, DecodeError::kTimestamp);
-			return false;
-		}
-		if (frame.clock_domain != ClockDomain::kSystem)
-		{
-			set_error(error, DecodeError::kClockDomain);
-			return false;
-		}
-		if (frame.mode != CommandMode::kNormal && frame.mode != CommandMode::kHold)
-		{
-			set_error(error, DecodeError::kMode);
-			return false;
-		}
-		if (!std::isfinite(frame.linear_velocity_mps) ||
-			!std::isfinite(frame.angular_velocity_radps))
-		{
-			set_error(error, DecodeError::kNonFinite);
-			return false;
-		}
-		*output = frame;
-		return true;
+		return decode_command_impl(input, input_size, output, error, true);
 	}
 
 	bool encode_feedback(

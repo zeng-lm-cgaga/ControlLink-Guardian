@@ -66,6 +66,27 @@ def _channel_argument(context, name):
 	return value
 
 
+def _require_adapters_executable(executable, build_option):
+	path = os.path.join(
+		get_package_prefix("control_link_adapters"),
+		"lib", "control_link_adapters", executable)
+	if not os.path.isfile(path) or not os.access(path, os.X_OK):
+		raise RuntimeError(
+			executable + " requires control_link_adapters built and installed with " +
+			"-D" + build_option + "=ON; missing=" + path)
+	return path
+
+
+def _configuration_file_argument(context, name, default_path=""):
+	value = LaunchConfiguration(name).perform(context) or default_path
+	if not value or not os.path.isabs(value):
+		raise RuntimeError(name + " must explicitly name an absolute readable file")
+	path = os.path.realpath(value)
+	if not os.path.isfile(path) or not os.access(path, os.R_OK):
+		raise RuntimeError(name + " must name a readable file; actual=" + path)
+	return path
+
+
 def _launch_adas_vcan(context, *args, **kwargs):
 	package_share = get_package_share_directory("control_link_bringup")
 	profile_path = os.path.realpath(
@@ -118,9 +139,9 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		context, "start_lifecycle_activator")
 	start_secondary_source = _bool_argument(context, "start_secondary_source")
 	planning_transport = LaunchConfiguration("planning_transport").perform(context).lower()
-	if planning_transport not in ("ros2", "edge"):
+	if planning_transport not in ("ros2", "edge", "someip"):
 		raise RuntimeError(
-			"planning_transport must be ros2 or edge; actual=" + planning_transport)
+			"planning_transport must be ros2, edge or someip; actual=" + planning_transport)
 	source_id = LaunchConfiguration("source_id").perform(context)
 	secondary_source_id = LaunchConfiguration("secondary_source_id").perform(context)
 	enabled_sources = profile.get("enabled_sources")
@@ -131,27 +152,27 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	if source_id not in enabled_sources:
 		raise RuntimeError(
 			"source_id must be enabled by ADAS Profile; actual=" + source_id)
-	if planning_transport == "edge" and source_id != "planning":
+	if planning_transport in ("edge", "someip") and source_id != "planning":
 		raise RuntimeError(
-			"planning_transport=edge fixes the Edge source binding to planning; actual=" +
+			"planning_transport=" + planning_transport + " fixes source binding to planning; actual=" +
 			source_id)
 	if start_secondary_source:
-		if not start_source and planning_transport != "edge":
+		if not start_source and planning_transport == "ros2":
 			raise RuntimeError(
 				"start_secondary_source requires start_source=true")
 		if secondary_source_id not in enabled_sources:
 			raise RuntimeError(
 				"secondary_source_id must be enabled by ADAS Profile; actual=" +
 				secondary_source_id)
+		if planning_transport in ("edge", "someip") and secondary_source_id == "planning":
+			raise RuntimeError(
+				"planning_transport=" + planning_transport + " cannot start a second ROS planning publisher")
 		if secondary_source_id == source_id:
 			raise RuntimeError(
 				"secondary_source_id must differ from source_id")
 		secondary_source_delay_seconds = _positive_float_argument(
 			context,
 			"secondary_source_delay_seconds")
-		if planning_transport == "edge" and secondary_source_id == "planning":
-			raise RuntimeError(
-				"planning_transport=edge cannot start a second ROS planning publisher")
 
 	simulator_parameters = {
 		**common_parameters,
@@ -202,6 +223,8 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		parameters=[{**common_parameters, "source_id": secondary_source_id}],
 	)
 	if planning_transport == "edge":
+		_require_adapters_executable(
+			"edge_planning_bridge_node", "CONTROL_LINK_ENABLE_EDGE_RUNTIME")
 		command_channel = _channel_argument(context, "edge_command_channel")
 		feedback_channel = _channel_argument(context, "edge_feedback_channel")
 		edge_linear_velocity_mps = _finite_float_argument(
@@ -223,23 +246,10 @@ def _launch_adas_vcan(context, *args, **kwargs):
 				"source_id": "planning",
 			}],
 		)
-		edge_client_path = os.path.join(
-			get_package_prefix("control_link_adapters"),
-			"lib",
-			"control_link_adapters",
-			"edge_planning_client")
-		edge_supervisor_path = os.path.join(
-			get_package_prefix("control_link_adapters"),
-			"lib",
-			"control_link_adapters",
-			"edge_planning_supervisor")
-		if (not os.path.isfile(edge_client_path) or
-				not os.access(edge_client_path, os.X_OK) or
-			not os.path.isfile(edge_supervisor_path) or
-			not os.access(edge_supervisor_path, os.X_OK)):
-			raise RuntimeError(
-				"planning_transport=edge requires control_link_adapters built with "
-				"-DCONTROL_LINK_ENABLE_EDGE_RUNTIME=ON; missing=" + edge_supervisor_path)
+		edge_client_path = _require_adapters_executable(
+			"edge_planning_client", "CONTROL_LINK_ENABLE_EDGE_RUNTIME")
+		edge_supervisor_path = _require_adapters_executable(
+			"edge_planning_supervisor", "CONTROL_LINK_ENABLE_EDGE_RUNTIME")
 		edge_supervisor = ExecuteProcess(
 			cmd=[
 				edge_supervisor_path,
@@ -254,6 +264,31 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			output="screen",
 			emulate_tty=True,
 		)
+	elif planning_transport == "someip":
+		_require_adapters_executable(
+			"someip_planning_bridge_node", "CONTROL_LINK_ENABLE_SOMEIP")
+		network_config_path = _configuration_file_argument(
+			context, "network_config_path",
+			os.path.join(config_root, "adas", "protocol_transports.yaml"))
+		vsomeip_config_path = _configuration_file_argument(context, "vsomeip_config_path")
+		bridge_node = Node(
+			package="control_link_adapters",
+			executable="someip_planning_bridge_node",
+			name="someip_planning_bridge",
+			namespace="control_link",
+			output="screen",
+			emulate_tty=True,
+			additional_env={
+				**participant_env,
+				"VSOMEIP_CONFIGURATION": vsomeip_config_path,
+			},
+			parameters=[{
+				**common_parameters,
+				"network_config_path": network_config_path,
+				"vsomeip_config_path": vsomeip_config_path,
+				"source_id": "planning",
+			}],
+		)
 
 	actions = [
 		LogInfo(msg="ADAS vcan demo requires an existing and up " + requested_interface),
@@ -264,6 +299,11 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		actions.append(bridge_node)
 		if start_source:
 			actions.append(edge_supervisor)
+	elif planning_transport == "someip":
+		actions.append(bridge_node)
+		actions.append(LogInfo(msg=(
+			"SOME/IP planning uses an external someip_planning_client with its own explicit "
+			"vsomeip configuration; start_source does not start a ROS planning publisher")))
 	elif start_source:
 		actions.append(source_node)
 	if start_secondary_source:
@@ -308,7 +348,7 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"start_source",
 			default_value="true",
-			description="Start one Contract-bound mock planning source",
+			description="Start the bundled ROS2/Edge source; SOME/IP requires an external client",
 		),
 		DeclareLaunchArgument(
 			"start_lifecycle_activator",
@@ -318,12 +358,22 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"planning_transport",
 			default_value="ros2",
-			description="Planning ingress transport: ros2 or optional EdgeRuntime edge",
+			description="Mutually exclusive planning ingress: ros2, optional edge or someip",
+		),
+		DeclareLaunchArgument(
+			"network_config_path",
+			default_value="",
+			description="SOME/IP network contract YAML; empty uses config_root/adas/protocol_transports.yaml",
+		),
+		DeclareLaunchArgument(
+			"vsomeip_config_path",
+			default_value="",
+			description="Explicit absolute vsomeip runtime JSON for SOME/IP; no implicit environment fallback",
 		),
 		DeclareLaunchArgument(
 			"source_id",
 			default_value="planning",
-			description="ROS2 source used in ros2 mode; edge mode fixes this to planning",
+			description="ROS2 source used in ros2 mode; edge/someip fix this to planning",
 		),
 		DeclareLaunchArgument(
 			"edge_command_channel",

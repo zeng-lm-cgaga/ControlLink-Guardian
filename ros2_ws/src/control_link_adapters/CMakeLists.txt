@@ -25,7 +25,6 @@ endif()
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# 默认关闭的网络选项仅探测依赖；P0 不创建协议数据面 target 或强依赖。
 include(cmake/ControlLinkNetworkDependencies.cmake)
 control_link_probe_network_dependencies()
 
@@ -47,11 +46,13 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Threads REQUIRED)
 
-if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
-	find_package(EdgeRuntime CONFIG REQUIRED)
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME OR CONTROL_LINK_ENABLE_SOMEIP)
+	if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
+		find_package(EdgeRuntime CONFIG REQUIRED)
+	endif()
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF CACHE BOOL
 		"" FORCE)
-	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SDK ON CACHE BOOL
+	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SDK ${CONTROL_LINK_ENABLE_EDGE_RUNTIME} CACHE BOOL
 		"" FORCE)
 	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR OFF CACHE BOOL
 		"" FORCE)
@@ -61,6 +62,19 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol
 		${CMAKE_CURRENT_BINARY_DIR}/edge_protocol
 	)
+endif()
+
+if(CONTROL_LINK_ENABLE_SOMEIP)
+	set(CONTROL_LINK_SOMEIP_BUILD_TESTS OFF)
+	add_subdirectory(
+		${CMAKE_CURRENT_SOURCE_DIR}/../../../someip_transport
+		${CMAKE_CURRENT_BINARY_DIR}/someip_transport
+	)
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/control_link_someip_runtime.txt"
+		"someip.status=RUNTIME_AVAILABLE\nproduction_protocol_targets=control_link_someip_transport;someip_planning_client;someip_configure;someip_planning_bridge_node\nacceptance=NOT_IMPLIED_BY_CONFIGURE\n")
+else()
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/control_link_someip_runtime.txt"
+		"someip.status=DISABLED\nproduction_protocol_targets=NONE\n")
 endif()
 
 
@@ -128,6 +142,20 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	)
 	add_executable(edge_planning_supervisor
 		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol/src/edge_planning_supervisor.cpp
+	)
+endif()
+
+if(CONTROL_LINK_ENABLE_SOMEIP)
+	add_executable(someip_planning_bridge_node src/someip_planning_bridge.cpp)
+	target_include_directories(someip_planning_bridge_node PRIVATE include)
+	target_compile_options(someip_planning_bridge_node PRIVATE -Wall -Wextra -Wpedantic)
+	target_link_libraries(someip_planning_bridge_node control_link_someip_transport)
+	ament_target_dependencies(someip_planning_bridge_node
+		builtin_interfaces
+		control_link_contract
+		control_link_interfaces
+		rclcpp
+		rmw
 	)
 endif()
 
@@ -242,6 +270,10 @@ if(BUILD_TESTING)
 			${CMAKE_CURRENT_SOURCE_DIR}/test/test_network_dependency_configuration.py -v
 	)
 	set_tests_properties(test_network_dependency_configuration PROPERTIES TIMEOUT 300)
+	add_test(NAME test_adas_planning_transport_selector
+		COMMAND ${Python3_EXECUTABLE} -B
+			${CMAKE_CURRENT_SOURCE_DIR}/../control_link_bringup/test/test_adas_planning_transport_selector.py -v
+	)
 	add_test(NAME test_protocol_transport_contract
 		COMMAND ${Python3_EXECUTABLE} -B
 			${CMAKE_CURRENT_SOURCE_DIR}/../../../tools/protocol_dependency_probe/test_transport_contract.py -v
@@ -294,6 +326,17 @@ if(BUILD_TESTING)
 		target_link_libraries(test_edge_command_wait_policy EdgeRuntime::edge_runtime)
 		target_compile_options(test_edge_command_wait_policy PRIVATE -Wall -Wextra -Wpedantic)
 	endif()
+	if(CONTROL_LINK_ENABLE_SOMEIP)
+		foreach(test_name IN ITEMS config ingress application_runtime session_reply_order)
+			ament_add_gtest(test_someip_${test_name}
+				${CMAKE_CURRENT_SOURCE_DIR}/../../../someip_transport/test/test_${test_name}.cpp
+			)
+			target_compile_definitions(test_someip_${test_name} PRIVATE
+				CONTROL_LINK_PROTOCOL_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/protocol_transports.yaml")
+			target_compile_options(test_someip_${test_name} PRIVATE -Wall -Wextra -Wpedantic)
+			target_link_libraries(test_someip_${test_name} control_link_someip_transport)
+		endforeach()
+	endif()
 
 	if(CONTROL_LINK_ENABLE_VCAN_TESTS)
 		ament_add_gtest(test_socketcan_transport
@@ -338,6 +381,11 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 			TARGETS edge_planning_bridge_node edge_planning_client edge_planning_supervisor
 			RUNTIME DESTINATION lib/${PROJECT_NAME}
 	)
+endif()
+
+if(CONTROL_LINK_ENABLE_SOMEIP)
+	install(TARGETS someip_planning_bridge_node someip_planning_client someip_configure
+		RUNTIME DESTINATION lib/${PROJECT_NAME})
 endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)

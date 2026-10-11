@@ -5,7 +5,8 @@ package control_link.network.v1;
 // P0 仅定义网络边界；后续 C++ 服务必须使用异步执行，不在回调内驱动控制决策。
 // OpenSession 的来源固定由生产配置绑定 planning，任何请求都不能授予 teleop 优先级。
 service PlanningIngress {
-  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  // 首帧 open 开立唯一 holder；RPC 的可观察终止撤销 epoch，不以 HTTP/2 channel 作会话。
+  rpc OpenSession(stream ControlSessionRequest) returns (stream OpenSessionResponse);
   rpc Submit(SubmitRequest) returns (SubmitReceipt);
   rpc SubscribeStatus(SubscribeStatusRequest) returns (stream StatusEnvelope);
   rpc GetStatus(GetStatusRequest) returns (StatusEnvelope);
@@ -41,6 +42,25 @@ enum ConnectionState {
   CONNECTION_STATE_FAULTED = 5;
 }
 
+// 网络资源生命周期，不是 GatewayState，也不另设业务 lease。
+enum ControlSessionState {
+  CONTROL_SESSION_STATE_UNKNOWN = 0;
+  CONTROL_SESSION_STATE_IDLE = 1;
+  CONTROL_SESSION_STATE_OPENING = 2;
+  CONTROL_SESSION_STATE_ADMITTED = 3;
+  CONTROL_SESSION_STATE_REVOKING = 4;
+}
+
+enum SessionOperationResult {
+  SESSION_OPERATION_RESULT_UNKNOWN = 0;
+  SESSION_OPERATION_RESULT_OPENING = 1;
+  SESSION_OPERATION_RESULT_ADMITTED = 2;
+  SESSION_OPERATION_RESULT_IDEMPOTENT = 3;
+  SESSION_OPERATION_RESULT_BUSY = 4;
+  SESSION_OPERATION_RESULT_REVOKED = 5;
+  SESSION_OPERATION_RESULT_REJECTED = 6;
+}
+
 enum ObservationValidity {
   OBSERVATION_VALIDITY_UNKNOWN = 0;
   OBSERVATION_VALIDITY_VALID = 1;
@@ -69,7 +89,8 @@ enum AvailabilityPresenceHint {
 }
 
 message CommandKey {
-  // 恰好 16 字节；服务器签发的接入 session，不是认证凭据或 ROS GID。
+  // Submit 目标/holder 自身 receipt 恰好 16B；只读嵌套 key 必须为空以脱敏。
+  // 只读事实仍保留 sequence/GID；空 token 绝不能当成可提交目标或认证凭据。
   bytes session_token = 1;
   // 每个 session 内递增；缺失不能默认为首条 sequence=0，拒绝不重置基线。
   oneof source_sequence_presence {
@@ -125,6 +146,7 @@ message ObservationMetadata {
 }
 
 message SessionInfo {
+  // 仅 holder 的握手回复可带控制 token；所有只读/事件反馈须移除包括嵌套 key 的 token。
   bytes session_token = 1;
   PlanningTransport planning_transport = 2;
   ConnectionState connection_state = 3;
@@ -133,6 +155,7 @@ message SessionInfo {
   bool submission_ready = 4;
   PublisherIdentity ingress_publisher = 5;
   ClockDomain clock_domain = 6;
+  ControlSessionState control_session_state = 7;
 }
 
 message TransportCounters {
@@ -297,11 +320,49 @@ message OpenSessionRequest {
   oneof schema_version_presence {
     uint32 schema_version = 1;
   }
+  // 两项均恰好 16B、由 client 独立随机生成；隔离身份/幂等键，不是认证。
+  // 只在同一存活 holder 中重试使用原值；终止后新握手必须重新生成。
+  bytes holder_nonce = 2;
+  bytes open_request_id = 3;
 }
 
 message OpenSessionResponse {
+  // BUSY/REJECTED 不携带 session，更不得返回另一 holder 的 token 或幂等键。
   SessionInfo session = 1;
   Capabilities capabilities = 2;
+  SessionOperationResult result = 3;
+  // 仅回显本请求的幂等键；readonly 状态不携带此字段。
+  bytes open_request_id = 4;
+}
+
+message KeepSessionRequest {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+  bytes holder_nonce = 2;
+  bytes open_request_id = 3;
+  // 网络存活序号与业务 sequence 独立；重复 keep 不延长 SOME/IP idle deadline。
+  oneof keepalive_sequence_presence {
+    uint64 keepalive_sequence = 4;
+  }
+}
+
+message CloseSessionRequest {
+  oneof schema_version_presence {
+    uint32 schema_version = 1;
+  }
+  bytes holder_nonce = 2;
+  bytes open_request_id = 3;
+}
+
+message ControlSessionRequest {
+  // gRPC 首帧必须 open；后续重复 open/keep/close 均绑定同一 RPC holder。
+  // SOME/IP 分别用独立 method 传上述请求，不把它们加入 64B command codec。
+  oneof operation {
+    OpenSessionRequest open = 1;
+    KeepSessionRequest keep = 2;
+    CloseSessionRequest close = 3;
+  }
 }
 
 message SubmitRequest {

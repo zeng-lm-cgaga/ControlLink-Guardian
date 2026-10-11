@@ -18,6 +18,10 @@ safety_owners:
   network_schema: control_link_network_v1.proto
   fingerprint_algorithm: sha256_proto_source_bytes
 
+control_session_resources:
+  # 仅保留退役幂等键；满额拒绝新开立，不驱逐旧键而允许旧握手复活。
+  retired_open_capacity: 64
+
 someip:
   enabled: false
   application_name: control_link_someip_planning
@@ -35,6 +39,8 @@ someip:
     open_session: 0x0001
     submit: 0x0002
     get_status: 0x0003
+    keep_session: 0x0004
+    close_session: 0x0005
   events:
     gateway_status: 0x8001
     vehicle_status: 0x8002
@@ -45,6 +51,9 @@ someip:
   max_payload_bytes: 4096
   pending_latest_capacity: 1
   readonly_inflight_limit: 4
+  # 应用存活握手限定网络 holder 资源，不替代 Gateway 命令 freshness/lease。
+  session_keepalive_period_ms: 1000
+  session_idle_timeout_ms: 5000
   reconnect_initial_ms: 100
   reconnect_max_ms: 2000
 
@@ -57,8 +66,12 @@ grpc:
   readonly_inflight_limit: 4
   max_status_subscribers: 4
   subscriber_latest_capacity: 1
-  # 仅限制网络资源存活时间，不替代 Contract 中的业务命令时效。
-  max_rpc_deadline_ms: 2000
+  # 三类 RPC 独立期限；keep/readonly 不延长控制 RPC 的绝对 deadline。
+  max_unary_deadline_ms: 2000
+  control_open_timeout_ms: 2000
+  max_control_stream_lifetime_ms: 600000
+  max_readonly_stream_lifetime_ms: 600000
+  shutdown_timeout_ms: 2000
   reconnect_initial_ms: 100
   reconnect_max_ms: 2000
 

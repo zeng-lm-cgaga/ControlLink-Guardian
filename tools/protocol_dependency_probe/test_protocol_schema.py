@@ -219,7 +219,10 @@ void status_json_mapping()
   source->mutable_observation()->set_validity(network::OBSERVATION_VALIDITY_STALE);
   source->mutable_endpoint_publisher()->set_rmw_implementation("rmw_fastrtps_cpp");
   source->mutable_endpoint_publisher()->set_gid(std::string(24, 'g'));
-  envelope.mutable_status()->mutable_session()->set_session_token(std::string(16, 's'));
+  envelope.mutable_status()->mutable_session()->set_control_session_state(network::CONTROL_SESSION_STATE_ADMITTED);
+  envelope.mutable_status()->mutable_session()->mutable_ingress_publisher()->set_gid(std::string(24, 'g'));
+  envelope.mutable_status()->mutable_latest_forwarded()->mutable_key()->set_source_sequence(7);
+  envelope.mutable_status()->mutable_latest_gateway_acceptance()->mutable_key()->set_source_sequence(6);
   google::protobuf::util::JsonPrintOptions options;
   options.preserve_proto_field_names = true;
   std::string json;
@@ -236,6 +239,10 @@ void status_json_mapping()
   require(parsed.status().sources(0).endpoint_publisher().gid() == source->endpoint_publisher().gid(), "GID base64 round trip");
   require(parsed.status().sources(0).observation().observed_system_presence_case() == network::ObservationMetadata::kObservedSystemNs, "zero original observation presence");
   require(parsed.status().sources(0).observation().validity() == network::OBSERVATION_VALIDITY_STALE, "retained copy not freshened by JSON");
+  require(parsed.status().session().session_token().empty(), "readonly fixture has no control token");
+  require(parsed.status().latest_forwarded().key().session_token().empty(), "readonly forwarded key has no token");
+  require(parsed.status().latest_gateway_acceptance().key().session_token().empty(), "readonly acceptance key has no token");
+  require(parsed.status().latest_forwarded().key().source_sequence() == 7, "redaction retains public sequence fact");
   require(!parsed.status().has_gateway(), "missing gateway remains absent");
   require(parsed.status().gateway().observation().validity() == network::OBSERVATION_VALIDITY_UNKNOWN, "missing gateway not valid");
   std::cout << json << '\n';
@@ -354,12 +361,94 @@ void metadata_versions()
   require(!parsed_receipt.rpc_received(), "schema presence is not received or accepted");
 }
 
+void control_operation_presence()
+{
+  network::ControlSessionRequest request;
+  require(request.operation_case() == network::ControlSessionRequest::OPERATION_NOT_SET, "missing operation distinct");
+  auto *open = request.mutable_open();
+  require(open->schema_version_presence_case() == network::OpenSessionRequest::SCHEMA_VERSION_PRESENCE_NOT_SET, "open missing version distinct");
+  open->set_schema_version(0);
+  open->set_holder_nonce(std::string(16, 'n'));
+  open->set_open_request_id(std::string(16, 'r'));
+  auto parsed_open = round_trip(request);
+  require(parsed_open.operation_case() == network::ControlSessionRequest::kOpen, "open oneof survives");
+  require(parsed_open.open().schema_version_presence_case() == network::OpenSessionRequest::kSchemaVersion, "explicit open version zero presence");
+  require(parsed_open.open().holder_nonce() == open->holder_nonce() && parsed_open.open().open_request_id() == open->open_request_id(), "independent 16 byte holder and idempotency identities exact");
+  auto *keep = request.mutable_keep();
+  require(!request.has_open(), "keep replaces open oneof");
+  require(keep->schema_version_presence_case() == network::KeepSessionRequest::SCHEMA_VERSION_PRESENCE_NOT_SET, "keep missing version distinct");
+  keep->set_schema_version(1);
+  keep->set_holder_nonce(std::string(16, 'n'));
+  keep->set_open_request_id(std::string(16, 'r'));
+  require(round_trip(request).keep().keepalive_sequence_presence_case() == network::KeepSessionRequest::KEEPALIVE_SEQUENCE_PRESENCE_NOT_SET, "missing keep sequence distinct");
+  keep->set_keepalive_sequence(0);
+  auto parsed_zero = round_trip(request);
+  require(parsed_zero.operation_case() == network::ControlSessionRequest::kKeep, "keep oneof survives");
+  require(parsed_zero.keep().schema_version_presence_case() == network::KeepSessionRequest::kSchemaVersion, "keep version presence exact");
+  require(parsed_zero.keep().holder_nonce().size() == 16 && parsed_zero.keep().open_request_id().size() == 16, "keep holder identities exact without submission token");
+  require(parsed_zero.keep().keepalive_sequence_presence_case() == network::KeepSessionRequest::kKeepaliveSequence && parsed_zero.keep().keepalive_sequence() == 0, "explicit keep sequence zero presence");
+  keep->set_keepalive_sequence(std::numeric_limits<std::uint64_t>::max());
+  require(round_trip(request).keep().keepalive_sequence() == std::numeric_limits<std::uint64_t>::max(), "keep sequence max exact and independent of business sequence");
+  auto *close = request.mutable_close();
+  require(!request.has_keep(), "close replaces keep oneof");
+  require(close->schema_version_presence_case() == network::CloseSessionRequest::SCHEMA_VERSION_PRESENCE_NOT_SET, "close missing version distinct");
+  close->set_schema_version(1);
+  close->set_holder_nonce(std::string(16, 'n'));
+  close->set_open_request_id(std::string(16, 'r'));
+  auto parsed_close = round_trip(request);
+  require(parsed_close.operation_case() == network::ControlSessionRequest::kClose, "close oneof survives");
+  require(parsed_close.close().schema_version_presence_case() == network::CloseSessionRequest::kSchemaVersion, "close version presence exact");
+  require(parsed_close.close().holder_nonce().size() == 16 && parsed_close.close().open_request_id().size() == 16, "close holder identities exact");
+  request.mutable_open()->set_holder_nonce(std::string(15, 'n'));
+  request.mutable_open()->set_open_request_id(std::string(17, 'r'));
+  auto malformed = round_trip(request);
+  require(malformed.open().holder_nonce().size() == 15 && malformed.open().open_request_id().size() == 17, "protobuf preserves malformed widths; future boundary must reject, not pad or truncate");
+}
+
+void control_response_facts()
+{
+  network::OpenSessionResponse absent;
+  require(!absent.has_session() && absent.result() == network::SESSION_OPERATION_RESULT_UNKNOWN, "missing response never implies admission");
+  for (auto state : {network::CONTROL_SESSION_STATE_IDLE, network::CONTROL_SESSION_STATE_OPENING,
+      network::CONTROL_SESSION_STATE_ADMITTED, network::CONTROL_SESSION_STATE_REVOKING}) {
+    network::SessionInfo info;
+    info.set_control_session_state(state);
+    info.set_submission_ready(false);
+    require(round_trip(info).control_session_state() == state, "control resource state survives independently of Gateway state");
+    require(!round_trip(info).submission_ready(), "resource state alone not ready");
+  }
+  for (auto result : {network::SESSION_OPERATION_RESULT_OPENING, network::SESSION_OPERATION_RESULT_ADMITTED,
+      network::SESSION_OPERATION_RESULT_IDEMPOTENT, network::SESSION_OPERATION_RESULT_BUSY,
+      network::SESSION_OPERATION_RESULT_REVOKED, network::SESSION_OPERATION_RESULT_REJECTED}) {
+    network::OpenSessionResponse response;
+    response.set_result(result);
+    response.set_open_request_id(std::string(16, 'r'));
+    if (result == network::SESSION_OPERATION_RESULT_ADMITTED || result == network::SESSION_OPERATION_RESULT_IDEMPOTENT) {
+      auto *session = response.mutable_session();
+      session->set_session_token(std::string(16, 't'));
+      session->set_control_session_state(network::CONTROL_SESSION_STATE_ADMITTED);
+      session->set_submission_ready(true);
+      session->mutable_ingress_publisher()->set_gid(std::string(24, 'g'));
+    }
+    auto parsed = round_trip(response);
+    require(parsed.result() == result && parsed.open_request_id() == response.open_request_id(), "result and request echo exact");
+    if (result == network::SESSION_OPERATION_RESULT_BUSY || result == network::SESSION_OPERATION_RESULT_REJECTED) {
+      require(!parsed.has_session() && parsed.session().session_token().empty(), "BUSY/REJECTED fixture does not disclose incumbent session");
+      require(parsed.open_request_id() == std::string(16, 'r'), "only own request key echoed");
+    }
+  }
+}
+
 int main(int argument_count, char **arguments)
 {
   try {
     require(argument_count == 2, "expected one case");
     const std::string selected = arguments[1];
-    if (selected == "metadata-versions") {
+    if (selected == "control-operation-presence") {
+      control_operation_presence();
+    } else if (selected == "control-response-facts") {
+      control_response_facts();
+    } else if (selected == "metadata-versions") {
       metadata_versions();
     } else if (selected == "command-presence") {
       command_presence();
@@ -462,6 +551,9 @@ class ProtocolSchemaTest(unittest.TestCase):
             "ObservationMetadata": ["observed_system_ns", "received_boottime_ns"],
             "StatusEnvelope": ["schema_version", "publication_sequence", "published_system_ns", "published_boottime_ns"],
             "AvailabilityEnvelope": ["schema_version", "presence_hint", "published_system_ns"],
+            "OpenSessionRequest": ["schema_version"],
+            "KeepSessionRequest": ["schema_version", "keepalive_sequence"],
+            "CloseSessionRequest": ["schema_version"],
         }
         for message_name, field_names in expected.items():
             message = self.messages[message_name]
@@ -480,8 +572,10 @@ class ProtocolSchemaTest(unittest.TestCase):
         methods = {method.name: method for method in service.method}
         self.assertEqual(set(methods), {"OpenSession", "Submit", "SubscribeStatus", "GetStatus", "GetCapabilities"})
         for name, method in methods.items():
-            self.assertFalse(method.client_streaming)
-            self.assertEqual(method.server_streaming, name == "SubscribeStatus")
+            self.assertEqual(method.client_streaming, name == "OpenSession")
+            self.assertEqual(method.server_streaming, name in {"OpenSession", "SubscribeStatus"})
+        self.assertEqual(methods["OpenSession"].input_type, ".control_link.network.v1.ControlSessionRequest")
+        self.assertEqual(methods["OpenSession"].output_type, ".control_link.network.v1.OpenSessionResponse")
         for request in ["SubscribeStatusRequest", "GetStatusRequest", "GetCapabilitiesRequest"]:
             self.assertEqual({field.name for field in self.messages[request].field}, {"schema_version"})
         for message_name in ["OpenSessionRequest", "CommandTarget"]:
@@ -538,7 +632,7 @@ class ProtocolSchemaTest(unittest.TestCase):
         for message_name in ["StatusEnvelope", "Capabilities", "AvailabilityEnvelope"]:
             fields = {field.name: field for field in self.messages[message_name].field}
             self.assertEqual(fields["schema_fingerprint"].type, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES)
-        self.assertEqual({field.name for field in self.messages["OpenSessionRequest"].field}, {"schema_version"})
+        self.assertEqual({field.name for field in self.messages["OpenSessionRequest"].field}, {"schema_version", "holder_nonce", "open_request_id"})
         diagnostic = self.messages["DiagnosticObservation"]
         self.assertEqual({field.name for field in diagnostic.field}, {"observation", "level", "name", "message", "hardware_id", "values"})
         fields = {field.name: field for field in diagnostic.field}
@@ -565,6 +659,51 @@ class ProtocolSchemaTest(unittest.TestCase):
 
     def test_cpp_availability_json_is_only_presence_hint(self):
         run_logged([str(self.executable), "availability-json-mapping"], self.output, "availability-json-mapping")
+
+    def test_descriptor_control_session_contract(self):
+        request = self.messages["ControlSessionRequest"]
+        self.assertEqual([oneof.name for oneof in request.oneof_decl], ["operation"])
+        self.assertEqual([(field.name, field.number) for field in request.field],
+                         [("open", 1), ("keep", 2), ("close", 3)])
+        for field in request.field:
+            self.assertEqual(field.oneof_index, 0)
+            self.assertEqual(field.type, descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE)
+            self.assertEqual(field.type_name, ".control_link.network.v1." + {
+                "open": "OpenSessionRequest", "keep": "KeepSessionRequest",
+                "close": "CloseSessionRequest"}[field.name])
+        for name in ("OpenSessionRequest", "KeepSessionRequest", "CloseSessionRequest"):
+            fields = {field.name: field for field in self.messages[name].field}
+            self.assertEqual(set(fields), {"schema_version", "holder_nonce", "open_request_id"} |
+                             ({"keepalive_sequence"} if name == "KeepSessionRequest" else set()))
+            for identity in ("holder_nonce", "open_request_id"):
+                self.assertEqual(fields[identity].type, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES)
+                self.assertFalse(fields[identity].HasField("oneof_index"))
+        keep_sequence = next(field for field in self.messages["KeepSessionRequest"].field
+                             if field.name == "keepalive_sequence")
+        self.assertEqual(keep_sequence.type, descriptor_pb2.FieldDescriptorProto.TYPE_UINT64)
+        response_fields = {field.name: field for field in self.messages["OpenSessionResponse"].field}
+        self.assertEqual(set(response_fields), {"session", "capabilities", "result", "open_request_id"})
+        self.assertEqual(response_fields["session"].type_name, ".control_link.network.v1.SessionInfo")
+        self.assertEqual(response_fields["result"].type_name, ".control_link.network.v1.SessionOperationResult")
+        session_fields = {field.name: field for field in self.messages["SessionInfo"].field}
+        self.assertEqual(session_fields["control_session_state"].number, 7)
+        self.assertEqual(session_fields["control_session_state"].type_name, ".control_link.network.v1.ControlSessionState")
+        enums = {enum.name: {value.name: value.number for value in enum.value}
+                 for enum in self.descriptor.enum_type}
+        self.assertEqual(enums["ControlSessionState"], {
+            "CONTROL_SESSION_STATE_" + name: index for index, name in enumerate(
+                ("UNKNOWN", "IDLE", "OPENING", "ADMITTED", "REVOKING"))})
+        self.assertEqual(enums["SessionOperationResult"], {
+            "SESSION_OPERATION_RESULT_" + name: index for index, name in enumerate(
+                ("UNKNOWN", "OPENING", "ADMITTED", "IDEMPOTENT", "BUSY", "REVOKED", "REJECTED"))})
+
+    def test_cpp_control_operation_oneof_and_identity_presence(self):
+        run_logged([str(self.executable), "control-operation-presence"], self.output,
+                   "control-operation-presence")
+
+    def test_cpp_control_state_result_and_busy_encoding(self):
+        run_logged([str(self.executable), "control-response-facts"], self.output,
+                   "control-response-facts")
 
 
 if __name__ == "__main__":

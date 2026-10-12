@@ -1,0 +1,11 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Protobuf @CONTROL_LINK_PROTOBUF_VERSION@ EXACT MODULE)
+find_dependency(yaml-cpp)
+find_dependency(Boost @Boost_VERSION_STRING@ EXACT)
+find_dependency(Threads)
+find_dependency(control_link_edge_protocol CONFIG)
+set(control_link_network_ingress_SCHEMA_SHA256_HEX "@CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX@")
+include("${CMAKE_CURRENT_LIST_DIR}/control_link_network_ingressTargets.cmake")
+check_required_components(control_link_network_ingress)

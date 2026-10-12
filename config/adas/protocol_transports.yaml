@@ -5,7 +5,7 @@ planning:
   source_id: planning
   transport: ros2
   allowed_transports: [ros2, edge, someip, grpc]
-  runtime_available_transports: [ros2, edge, someip]
+  runtime_available_transports: [ros2, edge, someip, grpc]
   exclusive: true
 
 safety_owners:

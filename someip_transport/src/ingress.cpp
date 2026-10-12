@@ -1,4 +1,4 @@
-#include "control_link_someip_transport/ingress.hpp"
+#include "control_link_network_ingress/ingress.hpp"
 
 #include <chrono>
 #include <cstdint>
@@ -10,40 +10,36 @@
 #include <string>
 #include <utility>
 
-#ifndef CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX
-#error "The ingress target must define CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX from its .proto input"
-#endif
-
 namespace control_link::someip {
 namespace {
 
 namespace codec = control_link_edge_protocol;
 
-wire::Capabilities normalized_capabilities(wire::Capabilities capabilities) {
-  const std::string fingerprint_hex = CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX;
-  if (fingerprint_hex.size() != 64) throw std::invalid_argument("invalid build-time schema fingerprint");
-  std::string fingerprint;
-  fingerprint.reserve(32);
-  for (std::size_t offset = 0; offset < fingerprint_hex.size(); offset += 2) {
-    const auto pair = fingerprint_hex.substr(offset, 2);
-    std::size_t consumed = 0;
-    const auto byte = std::stoul(pair, &consumed, 16);
-    if (consumed != 2 || byte > 255) throw std::invalid_argument("invalid build-time schema fingerprint");
-    fingerprint.push_back(static_cast<char>(byte));
+wire::Capabilities normalized_capabilities(wire::Capabilities capabilities,
+                                          wire::PlanningTransport transport) {
+  if (transport != wire::PLANNING_TRANSPORT_SOMEIP && transport != wire::PLANNING_TRANSPORT_GRPC) {
+    throw std::invalid_argument("network ingress requires SOMEIP or GRPC transport");
   }
   capabilities.set_schema_version(1);
-  capabilities.set_schema_fingerprint(std::move(fingerprint));
+  capabilities.set_schema_fingerprint(::control_link::network::schema_fingerprint());
+  capabilities.set_planning_transport(transport);
   return capabilities;
 }
 
-std::string payload_capacity_error(const Config &config, const wire::Capabilities &capabilities,
+IngressResources resources_from_config(const Config &config) {
+  validate_config(config);
+  return {config.max_payload_bytes, config.retired_open_capacity, config.idle_timeout_ms};
+}
+
+std::string payload_capacity_error(const IngressResources &resources, const wire::Capabilities &capabilities,
                                    const std::string &rmw) {
-  try {
-    validate_protocol_payload_budget(config, capabilities, rmw);
-    return {};
-  } catch (const std::invalid_argument &error) {
-    return error.what();
+  const auto required = required_protocol_payload_bytes(capabilities, rmw);
+  if (resources.max_payload_bytes < required) {
+    return "network ingress PAYLOAD_CAPACITY: actual capabilities/RMW and mandatory "
+        "session/status fields require at least " + std::to_string(required) +
+        " bytes; configured " + std::to_string(resources.max_payload_bytes);
   }
+  return {};
 }
 
 std::string token_bytes(const codec::SessionToken &token) {
@@ -83,26 +79,35 @@ void redact_tokens(google::protobuf::Message *message) {
 
 struct PlanningIngress::Impl {
   struct Holder {
-    std::uint16_t peer;
+    std::uint64_t peer;
     std::string nonce;
     std::string request_id;
 
-    bool matches(std::uint16_t candidate_peer, const std::string &candidate_nonce,
+    bool matches(std::uint64_t candidate_peer, const std::string &candidate_nonce,
                  const std::string &candidate_request_id) const {
       return peer == candidate_peer && nonce == candidate_nonce && request_id == candidate_request_id;
     }
   };
 
-  explicit Impl(Config configuration, wire::Capabilities advertised)
-      : config(std::move(configuration)), capabilities(normalized_capabilities(std::move(advertised))) {
+  explicit Impl(IngressResources configuration, wire::Capabilities advertised,
+                wire::PlanningTransport selected_transport)
+      : resources(configuration), transport(selected_transport),
+        capabilities(normalized_capabilities(std::move(advertised), selected_transport)) {
+    if (resources.max_payload_bytes == 0 ||
+        resources.max_payload_bytes > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        resources.retired_open_capacity == 0 ||
+        (transport == wire::PLANNING_TRANSPORT_SOMEIP && resources.idle_timeout_ms == 0)) {
+      throw std::invalid_argument("network ingress requires bounded payload/retired keys and SOME/IP idle budget");
+    }
     // RMW 尚由 ROS owner 装配；真实身份须预检，构造仍拒绝已知 Capabilities 的必然超限。
-    validate_protocol_payload_budget(config, capabilities, "r");
+    const auto capacity_error = payload_capacity_error(resources, capabilities, "r");
+    if (!capacity_error.empty()) throw std::invalid_argument(capacity_error);
     reset_session_locked();
   }
 
   void reset_session_locked() {
     session.Clear();
-    session.set_planning_transport(wire::PLANNING_TRANSPORT_SOMEIP);
+    session.set_planning_transport(transport);
     session.set_clock_domain(wire::CLOCK_DOMAIN_SYSTEM);
     session.set_control_session_state(state);
     session.set_connection_state(wire::CONNECTION_STATE_DISCONNECTED);
@@ -110,6 +115,10 @@ struct PlanningIngress::Impl {
 
   bool live_locked() const {
     return state == wire::CONTROL_SESSION_STATE_OPENING || state == wire::CONTROL_SESSION_STATE_ADMITTED;
+  }
+
+  bool valid_peer_locked(std::uint64_t peer) const {
+    return peer != 0 && (transport == wire::PLANNING_TRANSPORT_GRPC || peer < UINT16_MAX);
   }
 
   wire::OpenSessionResponse response_locked(wire::SessionOperationResult result,
@@ -133,6 +142,7 @@ struct PlanningIngress::Impl {
       counters.set_dropped_count(counters.dropped_count() + 1);
       pending.reset();
     }
+    pending_submission_id = 0;
   }
 
   void revoke_locked(const std::string &reason) {
@@ -151,10 +161,11 @@ struct PlanningIngress::Impl {
   }
 
   void expire_locked(std::uint64_t now) {
-    if (!live_locked()) return;
+    // gRPC control RPC 的 EOF/Done/deadline/stop 是存活 owner，Keep 不建立第二条 idle lease。
+    if (transport == wire::PLANNING_TRANSPORT_GRPC || !live_locked()) return;
     if (now < last_keep_ns) {
       revoke_locked("STEADY_CLOCK_REGRESSION");
-    } else if (now - last_keep_ns >= static_cast<std::uint64_t>(config.idle_timeout_ms) * 1000000) {
+    } else if (now - last_keep_ns >= static_cast<std::uint64_t>(resources.idle_timeout_ms) * 1000000) {
       revoke_locked("HOLDER_IDLE_TIMEOUT");
     }
   }
@@ -192,7 +203,8 @@ struct PlanningIngress::Impl {
     return result;
   }
 
-  const Config config;
+  const IngressResources resources;
+  const wire::PlanningTransport transport;
   const wire::Capabilities capabilities;
   mutable std::mutex mutex;
   std::uint64_t epoch{0};
@@ -203,25 +215,31 @@ struct PlanningIngress::Impl {
   std::uint64_t last_keep_ns{0};
   std::uint64_t keep_sequence{0};
   std::optional<codec::CommandFrame> pending;
+  std::uint64_t pending_submission_id{0};
   wire::ForwardedCommandObservation latest_forwarded;
   wire::TransportCounters counters;
   wire::StatusSnapshot observations;
   std::string failure;
 };
 
-PlanningIngress::PlanningIngress(Config config, wire::Capabilities capabilities)
-    : impl_(std::make_unique<Impl>(std::move(config), std::move(capabilities))) {}
+PlanningIngress::PlanningIngress(Config config, wire::Capabilities capabilities,
+                                 wire::PlanningTransport transport)
+    : PlanningIngress(resources_from_config(config), std::move(capabilities), transport) {}
+
+PlanningIngress::PlanningIngress(IngressResources resources, wire::Capabilities capabilities,
+                                 wire::PlanningTransport transport)
+    : impl_(std::make_unique<Impl>(resources, std::move(capabilities), transport)) {}
 
 PlanningIngress::~PlanningIngress() = default;
 
-wire::OpenSessionResponse PlanningIngress::open(std::uint16_t peer,
+wire::OpenSessionResponse PlanningIngress::open(std::uint64_t peer,
                                                const wire::OpenSessionRequest &request,
                                                std::uint64_t steady_ns) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
   impl_->expire_locked(steady_ns);
   if (request.schema_version_presence_case() != wire::OpenSessionRequest::kSchemaVersion ||
-      request.schema_version() != 1 || peer == 0 || peer == UINT16_MAX ||
+      request.schema_version() != 1 || !impl_->valid_peer_locked(peer) ||
       !valid_identity(request.holder_nonce()) || !valid_identity(request.open_request_id())) {
     return impl_->rejected_locked(request.open_request_id());
   }
@@ -236,7 +254,7 @@ wire::OpenSessionResponse PlanningIngress::open(std::uint16_t peer,
   }
   const auto key = std::make_pair(request.holder_nonce(), request.open_request_id());
   if (impl_->retired.count(key) != 0) return impl_->rejected_locked(request.open_request_id());
-  if (impl_->retired.size() >= impl_->config.retired_open_capacity) {
+  if (impl_->retired.size() >= impl_->resources.retired_open_capacity) {
     impl_->failure = "RESOURCE_EXHAUSTED: retired open keys";
     impl_->counters.set_protocol_rejected_count(impl_->counters.protocol_rejected_count() + 1);
     return impl_->response_locked(wire::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED,
@@ -266,7 +284,7 @@ wire::OpenSessionResponse PlanningIngress::open(std::uint16_t peer,
   return impl_->response_locked(wire::SESSION_OPERATION_RESULT_OPENING, request.open_request_id(), true);
 }
 
-wire::OpenSessionResponse PlanningIngress::keep(std::uint16_t peer,
+wire::OpenSessionResponse PlanningIngress::keep(std::uint64_t peer,
                                                const wire::KeepSessionRequest &request,
                                                std::uint64_t steady_ns) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -286,7 +304,7 @@ wire::OpenSessionResponse PlanningIngress::keep(std::uint16_t peer,
       request.open_request_id(), true);
 }
 
-wire::OpenSessionResponse PlanningIngress::close(std::uint16_t peer,
+wire::OpenSessionResponse PlanningIngress::close(std::uint64_t peer,
                                                 const wire::CloseSessionRequest &request) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
@@ -299,8 +317,9 @@ wire::OpenSessionResponse PlanningIngress::close(std::uint16_t peer,
   return impl_->response_locked(wire::SESSION_OPERATION_RESULT_REVOKED, request.open_request_id(), true);
 }
 
-wire::SubmitReceipt PlanningIngress::submit(std::uint16_t peer, const codec::CommandFrame &frame,
-                                           std::uint64_t received_boot_ns) {
+wire::SubmitReceipt PlanningIngress::submit(std::uint64_t peer, const codec::CommandFrame &frame,
+                                           std::uint64_t received_boot_ns,
+                                           std::uint64_t submission_id) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
   wire::SubmitReceipt receipt;
@@ -311,7 +330,8 @@ wire::SubmitReceipt PlanningIngress::submit(std::uint16_t peer, const codec::Com
   receipt.mutable_key()->set_source_sequence(frame.command_sequence);
   receipt.mutable_gateway_acceptance()->set_state(wire::GATEWAY_ACCEPTANCE_STATE_UNKNOWN);
   if (impl_->state != wire::CONTROL_SESSION_STATE_ADMITTED || !impl_->session.submission_ready() ||
-      !impl_->holder || peer != impl_->holder->peer || received_boot_ns == 0 ||
+      !impl_->holder ||
+      (impl_->transport == wire::PLANNING_TRANSPORT_SOMEIP && peer != impl_->holder->peer) || received_boot_ns == 0 ||
       token_bytes(frame.session_token) != impl_->session.session_token() ||
       frame.clock_domain != codec::ClockDomain::kSystem || !representable_stamp(frame.source_stamp_ns)) {
     impl_->counters.set_protocol_rejected_count(impl_->counters.protocol_rejected_count() + 1);
@@ -324,8 +344,17 @@ wire::SubmitReceipt PlanningIngress::submit(std::uint16_t peer, const codec::Com
   }
   // 这里只保留可表达原值；mode/finite/业务 sequence/时效由 Gateway 唯一判断。
   impl_->pending = frame;
+  impl_->pending_submission_id = submission_id;
   receipt.set_forwarding_state(wire::FORWARDING_STATE_PENDING);
   return receipt;
+}
+
+bool PlanningIngress::cancel_pending_submission(std::uint64_t epoch, std::uint64_t submission_id) {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  if (epoch != impl_->epoch || submission_id == 0 || !impl_->pending ||
+      impl_->pending_submission_id != submission_id) return false;
+  impl_->drop_pending_locked();
+  return true;
 }
 
 void PlanningIngress::expire(std::uint64_t steady_ns) {
@@ -350,7 +379,7 @@ bool PlanningIngress::finish_release(std::uint64_t revoked_epoch) {
   if (revoked_epoch != impl_->epoch || impl_->state != wire::CONTROL_SESSION_STATE_REVOKING) return false;
   if (impl_->holder) {
     const auto key = std::make_pair(impl_->holder->nonce, impl_->holder->request_id);
-    if (impl_->retired.count(key) == 0 && impl_->retired.size() >= impl_->config.retired_open_capacity) {
+    if (impl_->retired.count(key) == 0 && impl_->retired.size() >= impl_->resources.retired_open_capacity) {
       impl_->failure = "RESOURCE_EXHAUSTED: cannot retire open key";
       return false;
     }
@@ -373,7 +402,7 @@ bool PlanningIngress::bind_publisher(std::uint64_t epoch, const std::string &gid
   if (epoch != impl_->epoch || impl_->state != wire::CONTROL_SESSION_STATE_OPENING || gid.size() != 24 || rmw.empty()) return false;
   const auto &publisher = impl_->session.ingress_publisher();
   if (!publisher.gid().empty() && (publisher.gid() != gid || publisher.rmw_implementation() != rmw)) return false;
-  const auto capacity_error = payload_capacity_error(impl_->config, impl_->capabilities, rmw);
+  const auto capacity_error = payload_capacity_error(impl_->resources, impl_->capabilities, rmw);
   if (!capacity_error.empty()) {
     impl_->revoke_locked(capacity_error);
     return false;
@@ -428,6 +457,7 @@ bool PlanningIngress::publish_pending(std::uint64_t epoch, std::uint64_t forward
   impl_->latest_forwarded.set_forwarded_boottime_ns(forwarded_boot_ns);
   impl_->counters.set_forwarded_count(impl_->counters.forwarded_count() + 1);
   impl_->pending.reset();
+  impl_->pending_submission_id = 0;
   return true;
 }
 
@@ -447,6 +477,12 @@ void PlanningIngress::record_protocol_rejection() {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
   impl_->counters.set_protocol_rejected_count(impl_->counters.protocol_rejected_count() + 1);
+}
+
+void PlanningIngress::record_transport_drop() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->counters.set_missed_count(impl_->counters.missed_count() + 1);
+  impl_->counters.set_dropped_count(impl_->counters.dropped_count() + 1);
 }
 
 wire::StatusSnapshot PlanningIngress::readonly_status() const {

@@ -386,14 +386,14 @@ TEST(SomeipConfig, RejectsMalformedYamlAndBoundedAliasRecursion) {
 
 TEST(SomeipConfig, PayloadQueueLimitHasExactHeaderCapacityAndOverflowBoundary) {
   auto config = load_config(source_config_path());
-  config.max_payload_bytes = 64;
   config.readonly_inflight_limit = 1;
   ASSERT_NO_THROW(validate_config(config));
   const auto minimum = YAML::Load(vsomeip_configuration_json(config, "server", 0x3101, "small-payload", true));
-  EXPECT_EQ(minimum["max-payload-size-reliable"].as<std::uint32_t>(), 64);
-  EXPECT_EQ(minimum["max-payload-size-local"].as<std::uint32_t>(), 64);
-  EXPECT_EQ(minimum["endpoint-queue-limit-external"].as<std::uint32_t>(), 480);
-  EXPECT_EQ(minimum["endpoint-queue-limit-local"].as<std::uint32_t>(), 480);
+  EXPECT_EQ(minimum["max-payload-size-reliable"].as<std::uint32_t>(), config.max_payload_bytes);
+  EXPECT_EQ(minimum["max-payload-size-local"].as<std::uint32_t>(), config.max_payload_bytes);
+  const auto queue_bytes = (std::uint64_t{config.max_payload_bytes} + 16) * 6;
+  EXPECT_EQ(minimum["endpoint-queue-limit-external"].as<std::uint64_t>(), queue_bytes);
+  EXPECT_EQ(minimum["endpoint-queue-limit-local"].as<std::uint64_t>(), queue_bytes);
   config.max_payload_bytes = 715827866;
   ASSERT_NO_THROW(validate_config(config));
   const auto maximum = YAML::Load(vsomeip_configuration_json(config, "server", 0x3101, "max-queue", true));

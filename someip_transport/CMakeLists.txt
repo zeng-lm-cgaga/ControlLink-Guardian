@@ -8,25 +8,8 @@ option(CONTROL_LINK_SOMEIP_BUILD_TESTS
 include(${CMAKE_CURRENT_SOURCE_DIR}/../ros2_ws/src/control_link_adapters/cmake/ControlLinkNetworkDependencyLock.cmake)
 find_package(vsomeip3 ${CONTROL_LINK_VSOMEIP_VERSION} EXACT CONFIG REQUIRED)
 find_package(Boost 1.55 REQUIRED COMPONENTS system thread filesystem)
-find_package(Protobuf ${CONTROL_LINK_PROTOBUF_VERSION} EXACT MODULE REQUIRED)
-find_package(yaml-cpp REQUIRED)
-find_package(Threads REQUIRED)
-if(NOT TARGET vsomeip3 OR NOT TARGET protobuf::libprotobuf OR NOT TARGET protobuf::protoc)
-	message(FATAL_ERROR "ControlLink SOME/IP runtime requires real vsomeip3, protobuf::libprotobuf and protobuf::protoc imported targets")
-endif()
-
-get_target_property(control_link_protoc_location protobuf::protoc IMPORTED_LOCATION)
-if(NOT control_link_protoc_location OR NOT EXISTS "${control_link_protoc_location}")
-	message(FATAL_ERROR "ControlLink SOME/IP runtime requires a real installed protobuf::protoc executable")
-endif()
-execute_process(COMMAND "${control_link_protoc_location}" --version
-	RESULT_VARIABLE control_link_protoc_result
-	OUTPUT_VARIABLE control_link_protoc_version
-	ERROR_VARIABLE control_link_protoc_error
-	OUTPUT_STRIP_TRAILING_WHITESPACE TIMEOUT 10)
-if(NOT control_link_protoc_result EQUAL 0 OR
-	NOT control_link_protoc_version STREQUAL "libprotoc ${CONTROL_LINK_PROTOBUF_VERSION}")
-	message(FATAL_ERROR "ControlLink SOME/IP runtime requires protoc/header/library version ${CONTROL_LINK_PROTOBUF_VERSION}; got=${control_link_protoc_version}; exit=${control_link_protoc_result}; ${control_link_protoc_error}")
+if(NOT TARGET vsomeip3)
+	message(FATAL_ERROR "ControlLink SOME/IP runtime requires a real vsomeip3 imported target")
 endif()
 
 get_target_property(control_link_vsomeip_location vsomeip3 IMPORTED_LOCATION)
@@ -57,46 +40,25 @@ if(NOT control_link_vsomeip_sd_dir STREQUAL control_link_vsomeip_library_dir)
 	message(FATAL_ERROR "ControlLink SOME/IP runtime must not mix vsomeip3 and Service Discovery installation prefixes")
 endif()
 
-# standalone 使用当前源码 codec；已有安装的同版本旧 archive 不得静默替代布局 API。
-if(TARGET control_link_edge_protocol)
-	set(control_link_someip_codec_target control_link_edge_protocol)
-elseif(TARGET ControlLink::control_link_edge_protocol AND
-	NOT CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-	set(control_link_someip_codec_target ControlLink::control_link_edge_protocol)
+# message/codec/ingress 由公共 target 唯一编译和安装；gRPC-only 不经本目录装配。
+if(TARGET control_link_network_ingress)
+	set(control_link_someip_ingress_target control_link_network_ingress)
+elseif(TARGET ControlLink::control_link_network_ingress)
+	set(control_link_someip_ingress_target ControlLink::control_link_network_ingress)
 else()
-	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_CLIENT OFF)
-	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SDK OFF)
-	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SUPERVISOR OFF)
-	set(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS OFF)
-	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../edge_protocol
-		${CMAKE_CURRENT_BINARY_DIR}/edge_protocol)
-	set(control_link_someip_codec_target control_link_edge_protocol)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../network_ingress
+		${CMAKE_CURRENT_BINARY_DIR}/network_ingress)
+	set(control_link_someip_ingress_target control_link_network_ingress)
+endif()
+get_target_property(CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX
+	${control_link_someip_ingress_target} CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX)
+if(NOT CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX)
+	message(FATAL_ERROR "ControlLink SOME/IP requires the shared ingress schema fingerprint property")
 endif()
 
-set(control_link_network_schema "${CMAKE_CURRENT_SOURCE_DIR}/../protocols/control_link_network_v1.proto")
-set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${control_link_network_schema}")
-file(SHA256 "${control_link_network_schema}" CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX)
-set(control_link_network_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
-set(control_link_network_generated_source "${control_link_network_generated_dir}/control_link_network_v1.pb.cc")
-set(control_link_network_generated_header "${control_link_network_generated_dir}/control_link_network_v1.pb.h")
-add_custom_command(
-	OUTPUT "${control_link_network_generated_source}" "${control_link_network_generated_header}"
-	COMMAND ${CMAKE_COMMAND} -E make_directory "${control_link_network_generated_dir}"
-	COMMAND protobuf::protoc
-		"--proto_path=${CMAKE_CURRENT_SOURCE_DIR}/../protocols"
-		"--cpp_out=${control_link_network_generated_dir}"
-		"${control_link_network_schema}"
-	DEPENDS "${control_link_network_schema}" protobuf::protoc
-	VERBATIM
-)
-
 add_library(control_link_someip_transport STATIC
-	src/config.cpp
-	src/ingress.cpp
 	src/server.cpp
 	src/client.cpp
-	"${control_link_network_generated_source}"
-	"${control_link_network_generated_header}"
 )
 add_library(ControlLink::control_link_someip_transport ALIAS control_link_someip_transport)
 set_target_properties(control_link_someip_transport PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -106,14 +68,10 @@ target_compile_definitions(control_link_someip_transport PRIVATE
 	CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX="${CONTROL_LINK_NETWORK_SCHEMA_SHA256_HEX}")
 target_include_directories(control_link_someip_transport PUBLIC
 	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-	$<BUILD_INTERFACE:${control_link_network_generated_dir}>
 	$<INSTALL_INTERFACE:include>)
 target_link_libraries(control_link_someip_transport PUBLIC
 	vsomeip3
-	protobuf::libprotobuf
-	yaml-cpp
-	Threads::Threads
-	${control_link_someip_codec_target})
+	${control_link_someip_ingress_target})
 
 add_executable(someip_planning_client src/someip_planning_client.cpp)
 target_compile_features(someip_planning_client PRIVATE cxx_std_17)
@@ -151,10 +109,9 @@ install(TARGETS control_link_someip_transport
 	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 	INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(TARGETS someip_planning_client someip_configure RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES "${control_link_network_generated_header}" DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES "${control_link_network_schema}"
-	DESTINATION ${CMAKE_INSTALL_DATADIR}/${PROJECT_NAME}/protocols)
+install(FILES include/control_link_someip_transport/client.hpp
+	include/control_link_someip_transport/server.hpp
+	DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/control_link_someip_transport)
 install(EXPORT control_link_someip_transport_targets
 	FILE control_link_someip_transportTargets.cmake
 	NAMESPACE ControlLink::

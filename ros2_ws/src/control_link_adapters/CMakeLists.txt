@@ -46,7 +46,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Threads REQUIRED)
 
-if(CONTROL_LINK_ENABLE_EDGE_RUNTIME OR CONTROL_LINK_ENABLE_SOMEIP)
+if(CONTROL_LINK_ENABLE_EDGE_RUNTIME OR CONTROL_LINK_ENABLE_SOMEIP OR CONTROL_LINK_ENABLE_GRPC)
 	if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 		find_package(EdgeRuntime CONFIG REQUIRED)
 	endif()
@@ -75,6 +75,15 @@ if(CONTROL_LINK_ENABLE_SOMEIP)
 else()
 	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/control_link_someip_runtime.txt"
 		"someip.status=DISABLED\nproduction_protocol_targets=NONE\n")
+endif()
+
+if(CONTROL_LINK_ENABLE_GRPC)
+	set(CONTROL_LINK_GRPC_BUILD_TESTS OFF)
+	add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../grpc_transport ${CMAKE_CURRENT_BINARY_DIR}/grpc_transport)
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/control_link_grpc_runtime.txt"
+		"grpc.status=RUNTIME_AVAILABLE\nproduction_protocol_targets=control_link_grpc_transport;grpc_planning_client;grpc_planning_bridge_node\nacceptance=NOT_IMPLIED_BY_CONFIGURE\n")
+else()
+	file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/control_link_grpc_runtime.txt" "grpc.status=DISABLED\nproduction_protocol_targets=NONE\n")
 endif()
 
 
@@ -143,6 +152,15 @@ if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
 	add_executable(edge_planning_supervisor
 		${CMAKE_CURRENT_SOURCE_DIR}/../../../edge_protocol/src/edge_planning_supervisor.cpp
 	)
+endif()
+
+if(CONTROL_LINK_ENABLE_GRPC)
+	add_executable(grpc_planning_bridge_node src/grpc_planning_bridge.cpp)
+	target_include_directories(grpc_planning_bridge_node PRIVATE include)
+	target_compile_options(grpc_planning_bridge_node PRIVATE -Wall -Wextra -Wpedantic)
+	target_compile_definitions(grpc_planning_bridge_node PRIVATE CONTROL_LINK_USE_GRPC)
+	target_link_libraries(grpc_planning_bridge_node control_link_grpc_transport)
+	ament_target_dependencies(grpc_planning_bridge_node builtin_interfaces control_link_contract control_link_interfaces rclcpp rmw)
 endif()
 
 if(CONTROL_LINK_ENABLE_SOMEIP)
@@ -370,6 +388,7 @@ install(FILES
 	${CMAKE_CURRENT_SOURCE_DIR}/../../../protocols/control_link_network_v1.proto
 	${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/protocol_transports.yaml
 	DESTINATION share/${PROJECT_NAME}/network_contracts
+	COMPONENT network_contracts
 )
 install(
 	TARGETS ${PROJECT_NAME} control_link_mock_system
@@ -393,6 +412,10 @@ endif()
 if(CONTROL_LINK_ENABLE_SOMEIP)
 	install(TARGETS someip_planning_bridge_node someip_planning_client someip_configure
 		RUNTIME DESTINATION lib/${PROJECT_NAME})
+endif()
+if(CONTROL_LINK_ENABLE_GRPC)
+	install(TARGETS grpc_planning_bridge_node grpc_planning_client
+		RUNTIME DESTINATION lib/${PROJECT_NAME} COMPONENT grpc_runtime)
 endif()
 
 ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)

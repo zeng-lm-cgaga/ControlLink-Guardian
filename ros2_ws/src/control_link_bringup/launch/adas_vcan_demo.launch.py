@@ -139,9 +139,9 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		context, "start_lifecycle_activator")
 	start_secondary_source = _bool_argument(context, "start_secondary_source")
 	planning_transport = LaunchConfiguration("planning_transport").perform(context).lower()
-	if planning_transport not in ("ros2", "edge", "someip"):
+	if planning_transport not in ("ros2", "edge", "someip", "grpc"):
 		raise RuntimeError(
-			"planning_transport must be ros2, edge or someip; actual=" + planning_transport)
+			"planning_transport must be ros2, edge, someip or grpc; actual=" + planning_transport)
 	source_id = LaunchConfiguration("source_id").perform(context)
 	secondary_source_id = LaunchConfiguration("secondary_source_id").perform(context)
 	enabled_sources = profile.get("enabled_sources")
@@ -152,7 +152,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	if source_id not in enabled_sources:
 		raise RuntimeError(
 			"source_id must be enabled by ADAS Profile; actual=" + source_id)
-	if planning_transport in ("edge", "someip") and source_id != "planning":
+	if planning_transport in ("edge", "someip", "grpc") and source_id != "planning":
 		raise RuntimeError(
 			"planning_transport=" + planning_transport + " fixes source binding to planning; actual=" +
 			source_id)
@@ -164,7 +164,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			raise RuntimeError(
 				"secondary_source_id must be enabled by ADAS Profile; actual=" +
 				secondary_source_id)
-		if planning_transport in ("edge", "someip") and secondary_source_id == "planning":
+		if planning_transport in ("edge", "someip", "grpc") and secondary_source_id == "planning":
 			raise RuntimeError(
 				"planning_transport=" + planning_transport + " cannot start a second ROS planning publisher")
 		if secondary_source_id == source_id:
@@ -264,6 +264,14 @@ def _launch_adas_vcan(context, *args, **kwargs):
 			output="screen",
 			emulate_tty=True,
 		)
+	elif planning_transport == "grpc":
+		_require_adapters_executable("grpc_planning_bridge_node", "CONTROL_LINK_ENABLE_GRPC")
+		network_config_path = _configuration_file_argument(context, "network_config_path",
+			os.path.join(config_root, "adas", "protocol_transports.yaml"))
+		bridge_node = Node(package="control_link_adapters", executable="grpc_planning_bridge_node",
+			name="grpc_planning_bridge", namespace="control_link", output="screen", emulate_tty=True,
+			additional_env=participant_env,
+			parameters=[{**common_parameters, "network_config_path": network_config_path, "source_id": "planning"}])
 	elif planning_transport == "someip":
 		_require_adapters_executable(
 			"someip_planning_bridge_node", "CONTROL_LINK_ENABLE_SOMEIP")
@@ -299,11 +307,10 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		actions.append(bridge_node)
 		if start_source:
 			actions.append(edge_supervisor)
-	elif planning_transport == "someip":
+	elif planning_transport in ("someip", "grpc"):
 		actions.append(bridge_node)
 		actions.append(LogInfo(msg=(
-			"SOME/IP planning uses an external someip_planning_client with its own explicit "
-			"vsomeip configuration; start_source does not start a ROS planning publisher")))
+			planning_transport + " planning uses an external installed client; start_source does not start a ROS planning publisher")))
 	elif start_source:
 		actions.append(source_node)
 	if start_secondary_source:
@@ -358,7 +365,7 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"planning_transport",
 			default_value="ros2",
-			description="Mutually exclusive planning ingress: ros2, optional edge or someip",
+			description="Mutually exclusive planning ingress: ros2, optional edge, someip or grpc",
 		),
 		DeclareLaunchArgument(
 			"network_config_path",
@@ -373,7 +380,7 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"source_id",
 			default_value="planning",
-			description="ROS2 source used in ros2 mode; edge/someip fix this to planning",
+			description="ROS2 source used in ros2 mode; edge/someip/grpc fix this to planning",
 		),
 		DeclareLaunchArgument(
 			"edge_command_channel",

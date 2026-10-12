@@ -27,7 +27,7 @@ def check_contract(configuration):
     if planning != {
         "source_id": "planning", "transport": "ros2",
         "allowed_transports": ["ros2", "edge", "someip", "grpc"],
-        "runtime_available_transports": ["ros2", "edge", "someip"], "exclusive": True,
+        "runtime_available_transports": ["ros2", "edge", "someip", "grpc"], "exclusive": True,
     }:
         raise ValueError("planning transport selection must stay exclusive and truthful")
     for protocol in ("someip", "grpc", "mqtt"):

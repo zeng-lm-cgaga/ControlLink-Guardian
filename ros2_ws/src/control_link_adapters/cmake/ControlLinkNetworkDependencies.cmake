@@ -5,7 +5,7 @@ set(_CONTROL_LINK_NETWORK_DEPENDENCIES_INCLUDED TRUE)
 include("${CMAKE_CURRENT_LIST_DIR}/ControlLinkNetworkDependencyLock.cmake")
 
 option(CONTROL_LINK_ENABLE_SOMEIP "Find optional vsomeip dependencies; adapters create the SOME/IP runtime targets" OFF)
-option(CONTROL_LINK_ENABLE_GRPC "P0 gRPC/Protobuf dependency probe only; no production gRPC adapter" OFF)
+option(CONTROL_LINK_ENABLE_GRPC "Find locked gRPC dependencies; adapters create the optional async runtime targets" OFF)
 option(CONTROL_LINK_ENABLE_MQTT "P0 Paho dependency probe only; no production MQTT adapter" OFF)
 
 function(_control_link_require_target target_name)

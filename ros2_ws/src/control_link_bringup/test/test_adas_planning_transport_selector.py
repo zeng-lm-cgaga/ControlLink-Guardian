@@ -92,8 +92,8 @@ class PlanningTransportSelector(unittest.TestCase):
 		self.assertEqual(len(planning), 1)
 		self.assertFalse(any("bridge" in action.get("executable", "") for action in actions))
 
-	def test_unimplemented_grpc_and_unknown_selector_fail(self):
-		for selector in ("grpc", "mqtt", "unknown"):
+	def test_unimplemented_mqtt_and_unknown_selector_fail(self):
+		for selector in ("mqtt", "unknown"):
 			with self.subTest(selector=selector):
 				with self.assertRaisesRegex(RuntimeError, "planning_transport must be"):
 					self.actions(planning_transport=selector)
@@ -102,11 +102,17 @@ class PlanningTransportSelector(unittest.TestCase):
 		with self.assertRaisesRegex(RuntimeError, "CONTROL_LINK_ENABLE_SOMEIP=ON"):
 			self.actions(planning_transport="someip")
 
-	def test_someip_non_executable_bridge_fails(self):
-		path = self.install_executable("someip_planning_bridge_node")
-		path.chmod(0o644)
-		with self.assertRaisesRegex(RuntimeError, "missing="):
-			self.actions(planning_transport="someip")
+	def test_grpc_without_installed_bridge_fails_clearly(self):
+		with self.assertRaisesRegex(RuntimeError, "CONTROL_LINK_ENABLE_GRPC=ON"):
+			self.actions(planning_transport="grpc")
+
+	def test_network_non_executable_bridge_fails(self):
+		for selector in ("someip", "grpc"):
+			with self.subTest(selector=selector):
+				path = self.install_executable(selector + "_planning_bridge_node")
+				path.chmod(0o644)
+				with self.assertRaisesRegex(RuntimeError, "missing="):
+					self.actions(planning_transport=selector)
 
 	def test_someip_needs_explicit_runtime_config_even_if_environment_has_one(self):
 		self.install_executable("someip_planning_bridge_node")
@@ -134,24 +140,42 @@ class PlanningTransportSelector(unittest.TestCase):
 		self.assertFalse(any(action.get("executable") == "mock_control_source_node" for action in actions))
 		self.assertFalse(any(action["action"] == "process" for action in actions))
 
-	def test_someip_explicit_network_config_is_not_silently_replaced(self):
-		self.install_executable("someip_planning_bridge_node")
+	def test_grpc_default_network_config_without_vsomeip_reaches_bridge(self):
+		self.install_executable("grpc_planning_bridge_node")
+		with patch.dict("os.environ", {"VSOMEIP_CONFIGURATION": "unused-for-grpc.json"}):
+			actions = self.actions(planning_transport="grpc", vsomeip_config_path="")
+		bridges = [action for action in actions if action.get("executable") == "grpc_planning_bridge_node"]
+		self.assertEqual(len(bridges), 1)
+		parameters = bridges[0]["parameters"][0]
+		self.assertEqual(parameters["network_config_path"], str(self.network_config))
+		self.assertEqual(parameters["source_id"], "planning")
+		self.assertNotIn("vsomeip_config_path", parameters)
+		self.assertNotIn("VSOMEIP_CONFIGURATION", bridges[0]["additional_env"])
+		self.assertFalse(any(action.get("executable") == "mock_control_source_node" for action in actions))
+		self.assertFalse(any(action["action"] == "process" for action in actions))
+
+	def test_network_explicit_config_is_not_silently_replaced(self):
 		alternate = self.directory / "alternate-network.yaml"
 		alternate.write_text("schema_version: 1\n")
-		actions = self.actions(planning_transport="someip", network_config_path=str(alternate))
-		bridge = next(action for action in actions if action.get("executable") == "someip_planning_bridge_node")
-		self.assertEqual(bridge["parameters"][0]["network_config_path"], str(alternate))
-		with self.assertRaisesRegex(RuntimeError, "network_config_path must"):
-			self.actions(planning_transport="someip", network_config_path=str(self.directory / "missing.yaml"))
+		for selector in ("someip", "grpc"):
+			with self.subTest(selector=selector):
+				self.install_executable(selector + "_planning_bridge_node")
+				actions = self.actions(planning_transport=selector, network_config_path=str(alternate))
+				bridge = next(action for action in actions if action.get("executable") == selector + "_planning_bridge_node")
+				self.assertEqual(bridge["parameters"][0]["network_config_path"], str(alternate))
+				for invalid_path in ("relative.yaml", str(self.directory / "missing.yaml")):
+					with self.subTest(path=invalid_path):
+						with self.assertRaisesRegex(RuntimeError, "network_config_path must"):
+							self.actions(planning_transport=selector, network_config_path=invalid_path)
 
 	def test_network_planning_source_identity_cannot_be_changed(self):
-		for selector in ("edge", "someip"):
+		for selector in ("edge", "someip", "grpc"):
 			with self.subTest(selector=selector):
 				with self.assertRaisesRegex(RuntimeError, "fixes source binding to planning"):
 					self.actions(planning_transport=selector, source_id="teleop")
 
 	def test_network_mode_rejects_second_ros_planning_publisher(self):
-		for selector in ("edge", "someip"):
+		for selector in ("edge", "someip", "grpc"):
 			with self.subTest(selector=selector):
 				with self.assertRaisesRegex(RuntimeError, "cannot start a second ROS planning publisher"):
 					self.actions(
@@ -159,13 +183,15 @@ class PlanningTransportSelector(unittest.TestCase):
 						start_secondary_source="true",
 						secondary_source_id="planning")
 
-	def test_external_someip_allows_ros_teleop_without_bundled_source(self):
-		self.install_executable("someip_planning_bridge_node")
-		actions = self.actions(
-			planning_transport="someip", start_source="false", start_secondary_source="true")
-		timer = next(action for action in actions if action["action"] == "timer")
-		self.assertEqual(timer["actions"][0]["name"], "mock_source_teleop")
-		self.assertFalse(any(action.get("name") == "mock_source_planning" for action in actions))
+	def test_external_network_allows_ros_teleop_without_bundled_source(self):
+		for selector in ("someip", "grpc"):
+			with self.subTest(selector=selector):
+				self.install_executable(selector + "_planning_bridge_node")
+				actions = self.actions(
+					planning_transport=selector, start_source="false", start_secondary_source="true")
+				timer = next(action for action in actions if action["action"] == "timer")
+				self.assertEqual(timer["actions"][0]["name"], "mock_source_teleop")
+				self.assertFalse(any(action.get("name") == "mock_source_planning" for action in actions))
 
 	def test_edge_mode_still_uses_existing_supervisor(self):
 		for name in ("edge_planning_bridge_node", "edge_planning_client", "edge_planning_supervisor"):

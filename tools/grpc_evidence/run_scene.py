@@ -27,6 +27,8 @@ def main():
     parser.add_argument("--report", required=True)
     parser.add_argument("--probe", required=True)
     parser.add_argument("--domain", required=True, type=int)
+    parser.add_argument("--arbitration-only", action="store_true")
+    parser.add_argument("--teleop-executable", required=True)
     args = parser.parse_args()
     root, report = Path(args.root).resolve(), Path(args.report).resolve()
     report.mkdir(parents=True, exist_ok=False)
@@ -71,9 +73,12 @@ def main():
         service = launch("launch", ["ros2", "launch", "control_link_bringup", "adas_vcan_demo.launch.py",
             "planning_transport:=grpc", "start_source:=false", "can_interface:=vcan0"])
         time.sleep(2)
+        if service.poll() is not None:
+            raise RuntimeError("gRPC launch failed before independent client start")
         probe = launch("probe", [str(Path(args.probe).resolve()), "--config",
             str(root / "config/adas/protocol_transports.yaml"), "--precondition-dir", str(gates),
-            "--period-ms", "50", "--keep-period-ms", "1000"], client_environment)
+            "--period-ms", "50", "--keep-period-ms", "1000"] +
+            (["--arbitration-only"] if args.arbitration_only else []), client_environment)
         events["probe_identity"] = process_identity(probe.pid)
         live = LiveCapture(capture)
         mapping = judge.load_can_map((root / "config/adas/can_signal_map.yaml").read_bytes())
@@ -96,13 +101,14 @@ def main():
                         judge.publish_json(gates / (phase + ".ok"), proof)
                         handled.add(phase)
                 if record["event"] == "phase_begin" and phase == "teleop_arbitration" and teleop is None:
-                    teleop = launch("teleop", ["ros2", "run", "control_link_adapters", "mock_control_source_node",
+                    teleop = launch("teleop", [str(Path(args.teleop_executable).resolve(strict=True)),
                         "--ros-args", "-p", "profile_path:=" + str(root / "config/adas/adas_profile.yaml"),
                         "-p", "config_root:=" + str(root / "config"), "-p", "source_id:=teleop",
                         "-p", "publish_rate_hz:=20.0"])
                     events["teleop_started"] = marker()
+                    events["teleop_identity"] = process_identity(teleop.pid)
                     teleop_started_at = time.monotonic()
-            if teleop is not None and teleop_started_at is not None and time.monotonic() - teleop_started_at >= 2:
+            if teleop is not None and teleop_started_at is not None and time.monotonic() - teleop_started_at >= 3:
                 events["teleop_exit"] = stop(teleop)
                 events["teleop_released"] = marker()
                 teleop_started_at = None

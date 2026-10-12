@@ -91,6 +91,7 @@ struct Options {
   std::uint32_t max_run_seconds{90};
   std::uint32_t keep_period_ms{1000};
   bool smoke_only{false};
+  bool arbitration_only{false};
 };
 
 Options options(int argc, char **argv) {
@@ -98,6 +99,7 @@ Options options(int argc, char **argv) {
   for (int index = 1; index < argc; ++index) {
     const std::string option = argv[index];
     if (option == "--smoke-only") { result.smoke_only = true; continue; }
+    if (option == "--arbitration-only") { result.arbitration_only = true; continue; }
     if (++index == argc) throw std::invalid_argument("Missing value for " + option);
     const std::string value = argv[index];
     if (option == "--config") result.config = value;
@@ -185,6 +187,10 @@ class Probe final {
     wait_ready(std::min(deadline_, Steady::now() + std::chrono::seconds(35)));
     end();
     valid_phase("normal", 3000);
+    if (arguments_.arbitration_only) {
+      arbitration_and_close();
+      return;
+    }
 
     if (!arguments_.smoke_only) {
       fault_phase("duplicate");
@@ -251,6 +257,12 @@ class Probe final {
     end();
     valid_phase("new_session_normal", 3000);
 
+    arbitration_and_close();
+  }
+
+ private:
+  void arbitration_and_close() {
+
     // 仲裁专窗由 runner 划分 teleop/释放恢复子窗，不混入 planning-only 判据。
     begin("teleop_arbitration", true, 6000, false);
     interval(6000, "valid");
@@ -272,7 +284,6 @@ class Probe final {
         ",\"rpc_fixture_complete\":true,\"business_verdict\":\"EXTERNAL_JUDGE_REQUIRED\"");
   }
 
- private:
   Options arguments_;
   transport::Config config_;
   transport::GrpcClient client_;
@@ -766,7 +777,7 @@ class Probe final {
 int main(int argc, char **argv) {
   if (argc == 2 && std::string(argv[1]) == "--help") {
     std::cout << "--config YAML [--address 127.0.0.1:50051] [--period-ms 50 --keep-period-ms 1000] "
-        "--precondition-dir DIR [--max-run-seconds 90] [--smoke-only]" << std::endl;
+        "--precondition-dir DIR [--max-run-seconds 90] [--smoke-only | --arbitration-only]" << std::endl;
     return 0;
   }
   try {

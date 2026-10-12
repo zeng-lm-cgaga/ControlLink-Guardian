@@ -83,7 +83,7 @@ public:
 			std::find(profile.common.enabled_sources.begin(), profile.common.enabled_sources.end(),
 				"planning") == profile.common.enabled_sources.end())
 		{
-			throw std::invalid_argument("SOME/IP planning requires enabled ControlCommand source");
+			throw std::invalid_argument("Network planning requires enabled ControlCommand source");
 		}
 		source_topic_ = policy.topic;
 		wire::Capabilities capabilities;
@@ -362,7 +362,7 @@ private:
 					}))
 				{
 					admission_pending_ = false;
-					RCLCPP_INFO(get_logger(), "Gateway admitted SOME/IP epoch=%llu stable USABLE count=1 actual GID",
+					RCLCPP_INFO(get_logger(), "Gateway admitted network ingress epoch=%llu stable USABLE count=1 actual GID",
 						static_cast<unsigned long long>(admission_epoch_));
 				}
 			}

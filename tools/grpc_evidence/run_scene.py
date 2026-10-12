@@ -93,6 +93,8 @@ def main():
             observations = records(log)
             for record in observations:
                 phase = record.get("phase")
+                if record["event"] == "phase_begin" and phase == "normal" and "probe_live_identity" not in events:
+                    events["probe_live_identity"] = process_identity(probe.pid)
                 if record["event"] == "fault_ready_request" and phase not in handled:
                     gid = live.active(mapping, record["wall_clock_ns"])
                     if gid == record["gid"]:
@@ -109,6 +111,8 @@ def main():
                     events["teleop_identity"] = process_identity(teleop.pid)
                     teleop_started_at = time.monotonic()
             if teleop is not None and teleop_started_at is not None and time.monotonic() - teleop_started_at >= 3:
+                if teleop.poll() is None:
+                    events["teleop_live_identity"] = process_identity(teleop.pid)
                 events["teleop_exit"] = stop(teleop)
                 events["teleop_released"] = marker()
                 teleop_started_at = None

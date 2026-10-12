@@ -1,7 +1,10 @@
 #include "control_link_someip_transport/config.hpp"
+#include "control_link_edge_protocol/protocol.hpp"
+#include "control_link_network_v1.pb.h"
 
 #include <arpa/inet.h>
 
+#include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
@@ -20,8 +23,127 @@
 namespace control_link::someip {
 namespace {
 
+// 656B 只是固定 protobuf 字段的保守配置初筛，不是实际装配可用容量；
+// 占 holder/网络启动前还须以真实 Capabilities/RMW 调用 validate_protocol_payload_budget。
+constexpr std::uint32_t kMinimumBoundedProtocolPayloadBytes = 656;
+
 [[noreturn]] void invalid(const std::string &field, const std::string &reason) {
   throw std::invalid_argument("SOME/IP config " + field + ": " + reason);
+}
+
+// 仅组装本 adapter 必需的有界字段；开放文本使用实际装配身份，不虚构长度上界。
+// ROS 字段按原 msg 整数宽度保留，包括标为 INVALID 的原观察；这不是业务合法性判断。
+std::size_t mandatory_payload_bytes(const ::control_link::network::v1::Capabilities &capabilities,
+                                    const std::string &rmw) {
+  namespace wire = ::control_link::network::v1;
+  namespace codec = control_link_edge_protocol;
+  const auto maximum8 = std::numeric_limits<std::uint8_t>::max();
+  const auto maximum16 = std::numeric_limits<std::uint16_t>::max();
+  const auto maximum32 = std::numeric_limits<std::uint32_t>::max();
+  const auto maximum64 = std::numeric_limits<std::uint64_t>::max();
+  wire::PublisherIdentity publisher;
+  publisher.set_gid(std::string(24, 'g'));
+  publisher.set_rmw_implementation(rmw);
+  wire::ObservationMetadata observation;
+  observation.set_observed_system_ns(-1);
+  observation.set_received_boottime_ns(maximum64);
+  observation.set_validity(wire::OBSERVATION_VALIDITY_INVALID);
+  wire::OpenSessionResponse response;
+  *response.mutable_capabilities() = capabilities;
+  response.set_result(wire::SESSION_OPERATION_RESULT_ADMITTED);
+  response.set_open_request_id(std::string(codec::kSessionTokenSize, 'o'));
+  auto *session = response.mutable_session();
+  session->set_session_token(std::string(codec::kSessionTokenSize, 't'));
+  session->set_planning_transport(wire::PLANNING_TRANSPORT_SOMEIP);
+  session->set_connection_state(wire::CONNECTION_STATE_CONNECTED);
+  session->set_submission_ready(true);
+  *session->mutable_ingress_publisher() = publisher;
+  session->set_clock_domain(wire::CLOCK_DOMAIN_SYSTEM);
+  session->set_control_session_state(wire::CONTROL_SESSION_STATE_ADMITTED);
+  wire::StatusEnvelope envelope;
+  envelope.set_schema_version(1);
+  envelope.set_schema_fingerprint(capabilities.schema_fingerprint());
+  envelope.set_publisher_instance_token(std::string(codec::kSessionTokenSize, 't'));
+  envelope.set_publication_sequence(maximum64);
+  envelope.set_published_system_ns(-1);
+  envelope.set_published_boottime_ns(maximum64);
+  auto *snapshot = envelope.mutable_status();
+  *snapshot->mutable_session() = *session;
+  snapshot->mutable_session()->clear_session_token();
+  auto *counters = snapshot->mutable_transport();
+  counters->set_rpc_received_count(maximum64);
+  counters->set_forwarded_count(maximum64);
+  counters->set_missed_count(maximum64);
+  counters->set_dropped_count(maximum64);
+  counters->set_protocol_rejected_count(maximum64);
+  counters->set_connection_state(wire::CONNECTION_STATE_CONNECTED);
+  auto *forwarded = snapshot->mutable_latest_forwarded();
+  forwarded->mutable_key()->set_source_sequence(maximum64);
+  *forwarded->mutable_publisher() = publisher;
+  forwarded->set_forwarded_boottime_ns(maximum64);
+  auto *gateway = snapshot->mutable_gateway();
+  *gateway->mutable_observation() = observation;
+  gateway->set_state(maximum8);
+  gateway->set_reason_code(maximum16);
+  // 此处可观测 teleop 等来源；32B grammar 的唯一 owner 为公共 Contract parser。
+  gateway->set_active_source_id(std::string(32, 's'));
+  gateway->set_active_source_sequence(maximum64);
+  gateway->set_active_command_age_ms(1.0);
+  gateway->set_recovery_valid_count(maximum16);
+  gateway->set_transition_sequence(maximum64);
+  auto *source = snapshot->add_sources();
+  *source->mutable_observation() = observation;
+  source->set_source_id("planning");
+  source->set_priority(maximum8);
+  source->set_enabled(true);
+  source->set_lease_valid(true);
+  source->set_command_valid(true);
+  source->set_last_reject_reason(maximum16);
+  source->set_last_source_sequence(maximum64);
+  source->set_command_age_ms(1.0);
+  source->set_accepted_count(maximum64);
+  source->set_rejected_count(maximum64);
+  source->set_endpoint_stable(true);
+  source->set_endpoint_state(maximum8);
+  source->set_endpoint_publisher_count(maximum32);
+  source->set_endpoint_generation_valid(true);
+  *source->mutable_endpoint_publisher() = publisher;
+  auto *vehicle = snapshot->mutable_vehicle();
+  *vehicle->mutable_observation() = observation;
+  vehicle->set_state(maximum8);
+  vehicle->set_fault_code(maximum16);
+  vehicle->set_linear_velocity_mps(1.0);
+  vehicle->set_angular_velocity_radps(1.0);
+  vehicle->set_rolling_counter(maximum8);
+  auto *acceptance = snapshot->mutable_latest_gateway_acceptance();
+  acceptance->set_state(wire::GATEWAY_ACCEPTANCE_STATE_LATEST_KEY_OBSERVED);
+  acceptance->mutable_key()->set_source_sequence(maximum64);
+  *acceptance->mutable_publisher() = publisher;
+  *acceptance->mutable_source_observation() = observation;
+  acceptance->set_accepted_count(maximum64);
+  wire::SubmitReceipt receipt;
+  *receipt.mutable_key() = forwarded->key();
+  receipt.mutable_key()->set_session_token(session->session_token());
+  receipt.set_rpc_received(true);
+  receipt.set_forwarding_state(wire::FORWARDING_STATE_FORWARDED);
+  *receipt.mutable_forwarded() = *forwarded;
+  receipt.mutable_forwarded()->mutable_key()->set_session_token(session->session_token());
+  *receipt.mutable_gateway_acceptance() = *acceptance;
+  receipt.mutable_gateway_acceptance()->mutable_key()->set_session_token(session->session_token());
+  receipt.set_rpc_received_boottime_ns(maximum64);
+  receipt.set_schema_version(1);
+  auto required = static_cast<std::size_t>(kMinimumBoundedProtocolPayloadBytes);
+  for (const auto *message : std::array<const google::protobuf::Message *, 3>{&response, &envelope, &receipt}) {
+    if (message->ByteSizeLong() > std::numeric_limits<std::uint32_t>::max()) {
+      invalid("max_payload_bytes", "mandatory protocol payload exceeds uint32 capacity");
+    }
+    std::string serialized;
+    if (!message->SerializeToString(&serialized)) {
+      invalid("max_payload_bytes", "mandatory protocol payload cannot be serialized");
+    }
+    required = std::max(required, serialized.size());
+  }
+  return required;
 }
 
 void check_duplicates(const YAML::Node &node, const std::string &path,
@@ -334,8 +456,13 @@ void validate_config(const Config &config) {
   if (config.gateway_eventgroup == 0 || config.gateway_eventgroup == UINT16_MAX ||
       config.vehicle_eventgroup == 0 || config.vehicle_eventgroup == UINT16_MAX ||
       config.gateway_eventgroup == config.vehicle_eventgroup) invalid("eventgroups", "reserved or duplicate group id");
-  if (config.max_payload_bytes < 64 || config.readonly_inflight_limit == 0 || config.retired_open_capacity == 0) {
-    invalid("resources", "payload must fit codec; capacities must be positive");
+  if (config.max_payload_bytes < kMinimumBoundedProtocolPayloadBytes) {
+    invalid("max_payload_bytes", "must be at least " +
+        std::to_string(kMinimumBoundedProtocolPayloadBytes) +
+        " bytes for mandatory session/capability/status fields, not just the 64B command codec");
+  }
+  if (config.readonly_inflight_limit == 0 || config.retired_open_capacity == 0) {
+    invalid("resources", "capacities must be positive");
   }
   if (config.keep_period_ms == 0 || config.idle_timeout_ms <= config.keep_period_ms) invalid("keep/idle", "keep must be positive and shorter than idle budget");
   if (config.status_event_period_ms == 0 || config.status_event_period_ms > config.idle_timeout_ms) {
@@ -348,6 +475,29 @@ void validate_config(const Config &config) {
     invalid("graph", "positive probe/quiet/readiness budgets must fit the admission timeout");
   }
   queue_budget(config);
+}
+
+std::size_t required_protocol_payload_bytes(
+    const ::control_link::network::v1::Capabilities &capabilities,
+    const std::string &rmw_implementation) {
+  if (rmw_implementation.empty()) invalid("rmw_implementation", "actual nonempty runtime identity is required");
+  auto normalized = capabilities;
+  normalized.set_schema_version(1);
+  // PlanningIngress 同样规范到 V1/32B fingerprint；字节内容不影响 wire 长度。
+  normalized.set_schema_fingerprint(std::string(32, 'f'));
+  return mandatory_payload_bytes(normalized, rmw_implementation);
+}
+
+void validate_protocol_payload_budget(
+    const Config &config, const ::control_link::network::v1::Capabilities &capabilities,
+    const std::string &rmw_implementation) {
+  validate_config(config);
+  const auto required = required_protocol_payload_bytes(capabilities, rmw_implementation);
+  if (config.max_payload_bytes < required) {
+    invalid("max_payload_bytes", "PAYLOAD_CAPACITY: actual capabilities/RMW and mandatory "
+        "session/status fields require at least " + std::to_string(required) +
+        " bytes; configured " + std::to_string(config.max_payload_bytes));
+  }
 }
 
 std::string vsomeip_configuration_json(const Config &config, const std::string &application_name,

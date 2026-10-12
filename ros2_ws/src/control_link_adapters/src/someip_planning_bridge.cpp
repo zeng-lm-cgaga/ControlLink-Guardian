@@ -8,6 +8,7 @@
 #include <variant>
 
 #include "control_link_adapters/graph_admission_policy.hpp"
+#include "someip_observation.hpp"
 #include "control_link_contract/contract_bundle.hpp"
 #include "control_link_contract/qos_factory.hpp"
 #include "control_link_interfaces/msg/control_command.hpp"
@@ -29,23 +30,6 @@ using SourceStatus = control_link_interfaces::msg::SourceStatus;
 using VehicleState = control_link_interfaces::msg::VehicleState;
 using SteadyClock = std::chrono::steady_clock;
 
-static std::int64_t system_stamp_ns(const builtin_interfaces::msg::Time &stamp)
-{
-	return static_cast<std::int64_t>(stamp.sec) * 1'000'000'000LL + stamp.nanosec;
-}
-
-static void set_observation(
-	wire::ObservationMetadata *observation,
-	const builtin_interfaces::msg::Time &stamp,
-	std::uint64_t received)
-{
-	observation->set_observed_system_ns(system_stamp_ns(stamp));
-	observation->set_received_boottime_ns(received);
-	observation->set_validity(stamp.nanosec < 1'000'000'000U &&
-		system_stamp_ns(stamp) > 0 && received > 0 ?
-		wire::OBSERVATION_VALIDITY_VALID : wire::OBSERVATION_VALIDITY_INVALID);
-}
-
 class SomeipPlanningBridge final : public rclcpp::Node
 {
 public:
@@ -60,6 +44,7 @@ public:
 			throw std::invalid_argument("SOME/IP requires explicit config_root/profile/network/vsomeip configuration paths");
 		}
 		bundle_ = control_link_contract::load_contract_bundle(profile_path, config_root);
+		observation_budgets_ = someip_observation_budgets(*bundle_->gateway_contract);
 		const auto &profile = std::get<control_link_contract::AdasProfile>(*bundle_->profile);
 		if (profile.common.clock_mode != control_link_contract::ClockMode::kSystem)
 		{
@@ -90,6 +75,8 @@ public:
 		capabilities.set_max_status_bytes(config_.max_payload_bytes);
 		capabilities.set_max_pending_targets(1);
 		capabilities.set_max_status_subscribers(config_.readonly_inflight_limit);
+		net::validate_protocol_payload_budget(
+			config_, capabilities, rmw_get_implementation_identifier());
 		ingress_ = std::make_shared<net::PlanningIngress>(config_, capabilities);
 		resource_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 		feedback_group_ = create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -128,7 +115,7 @@ private:
 				ingress_->update_observations([&](wire::StatusSnapshot &status)
 				{
 					auto *target = status.mutable_gateway();
-					set_observation(target->mutable_observation(), message->observed_at, received);
+					set_someip_observation(target->mutable_observation(), message->observed_at, received);
 					target->set_state(message->state);
 					target->set_reason_code(message->reason_code);
 					target->set_active_source_id(message->active_source_id);
@@ -148,7 +135,7 @@ private:
 				{
 					status.clear_sources();
 					auto *target = status.add_sources();
-					set_observation(target->mutable_observation(), message->observed_at, received);
+					set_someip_observation(target->mutable_observation(), message->observed_at, received);
 					target->set_source_id(message->source_id);
 					target->set_priority(message->priority);
 					target->set_enabled(message->enabled);
@@ -176,12 +163,7 @@ private:
 				ingress_->update_observations([&](wire::StatusSnapshot &status)
 				{
 					auto *target = status.mutable_vehicle();
-					set_observation(target->mutable_observation(), message->observed_at, received);
-					target->set_state(message->state);
-					target->set_fault_code(message->fault_code);
-					target->set_linear_velocity_mps(message->linear_velocity_mps);
-					target->set_angular_velocity_radps(message->angular_velocity_radps);
-					target->set_rolling_counter(message->rolling_counter);
+					set_someip_vehicle_observation(target, *message, received);
 				});
 			}, options);
 	}
@@ -193,9 +175,7 @@ private:
 		const auto now_boot = net::boottime_now_ns();
 		const auto now_system = net::system_now_ns();
 		const auto &observation = source.observation();
-		const auto &topic = bundle_->gateway_contract->state_topics.at("source_status");
-		const auto budget_ns = bundle_->gateway_contract->qos_profiles.at(
-			topic.qos_profile.value()).liveliness_lease_duration_ms.value() * 1'000'000ULL;
+		const auto budget_ns = observation_budgets_.source_ms * 1'000'000ULL;
 		if (observation.received_boottime_ns() == 0 || now_boot < observation.received_boottime_ns() ||
 			now_boot - observation.received_boottime_ns() > budget_ns || now_system <= 0 ||
 			observation.observed_system_ns() <= 0 ||
@@ -236,15 +216,9 @@ private:
 					metadata->set_validity(wire::OBSERVATION_VALIDITY_STALE);
 				}
 			};
-			const auto &contract = *bundle_->gateway_contract;
-			const auto state_budget = [&](const std::string &group)
-			{
-				const auto &topic = contract.state_topics.at(group);
-				return contract.qos_profiles.at(topic.qos_profile.value()).liveliness_lease_duration_ms.value();
-			};
-			if (status.has_gateway()) expire(status.mutable_gateway()->mutable_observation(), state_budget("gateway_state"));
-			for (auto &source : *status.mutable_sources()) expire(source.mutable_observation(), state_budget("source_status"));
-			if (status.has_vehicle()) expire(status.mutable_vehicle()->mutable_observation(), contract.gateway.vehicle_state_topic_timeout_ms);
+			if (status.has_gateway()) expire(status.mutable_gateway()->mutable_observation(), observation_budgets_.gateway_ms);
+			for (auto &source : *status.mutable_sources()) expire(source.mutable_observation(), observation_budgets_.source_ms);
+			if (status.has_vehicle()) expire(status.mutable_vehicle()->mutable_observation(), observation_budgets_.vehicle_ms);
 		});
 	}
 
@@ -389,6 +363,7 @@ private:
 	}
 
 	control_link_contract::ContractBundlePtr bundle_;
+	SomeipObservationBudgets observation_budgets_{};
 	net::Config config_;
 	std::shared_ptr<net::PlanningIngress> ingress_;
 	std::unique_ptr<net::SomeipServer> server_;

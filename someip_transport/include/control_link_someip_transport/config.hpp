@@ -1,7 +1,12 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
+
+namespace control_link::network::v1 {
+class Capabilities;
+}
 
 namespace control_link::someip {
 
@@ -42,6 +47,15 @@ struct Config {
 // 缺失、重复、越界或非本版本字段抛出 std::invalid_argument；不探测网络依赖。
 Config load_config(const std::string &path);
 void validate_config(const Config &config);
+
+// 使用实际 Contract/hash/RMW 与单一生产 schema shape，计算必需握手/状态容量。
+// 默认配置初筛不能替代此装配前检查；不改变业务时效、原消息或开放文本长度。
+std::size_t required_protocol_payload_bytes(
+    const ::control_link::network::v1::Capabilities &capabilities,
+    const std::string &rmw_implementation);
+void validate_protocol_payload_budget(
+    const Config &config, const ::control_link::network::v1::Capabilities &capabilities,
+    const std::string &rmw_implementation);
 
 // 启动前核对实际JSON与同一配置owner，禁止手写JSON静默覆盖SD、payload或队列预算。
 // app ID、routing域和具体unicast是显式装配身份；其余字段须匹配本库生成契约。

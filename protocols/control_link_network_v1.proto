@@ -143,6 +143,8 @@ message ObservationMetadata {
   oneof received_boottime_presence {
     uint64 received_boottime_ns = 2;
   }
+  // 表示整组原始观测的结构与时效；VALID不只是timestamp有效，也不是业务健康或任务ACK。
+  // Vehicle组未知state或非finite速度必须INVALID，保留坏原值/原时间供诊断；新合法样本可恢复。
   ObservationValidity validity = 3;
 }
 

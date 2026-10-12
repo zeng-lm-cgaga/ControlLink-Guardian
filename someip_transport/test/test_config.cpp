@@ -1,4 +1,5 @@
 #include "control_link_someip_transport/config.hpp"
+#include "control_link_someip_transport/ingress.hpp"
 
 #include <unistd.h>
 
@@ -66,6 +67,180 @@ void rejects_change(const std::string &needle, const std::string &replacement) {
   yaml.replace(offset, needle.size(), replacement);
   const TemporaryConfig file(yaml);
   EXPECT_THROW(load_config(file.path()), std::invalid_argument) << needle << " -> " << replacement;
+}
+
+wire::Capabilities capacity_capabilities(const Config &config) {
+  wire::Capabilities capabilities;
+  capabilities.set_schema_version(1);
+  const auto contract_path = std::filesystem::path(source_config_path()).parent_path().parent_path() /
+      "common/gateway_contract.yaml";
+  capabilities.set_contract_id(YAML::LoadFile(contract_path.string())["contract_id"].as<std::string>());
+  capabilities.set_contract_hash(std::string(64, 'a'));
+  capabilities.set_decision_config_hash(std::string(64, 'b'));
+  capabilities.set_planning_transport(wire::PLANNING_TRANSPORT_SOMEIP);
+  capabilities.set_max_command_bytes(control_link_edge_protocol::kCommandFrameSize);
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  capabilities.set_max_pending_targets(1);
+  capabilities.set_max_status_subscribers(config.readonly_inflight_limit);
+  return capabilities;
+}
+
+TEST(SomeipConfig, RejectsPayloadBelowMandatoryProtocolFloorBeforeCreatingHolder) {
+  auto config = load_config(source_config_path());
+  const auto capabilities = capacity_capabilities(config);
+  for (const auto capacity : {0U, 63U, 64U, 95U, 143U, 655U}) {
+    SCOPED_TRACE(capacity);
+    config.max_payload_bytes = capacity;
+    EXPECT_THROW(validate_config(config), std::invalid_argument);
+    EXPECT_THROW(PlanningIngress(config, capabilities), std::invalid_argument);
+    EXPECT_THROW(vsomeip_configuration_json(config, "server", 0x3101, "capacity-test", true),
+                 std::invalid_argument);
+    rejects_change("  max_payload_bytes: 4096", "  max_payload_bytes: " + std::to_string(capacity));
+  }
+  try {
+    validate_config(config);
+    FAIL() << "undersized payload must be rejected before initialization";
+  } catch (const std::invalid_argument &error) {
+    EXPECT_NE(std::string{error.what()}.find("max_payload_bytes"), std::string::npos);
+    EXPECT_NE(std::string{error.what()}.find("656"), std::string::npos);
+  }
+}
+
+TEST(SomeipConfig, ActualIdentityCapacityUsesSerializedProductionShapeAtExactBoundary) {
+  const auto original = load_config(source_config_path());
+  auto capabilities = capacity_capabilities(original);
+  const auto unchanged = capabilities.SerializeAsString();
+  const std::string rmw = "rmw_fastrtps_cpp";
+  const auto minimum = required_protocol_payload_bytes(capabilities, rmw);
+  ASSERT_GT(minimum, 656U);
+  ASSERT_LT(minimum, 4096U);
+  RecordProperty("required_payload_bytes", std::to_string(minimum));
+  EXPECT_EQ(capabilities.SerializeAsString(), unchanged);
+  auto document = YAML::Load(fixture_yaml());
+  document["someip"]["max_payload_bytes"] = minimum;
+  const TemporaryConfig file(YAML::Dump(document));
+  auto config = load_config(file.path());
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  ASSERT_EQ(required_protocol_payload_bytes(capabilities, rmw), minimum);
+  EXPECT_EQ(config.max_payload_bytes, minimum);
+  EXPECT_NO_THROW(validate_config(config));
+  EXPECT_NO_THROW(validate_protocol_payload_budget(config, capabilities, rmw));
+  EXPECT_NO_THROW(vsomeip_configuration_json(config, "server", 0x3101, "capacity-test", true));
+  config.max_payload_bytes = static_cast<std::uint32_t>(minimum - 1);
+  EXPECT_NO_THROW(validate_config(config));
+  EXPECT_THROW(validate_protocol_payload_budget(config, capabilities, rmw), std::invalid_argument);
+  EXPECT_EQ(load_config(source_config_path()).max_payload_bytes, 4096U);
+}
+
+TEST(SomeipConfig, ActualMinimumPayloadAllowsOpenRetryAndAdmittedKeepWithCapabilities) {
+  auto config = load_config(source_config_path());
+  auto capabilities = capacity_capabilities(config);
+  const std::string rmw = "rmw_fastrtps_cpp";
+  config.max_payload_bytes = static_cast<std::uint32_t>(required_protocol_payload_bytes(capabilities, rmw));
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  capabilities.set_max_status_subscribers(config.readonly_inflight_limit);
+  ASSERT_NO_THROW(validate_protocol_payload_budget(config, capabilities, rmw));
+  PlanningIngress ingress(config, capabilities);
+  wire::OpenSessionRequest open;
+  open.set_schema_version(1);
+  open.set_holder_nonce(std::string(16, 'n'));
+  open.set_open_request_id(std::string(16, 'o'));
+  const auto opening = ingress.open(0x3101, open, 1'000'000'000ULL);
+  ASSERT_EQ(opening.result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  EXPECT_LE(opening.SerializeAsString().size(), config.max_payload_bytes);
+  const auto epoch = ingress.snapshot().epoch;
+  const auto retry = ingress.open(0x3101, open, 1'000'000'001ULL);
+  ASSERT_EQ(retry.result(), wire::SESSION_OPERATION_RESULT_IDEMPOTENT);
+  EXPECT_EQ(ingress.snapshot().epoch, epoch);
+  EXPECT_EQ(retry.session().session_token(), opening.session().session_token());
+  EXPECT_LE(retry.SerializeAsString().size(), config.max_payload_bytes);
+  ASSERT_TRUE(ingress.bind_publisher(epoch, std::string(24, 'g'), rmw));
+  ASSERT_TRUE(ingress.set_admitted(epoch, true));
+  wire::KeepSessionRequest keep;
+  keep.set_schema_version(1);
+  keep.set_holder_nonce(open.holder_nonce());
+  keep.set_open_request_id(open.open_request_id());
+  keep.set_keepalive_sequence(1);
+  const auto admitted = ingress.keep(0x3101, keep, 1'000'000'002ULL);
+  ASSERT_EQ(admitted.result(), wire::SESSION_OPERATION_RESULT_ADMITTED);
+  ASSERT_TRUE(admitted.session().submission_ready());
+  EXPECT_EQ(admitted.session().session_token(), opening.session().session_token());
+  EXPECT_EQ(admitted.capabilities().schema_fingerprint().size(), 32U);
+  EXPECT_EQ(admitted.capabilities().contract_hash().size(), 64U);
+  EXPECT_EQ(admitted.capabilities().decision_config_hash().size(), 64U);
+  EXPECT_LE(admitted.SerializeAsString().size(), config.max_payload_bytes);
+}
+
+TEST(SomeipConfig, BudgetRejectsUnknownRmwAndCodecOnlyOrFixedFloorCapacity) {
+  auto config = load_config(source_config_path());
+  const auto capabilities = capacity_capabilities(config);
+  EXPECT_THROW(required_protocol_payload_bytes(capabilities, ""), std::invalid_argument);
+  EXPECT_THROW(validate_protocol_payload_budget(config, capabilities, ""), std::invalid_argument);
+  for (const auto capacity : {64U, 656U}) {
+    SCOPED_TRACE(capacity);
+    config.max_payload_bytes = capacity;
+    EXPECT_THROW(validate_protocol_payload_budget(config, capabilities, "rmw_fastrtps_cpp"),
+                 std::invalid_argument);
+  }
+}
+
+TEST(SomeipConfig, BudgetUsesActualUnboundedCapabilityAndRmwTextWithoutTruncation) {
+  auto config = load_config(source_config_path());
+  auto capabilities = capacity_capabilities(config);
+  capabilities.set_contract_id(std::string(4096, 'c'));
+  const std::string rmw = "rmw_fastrtps_cpp";
+  const auto minimum = required_protocol_payload_bytes(capabilities, rmw);
+  ASSERT_GT(minimum, config.max_payload_bytes);
+  EXPECT_THROW(validate_protocol_payload_budget(config, capabilities, rmw), std::invalid_argument);
+  EXPECT_THROW(PlanningIngress(config, capabilities), std::invalid_argument);
+  config.max_payload_bytes = static_cast<std::uint32_t>(minimum);
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  ASSERT_EQ(required_protocol_payload_bytes(capabilities, rmw), minimum);
+  EXPECT_NO_THROW(validate_protocol_payload_budget(config, capabilities, rmw));
+  EXPECT_NO_THROW(PlanningIngress(config, capabilities));
+  EXPECT_EQ(capabilities.contract_id(), std::string(4096, 'c'));
+  const std::string longer_rmw(2048, 'r');
+  const auto longer_minimum = required_protocol_payload_bytes(capabilities, longer_rmw);
+  ASSERT_GT(longer_minimum, minimum);
+  EXPECT_THROW(validate_protocol_payload_budget(config, capabilities, longer_rmw), std::invalid_argument);
+  config.max_payload_bytes = static_cast<std::uint32_t>(longer_minimum);
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  EXPECT_EQ(required_protocol_payload_bytes(capabilities, longer_rmw), longer_minimum);
+  EXPECT_NO_THROW(validate_protocol_payload_budget(config, capabilities, longer_rmw));
+  EXPECT_EQ(capabilities.contract_hash(), std::string(64, 'a'));
+  EXPECT_EQ(capabilities.decision_config_hash(), std::string(64, 'b'));
+}
+
+TEST(SomeipConfig, BindBudgetFailureRevokesBeforeWritingIdentityAndStaleEpochCannotRevokeNewHolder) {
+  auto config = load_config(source_config_path());
+  config.max_payload_bytes = 656;
+  auto capabilities = capacity_capabilities(config);
+  PlanningIngress ingress(config, capabilities);
+  wire::OpenSessionRequest request;
+  request.set_schema_version(1);
+  request.set_holder_nonce(std::string(16, 'n'));
+  request.set_open_request_id(std::string(16, 'o'));
+  ASSERT_EQ(ingress.open(0x3101, request, 1'000'000'000ULL).result(),
+            wire::SESSION_OPERATION_RESULT_OPENING);
+  const auto old_epoch = ingress.snapshot().epoch;
+  ASSERT_FALSE(ingress.bind_publisher(old_epoch, std::string(24, 'g'), "rmw_fastrtps_cpp"));
+  const auto revoked = ingress.snapshot();
+  EXPECT_EQ(revoked.state, wire::CONTROL_SESSION_STATE_REVOKING);
+  EXPECT_FALSE(revoked.session.submission_ready());
+  EXPECT_TRUE(revoked.session.ingress_publisher().gid().empty());
+  EXPECT_NE(revoked.failure.find("PAYLOAD_CAPACITY"), std::string::npos);
+  EXPECT_FALSE(ingress.set_admitted(old_epoch, true));
+  ASSERT_TRUE(ingress.finish_release(revoked.epoch));
+  request.set_holder_nonce(std::string(16, 'p'));
+  request.set_open_request_id(std::string(16, 'q'));
+  ASSERT_EQ(ingress.open(0x3101, request, 1'000'000'001ULL).result(),
+            wire::SESSION_OPERATION_RESULT_OPENING);
+  const auto new_epoch = ingress.snapshot().epoch;
+  EXPECT_FALSE(ingress.bind_publisher(old_epoch, std::string(24, 'g'), std::string(2048, 'r')));
+  EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_OPENING);
+  EXPECT_EQ(ingress.snapshot().epoch, new_epoch);
+  ASSERT_TRUE(ingress.bind_publisher(new_epoch, std::string(24, 'g'), "r"));
+  EXPECT_TRUE(ingress.set_admitted(new_epoch, true));
 }
 
 TEST(SomeipConfig, ReadsOwnerWithoutRequiringEnabledFlagOrNetworkLibraries) {

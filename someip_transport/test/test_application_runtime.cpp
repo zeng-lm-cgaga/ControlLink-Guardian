@@ -41,7 +41,8 @@ class RuntimeEnvironment final {
   }
   const std::string &path() const { return path_; }
  private:
-  const std::array<std::string, 2> names_{"VSOMEIP_CONFIGURATION", "VSOMEIP_CONFIGURATION_runtime_test"};
+  const std::array<std::string, 3> names_{
+      "VSOMEIP_CONFIGURATION", "VSOMEIP_CONFIGURATION_runtime_test", "VSOMEIP_CONFIGURATION_MODULE"};
   std::vector<std::optional<std::string>> original_;
   std::string path_;
 };
@@ -50,6 +51,42 @@ TEST(SomeipApplicationRuntime, BindsExplicitConfiguration) {
   RuntimeEnvironment environment;
   detail::bind_application_configuration("runtime_test", environment.path());
   EXPECT_EQ(std::string{std::getenv("VSOMEIP_CONFIGURATION")}, environment.path());
+}
+
+TEST(SomeipApplicationRuntime, AcceptsUnsetConfigurationModule) {
+  RuntimeEnvironment environment;
+  ASSERT_EQ(std::getenv("VSOMEIP_CONFIGURATION_MODULE"), nullptr);
+  EXPECT_NO_THROW(detail::bind_application_configuration("runtime_test", environment.path()));
+  EXPECT_EQ(std::getenv("VSOMEIP_CONFIGURATION_MODULE"), nullptr);
+  EXPECT_STREQ(std::getenv("VSOMEIP_CONFIGURATION"), environment.path().c_str());
+}
+
+TEST(SomeipApplicationRuntime, RejectsEmptyConfigurationModuleOverrideWithoutChangingEnvironment) {
+  RuntimeEnvironment environment;
+  ASSERT_EQ(::setenv("VSOMEIP_CONFIGURATION_MODULE", "", 1), 0);
+  try {
+    detail::bind_application_configuration("runtime_test", environment.path());
+    FAIL() << "An empty module override must be rejected before vsomeip initialization";
+  } catch (const std::invalid_argument &error) {
+    EXPECT_NE(std::string{error.what()}.find("VSOMEIP_CONFIGURATION_MODULE must be unset"),
+              std::string::npos);
+  }
+  EXPECT_STREQ(std::getenv("VSOMEIP_CONFIGURATION_MODULE"), "");
+  EXPECT_EQ(std::getenv("VSOMEIP_CONFIGURATION"), nullptr);
+}
+
+TEST(SomeipApplicationRuntime, RejectsNonemptyConfigurationModuleOverrideWithoutChangingEnvironment) {
+  RuntimeEnvironment environment;
+  ASSERT_EQ(::setenv("VSOMEIP_CONFIGURATION_MODULE", "libunvalidated-cfg.so", 1), 0);
+  try {
+    detail::bind_application_configuration("runtime_test", environment.path());
+    FAIL() << "A nonempty module override must be rejected before vsomeip initialization";
+  } catch (const std::invalid_argument &error) {
+    EXPECT_NE(std::string{error.what()}.find("VSOMEIP_CONFIGURATION_MODULE must be unset"),
+              std::string::npos);
+  }
+  EXPECT_STREQ(std::getenv("VSOMEIP_CONFIGURATION_MODULE"), "libunvalidated-cfg.so");
+  EXPECT_EQ(std::getenv("VSOMEIP_CONFIGURATION"), nullptr);
 }
 
 TEST(SomeipApplicationRuntime, RejectsApplicationSpecificConfigurationOverride) {

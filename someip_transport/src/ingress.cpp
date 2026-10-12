@@ -36,6 +36,16 @@ wire::Capabilities normalized_capabilities(wire::Capabilities capabilities) {
   return capabilities;
 }
 
+std::string payload_capacity_error(const Config &config, const wire::Capabilities &capabilities,
+                                   const std::string &rmw) {
+  try {
+    validate_protocol_payload_budget(config, capabilities, rmw);
+    return {};
+  } catch (const std::invalid_argument &error) {
+    return error.what();
+  }
+}
+
 std::string token_bytes(const codec::SessionToken &token) {
   return std::string(reinterpret_cast<const char *>(token.bytes.data()), token.bytes.size());
 }
@@ -85,7 +95,8 @@ struct PlanningIngress::Impl {
 
   explicit Impl(Config configuration, wire::Capabilities advertised)
       : config(std::move(configuration)), capabilities(normalized_capabilities(std::move(advertised))) {
-    validate_config(config);
+    // RMW 尚由 ROS owner 装配；真实身份须预检，构造仍拒绝已知 Capabilities 的必然超限。
+    validate_protocol_payload_budget(config, capabilities, "r");
     reset_session_locked();
   }
 
@@ -362,6 +373,11 @@ bool PlanningIngress::bind_publisher(std::uint64_t epoch, const std::string &gid
   if (epoch != impl_->epoch || impl_->state != wire::CONTROL_SESSION_STATE_OPENING || gid.size() != 24 || rmw.empty()) return false;
   const auto &publisher = impl_->session.ingress_publisher();
   if (!publisher.gid().empty() && (publisher.gid() != gid || publisher.rmw_implementation() != rmw)) return false;
+  const auto capacity_error = payload_capacity_error(impl_->config, impl_->capabilities, rmw);
+  if (!capacity_error.empty()) {
+    impl_->revoke_locked(capacity_error);
+    return false;
+  }
   impl_->session.mutable_ingress_publisher()->set_gid(gid);
   impl_->session.mutable_ingress_publisher()->set_rmw_implementation(rmw);
   return true;

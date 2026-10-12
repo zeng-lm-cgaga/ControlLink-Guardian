@@ -11,6 +11,12 @@ namespace control_link::someip::detail {
 
 // vsomeip优先读取按application命名的环境变量；两种入口都必须绑定已验证的同一文件。
 inline void bind_application_configuration(const std::string &name, const std::string &path) {
+  // 锁定库按变量是否存在选择module分支；空串也跳过默认插件并解引用空configuration。
+  // 在client/server初始化前拒绝该入口，不能改写环境来掩盖不受支持的配置。
+  if (std::getenv("VSOMEIP_CONFIGURATION_MODULE") != nullptr) {
+    throw std::invalid_argument(
+        "VSOMEIP_CONFIGURATION_MODULE must be unset; custom configuration modules are unsupported");
+  }
   if (name.empty() || path.empty() || !std::filesystem::is_regular_file(path)) {
     throw std::invalid_argument("An explicit existing vsomeip JSON and application name are required");
   }

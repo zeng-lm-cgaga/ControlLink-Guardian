@@ -327,6 +327,13 @@ if(BUILD_TESTING)
 		target_compile_options(test_edge_command_wait_policy PRIVATE -Wall -Wextra -Wpedantic)
 	endif()
 	if(CONTROL_LINK_ENABLE_SOMEIP)
+		ament_add_gtest(test_someip_observation test/test_someip_observation.cpp)
+		target_include_directories(test_someip_observation PRIVATE include)
+		target_compile_definitions(test_someip_observation PRIVATE
+			CONTROL_LINK_TEST_CONFIG_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../config")
+		target_compile_options(test_someip_observation PRIVATE -Wall -Wextra -Wpedantic)
+		target_link_libraries(test_someip_observation control_link_someip_transport)
+		ament_target_dependencies(test_someip_observation builtin_interfaces control_link_contract control_link_interfaces)
 		foreach(test_name IN ITEMS config ingress application_runtime session_reply_order)
 			ament_add_gtest(test_someip_${test_name}
 				${CMAKE_CURRENT_SOURCE_DIR}/../../../someip_transport/test/test_${test_name}.cpp

@@ -5,6 +5,7 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 #include "builtin_interfaces/msg/time.hpp"
 #include "control_link_contract/fastdds_environment.hpp"
@@ -12,6 +13,7 @@
 #include "control_link_contract/qos_factory.hpp"
 #include "diagnostic_msgs/msg/diagnostic_status.hpp"
 #include "diagnostic_msgs/msg/key_value.hpp"
+#include "rclcpp/exceptions/exceptions.hpp"
 
 namespace control_link_adapters
 {
@@ -341,8 +343,26 @@ namespace control_link_adapters
 
 	void SocketCanAdapter::poll_canonical_endpoint()
 	{
-		const auto publishers = get_publishers_info_by_topic(
-			adas_profile_->adapter.canonical_input_topic);
+		const auto context = get_node_base_interface()->get_context();
+		if (!context->is_valid())
+		{
+			return;
+		}
+		std::vector<rclcpp::TopicEndpointInfo> publishers;
+		try
+		{
+			publishers = get_publishers_info_by_topic(
+				adas_profile_->adapter.canonical_input_topic);
+		}
+		catch (const rclcpp::exceptions::RCLError &)
+		{
+			// SIGINT 可在 Graph 查询中使 context 失效；仅关闭竞态返回，运行期错误仍传播。
+			if (context->is_valid())
+			{
+				throw;
+			}
+			return;
+		}
 		const auto snapshot = canonical_endpoint_tracker_->observe(
 			publishers,
 			std::chrono::steady_clock::now());

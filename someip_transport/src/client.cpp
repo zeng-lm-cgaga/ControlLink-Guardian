@@ -74,6 +74,13 @@ bool has_control_token(const wire::StatusSnapshot &snapshot) {
           !snapshot.latest_gateway_acceptance().key().session_token().empty());
 }
 
+template <typename Request>
+void require_opening_domain(const Request &request) {
+  if (!request.has_opening_domain() || !valid_opening_domain(request.opening_domain())) {
+    throw std::invalid_argument("SOME/IP Open/Keep/Close requires an explicit V1 opening domain; retain it for retries");
+  }
+}
+
 }
 
 struct SomeipClient::Impl {
@@ -174,7 +181,9 @@ struct SomeipClient::Impl {
     }
   }
 
-  bool valid_envelope(const wire::StatusEnvelope &envelope) const {
+  bool valid_envelope(const wire::StatusEnvelope &envelope, bool vehicle_only = false) const {
+    const bool valid_domain = envelope.status().has_opening_domain() &&
+        valid_opening_domain(envelope.status().opening_domain());
     return envelope.schema_version_presence_case() == wire::StatusEnvelope::kSchemaVersion &&
            envelope.schema_version() == 1 &&
            envelope.schema_fingerprint() == fingerprint &&
@@ -184,6 +193,12 @@ struct SomeipClient::Impl {
            envelope.published_system_presence_case() == wire::StatusEnvelope::kPublishedSystemNs &&
            envelope.published_boottime_presence_case() == wire::StatusEnvelope::kPublishedBoottimeNs &&
            envelope.published_boottime_ns() > 0 && envelope.has_status() &&
+           (valid_domain || (vehicle_only && !envelope.status().has_opening_domain() &&
+                             !envelope.status().has_session())) &&
+           (!envelope.status().has_session() ||
+            (envelope.status().session().has_opening_domain() &&
+             same_opening_domain(envelope.status().session().opening_domain(),
+                                  envelope.status().opening_domain()))) &&
            !has_control_token(envelope.status());
   }
 
@@ -203,10 +218,13 @@ struct SomeipClient::Impl {
       return;
     }
     current.gateway_status_received_steady_ns = steady_now_ns();
+    *snapshot.mutable_opening_domain() = incoming.opening_domain();
     if (incoming.has_session()) {
       *snapshot.mutable_session() = incoming.session();
       // 只读事实可以撤销缓存的可提交提示，不能借无 token 的 event 建立或升级 holder。
       const bool readiness_revoked = !incoming.session().submission_ready() ||
+          (current.session.has_opening_domain() &&
+           !same_opening_domain(current.session.opening_domain(), incoming.opening_domain())) ||
           (!current.session.ingress_publisher().gid().empty() &&
            incoming.session().ingress_publisher().gid() != current.session.ingress_publisher().gid());
       if (readiness_revoked) {
@@ -244,7 +262,7 @@ struct SomeipClient::Impl {
         if (incoming->get_method() != config.gateway_event && incoming->get_method() != config.vehicle_event) return;
         auto envelope = decode_response<wire::StatusEnvelope>(std::string(
             reinterpret_cast<const char *>(payload->get_data()), payload->get_length()));
-        if (!valid_envelope(envelope)) {
+        if (!valid_envelope(envelope, incoming->get_method() == config.vehicle_event)) {
           current.failure = "Rejected status event schema/presence/fingerprint/token";
           return;
         }
@@ -322,16 +340,33 @@ struct SomeipClient::Impl {
 
   wire::OpenSessionResponse session_reply(std::uint16_t method,
       const google::protobuf::MessageLite &request_message, const std::string &key,
+      const wire::OpenAdmissionDomain &requested_domain,
       std::chrono::milliseconds timeout) {
     const auto received = request(method, serialize_request(request_message), timeout);
     auto result = decode_response<wire::OpenSessionResponse>(received.bytes);
     if (!result.has_capabilities() || result.capabilities().schema_version() != 1 ||
-        result.capabilities().schema_fingerprint() != fingerprint || result.open_request_id() != key) {
+        result.capabilities().schema_fingerprint() != fingerprint ||
+        result.capabilities().planning_transport() != wire::PLANNING_TRANSPORT_SOMEIP ||
+        !result.capabilities().has_opening_domain() ||
+        !valid_opening_domain(result.capabilities().opening_domain()) || result.open_request_id() != key) {
       throw std::runtime_error("Session response schema/fingerprint/request key mismatch");
+    }
+    if (!wire::SessionOperationResult_IsValid(result.result()) ||
+        result.result() == wire::SESSION_OPERATION_RESULT_UNKNOWN) {
+      throw std::runtime_error("Session response has unknown operation result");
+    }
+    const bool denied = result.result() == wire::SESSION_OPERATION_RESULT_BUSY ||
+        result.result() == wire::SESSION_OPERATION_RESULT_REJECTED ||
+        result.result() == wire::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED;
+    if (denied && result.has_session()) {
+      throw std::runtime_error("Denied session response leaked a holder identity");
     }
     if (result.has_session()) {
       const auto &session = result.session();
       if (session.session_token().size() != 16 ||
+          !session.has_opening_domain() ||
+          !same_opening_domain(session.opening_domain(), requested_domain) ||
+          !same_opening_domain(result.capabilities().opening_domain(), requested_domain) ||
           session.planning_transport() != wire::PLANNING_TRANSPORT_SOMEIP ||
           session.clock_domain() != wire::CLOCK_DOMAIN_SYSTEM ||
           (!session.ingress_publisher().gid().empty() && session.ingress_publisher().gid().size() != 24) ||
@@ -345,10 +380,7 @@ struct SomeipClient::Impl {
       }
       // generation 管服务/身份换代；revision 只保护已观察的较晚撤准入，二者不能互代。
       session_reply_order.commit_reply(received.readiness_revision, *result.mutable_session(), current.session);
-    } else if (result.result() != wire::SESSION_OPERATION_RESULT_BUSY &&
-               result.result() != wire::SESSION_OPERATION_RESULT_REJECTED &&
-               result.result() != wire::SESSION_OPERATION_RESULT_REVOKED &&
-               result.result() != wire::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED) {
+    } else if (!denied) {
       throw std::runtime_error("Session response omitted holder identity");
     }
     return result;
@@ -469,17 +501,23 @@ void SomeipClient::set_status_subscription(bool enabled) {
 
 wire::OpenSessionResponse SomeipClient::open(const wire::OpenSessionRequest &request,
                                             std::chrono::milliseconds timeout) {
-  return impl_->session_reply(impl_->config.open_method, request, request.open_request_id(), timeout);
+  require_opening_domain(request);
+  return impl_->session_reply(impl_->config.open_method, request, request.open_request_id(),
+                             request.opening_domain(), timeout);
 }
 
 wire::OpenSessionResponse SomeipClient::keep(const wire::KeepSessionRequest &request,
                                             std::chrono::milliseconds timeout) {
-  return impl_->session_reply(impl_->config.keep_method, request, request.open_request_id(), timeout);
+  require_opening_domain(request);
+  return impl_->session_reply(impl_->config.keep_method, request, request.open_request_id(),
+                             request.opening_domain(), timeout);
 }
 
 wire::OpenSessionResponse SomeipClient::close(const wire::CloseSessionRequest &request,
                                              std::chrono::milliseconds timeout) {
-  auto response = impl_->session_reply(impl_->config.close_method, request, request.open_request_id(), timeout);
+  require_opening_domain(request);
+  auto response = impl_->session_reply(impl_->config.close_method, request, request.open_request_id(),
+                                      request.opening_domain(), timeout);
   if (response.result() == wire::SESSION_OPERATION_RESULT_REVOKED) {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->current.session.Clear();
@@ -659,6 +697,7 @@ int run_planning_example(int argc, char **argv) {
               << " source=planning frame=body clock=SYSTEM units=m/s,rad/s\n";
     auto holder_nonce = random_identity();
     auto open_request_id = random_identity();
+    wire::OpenAdmissionDomain opening_domain;
     std::string current_token;
     std::uint64_t business_sequence = 0;
     std::uint64_t keep_sequence = 0;
@@ -679,6 +718,7 @@ int run_planning_example(int argc, char **argv) {
     const auto new_holder = [&] {
       holder_nonce = random_identity();
       open_request_id = random_identity();
+      opening_domain.Clear();
       current_token.clear();
       held = false;
       ready = false;
@@ -737,6 +777,7 @@ int run_planning_example(int argc, char **argv) {
             request.set_schema_version(1);
             request.set_holder_nonce(holder_nonce);
             request.set_open_request_id(open_request_id);
+            *request.mutable_opening_domain() = opening_domain;
             request.set_keepalive_sequence(++keep_sequence);
             next_keep = now + keep_period;
             observe_session(client.keep(request, std::chrono::milliseconds(20)));
@@ -744,10 +785,15 @@ int run_planning_example(int argc, char **argv) {
           now = std::chrono::steady_clock::now();
           if (!ready && now >= next_open &&
               !(options.no_keep && held && first_ready != std::chrono::steady_clock::time_point{})) {
+            // 只在新键对首次开立前发现域；超时、迟到回复及只读更新均不重绑定旧请求。
+            if (!valid_opening_domain(opening_domain)) {
+              opening_domain = client.get_status(std::chrono::milliseconds(100)).status().opening_domain();
+            }
             wire::OpenSessionRequest request;
             request.set_schema_version(1);
             request.set_holder_nonce(holder_nonce);
             request.set_open_request_id(open_request_id);
+            *request.mutable_opening_domain() = opening_domain;
             next_open = now + std::chrono::milliseconds(open_retry_delay_ms);
             open_retry_delay_ms = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 config.reconnect_max_ms, static_cast<std::uint64_t>(open_retry_delay_ms) * 2));
@@ -763,6 +809,7 @@ int run_planning_example(int argc, char **argv) {
             request.set_schema_version(1);
             request.set_holder_nonce(holder_nonce);
             request.set_open_request_id(open_request_id);
+            *request.mutable_opening_domain() = opening_domain;
             const auto response = client.close(request, std::chrono::milliseconds(100));
             std::cout << "explicit_close result=" << response.result() << '\n';
             held = false;
@@ -836,6 +883,7 @@ int run_planning_example(int argc, char **argv) {
       request.set_schema_version(1);
       request.set_holder_nonce(holder_nonce);
       request.set_open_request_id(open_request_id);
+      *request.mutable_opening_domain() = opening_domain;
       try {
         client.close(request, std::chrono::milliseconds(100));
       } catch (const std::exception &failure) {

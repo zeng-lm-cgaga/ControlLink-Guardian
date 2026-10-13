@@ -145,6 +145,7 @@ TEST(SomeipConfig, ActualMinimumPayloadAllowsOpenRetryAndAdmittedKeepWithCapabil
   open.set_schema_version(1);
   open.set_holder_nonce(std::string(16, 'n'));
   open.set_open_request_id(std::string(16, 'o'));
+  *open.mutable_opening_domain() = ingress.opening_domain();
   const auto opening = ingress.open(0x3101, open, 1'000'000'000ULL);
   ASSERT_EQ(opening.result(), wire::SESSION_OPERATION_RESULT_OPENING);
   EXPECT_LE(opening.SerializeAsString().size(), config.max_payload_bytes);
@@ -161,6 +162,7 @@ TEST(SomeipConfig, ActualMinimumPayloadAllowsOpenRetryAndAdmittedKeepWithCapabil
   keep.set_holder_nonce(open.holder_nonce());
   keep.set_open_request_id(open.open_request_id());
   keep.set_keepalive_sequence(1);
+  *keep.mutable_opening_domain() = open.opening_domain();
   const auto admitted = ingress.keep(0x3101, keep, 1'000'000'002ULL);
   ASSERT_EQ(admitted.result(), wire::SESSION_OPERATION_RESULT_ADMITTED);
   ASSERT_TRUE(admitted.session().submission_ready());
@@ -168,6 +170,8 @@ TEST(SomeipConfig, ActualMinimumPayloadAllowsOpenRetryAndAdmittedKeepWithCapabil
   EXPECT_EQ(admitted.capabilities().schema_fingerprint().size(), 32U);
   EXPECT_EQ(admitted.capabilities().contract_hash().size(), 64U);
   EXPECT_EQ(admitted.capabilities().decision_config_hash().size(), 64U);
+  EXPECT_EQ(admitted.capabilities().opening_domain().SerializeAsString(), open.opening_domain().SerializeAsString());
+  EXPECT_EQ(admitted.session().opening_domain().SerializeAsString(), open.opening_domain().SerializeAsString());
   EXPECT_LE(admitted.SerializeAsString().size(), config.max_payload_bytes);
 }
 
@@ -213,13 +217,17 @@ TEST(SomeipConfig, BudgetUsesActualUnboundedCapabilityAndRmwTextWithoutTruncatio
 
 TEST(SomeipConfig, BindBudgetFailureRevokesBeforeWritingIdentityAndStaleEpochCannotRevokeNewHolder) {
   auto config = load_config(source_config_path());
-  config.max_payload_bytes = 656;
   auto capabilities = capacity_capabilities(config);
+  config.max_payload_bytes = static_cast<std::uint32_t>(required_protocol_payload_bytes(capabilities, "r"));
+  capabilities.set_max_status_bytes(config.max_payload_bytes);
+  ASSERT_EQ(required_protocol_payload_bytes(capabilities, "r"), config.max_payload_bytes);
+  ASSERT_LT(config.max_payload_bytes, required_protocol_payload_bytes(capabilities, "rmw_fastrtps_cpp"));
   PlanningIngress ingress(config, capabilities);
   wire::OpenSessionRequest request;
   request.set_schema_version(1);
   request.set_holder_nonce(std::string(16, 'n'));
   request.set_open_request_id(std::string(16, 'o'));
+  *request.mutable_opening_domain() = ingress.opening_domain();
   ASSERT_EQ(ingress.open(0x3101, request, 1'000'000'000ULL).result(),
             wire::SESSION_OPERATION_RESULT_OPENING);
   const auto old_epoch = ingress.snapshot().epoch;
@@ -231,9 +239,12 @@ TEST(SomeipConfig, BindBudgetFailureRevokesBeforeWritingIdentityAndStaleEpochCan
   EXPECT_NE(revoked.failure.find("PAYLOAD_CAPACITY"), std::string::npos);
   EXPECT_FALSE(ingress.set_admitted(old_epoch, true));
   ASSERT_TRUE(ingress.finish_release(revoked.epoch));
-  request.set_holder_nonce(std::string(16, 'p'));
-  request.set_open_request_id(std::string(16, 'q'));
-  ASSERT_EQ(ingress.open(0x3101, request, 1'000'000'001ULL).result(),
+  wire::OpenSessionRequest replacement;
+  replacement.set_schema_version(1);
+  replacement.set_holder_nonce(std::string(16, 'p'));
+  replacement.set_open_request_id(std::string(16, 'q'));
+  *replacement.mutable_opening_domain() = ingress.opening_domain();
+  ASSERT_EQ(ingress.open(0x3101, replacement, 1'000'000'001ULL).result(),
             wire::SESSION_OPERATION_RESULT_OPENING);
   const auto new_epoch = ingress.snapshot().epoch;
   EXPECT_FALSE(ingress.bind_publisher(old_epoch, std::string(24, 'g'), std::string(2048, 'r')));

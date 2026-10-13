@@ -11,6 +11,20 @@
 #include <utility>
 
 namespace control_link::someip {
+
+bool valid_opening_domain(const wire::OpenAdmissionDomain &domain) {
+  return domain.domain_version() == 1 && domain.service_instance_id().size() == 16 &&
+      domain.generation_presence_case() == wire::OpenAdmissionDomain::kGeneration &&
+      domain.generation() > 0;
+}
+
+bool same_opening_domain(const wire::OpenAdmissionDomain &left,
+                         const wire::OpenAdmissionDomain &right) {
+  return valid_opening_domain(left) && valid_opening_domain(right) &&
+      left.service_instance_id() == right.service_instance_id() &&
+      left.generation() == right.generation();
+}
+
 namespace {
 
 namespace codec = control_link_edge_protocol;
@@ -90,15 +104,30 @@ struct PlanningIngress::Impl {
   };
 
   explicit Impl(IngressResources configuration, wire::Capabilities advertised,
-                wire::PlanningTransport selected_transport)
+                wire::PlanningTransport selected_transport,
+                std::function<std::string()> random_source)
       : resources(configuration), transport(selected_transport),
-        capabilities(normalized_capabilities(std::move(advertised), selected_transport)) {
+        capabilities(normalized_capabilities(std::move(advertised), selected_transport)),
+        identity_source(random_source ? std::move(random_source) : random_identity) {
     if (resources.max_payload_bytes == 0 ||
         resources.max_payload_bytes > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
-        resources.retired_open_capacity == 0 ||
+        resources.retired_open_capacity == 0 || resources.admission_generation_limit == 0 ||
         (transport == wire::PLANNING_TRANSPORT_SOMEIP && resources.idle_timeout_ms == 0)) {
       throw std::invalid_argument("network ingress requires bounded payload/retired keys and SOME/IP idle budget");
     }
+    std::string instance;
+    try {
+      instance = identity_source();
+    } catch (const std::exception &) {
+      throw std::runtime_error("RANDOM_SOURCE_FAILED: cannot create service instance identity");
+    }
+    if (!valid_identity(instance) || instance == std::string(16, '\0')) {
+      throw std::runtime_error("RANDOM_SOURCE_FAILED: invalid service instance identity");
+    }
+    domain.set_service_instance_id(instance);
+    domain.set_generation(1);
+    domain.set_domain_version(1);
+    *capabilities.mutable_opening_domain() = domain;
     // RMW 尚由 ROS owner 装配；真实身份须预检，构造仍拒绝已知 Capabilities 的必然超限。
     const auto capacity_error = payload_capacity_error(resources, capabilities, "r");
     if (!capacity_error.empty()) throw std::invalid_argument(capacity_error);
@@ -111,6 +140,11 @@ struct PlanningIngress::Impl {
     session.set_clock_domain(wire::CLOCK_DOMAIN_SYSTEM);
     session.set_control_session_state(state);
     session.set_connection_state(wire::CONNECTION_STATE_DISCONNECTED);
+    *session.mutable_opening_domain() = domain;
+  }
+
+  bool matches_domain_locked(const wire::OpenAdmissionDomain &candidate) const {
+    return same_opening_domain(candidate, domain);
   }
 
   bool live_locked() const {
@@ -132,9 +166,12 @@ struct PlanningIngress::Impl {
     return response;
   }
 
-  wire::OpenSessionResponse rejected_locked(const std::string &request_id) {
+  wire::OpenSessionResponse rejected_locked(const std::string &request_id,
+                                            const std::string &reason = "INVALID_REQUEST_OR_HOLDER") {
     counters.set_protocol_rejected_count(counters.protocol_rejected_count() + 1);
-    return response_locked(wire::SESSION_OPERATION_RESULT_REJECTED, request_id);
+    auto response = response_locked(wire::SESSION_OPERATION_RESULT_REJECTED, request_id);
+    response.set_failure_reason(reason);
+    return response;
   }
 
   void drop_pending_locked() {
@@ -172,6 +209,7 @@ struct PlanningIngress::Impl {
 
   wire::StatusSnapshot status_locked() const {
     auto result = observations;
+    *result.mutable_opening_domain() = domain;
     *result.mutable_session() = session;
     *result.mutable_transport() = counters;
     result.mutable_transport()->set_connection_state(session.connection_state());
@@ -205,8 +243,11 @@ struct PlanningIngress::Impl {
 
   const IngressResources resources;
   const wire::PlanningTransport transport;
-  const wire::Capabilities capabilities;
+  wire::Capabilities capabilities;
+  const std::function<std::string()> identity_source;
   mutable std::mutex mutex;
+  wire::OpenAdmissionDomain domain;
+  bool stopped{false};
   std::uint64_t epoch{0};
   wire::ControlSessionState state{wire::CONTROL_SESSION_STATE_IDLE};
   wire::SessionInfo session;
@@ -227,8 +268,10 @@ PlanningIngress::PlanningIngress(Config config, wire::Capabilities capabilities,
     : PlanningIngress(resources_from_config(config), std::move(capabilities), transport) {}
 
 PlanningIngress::PlanningIngress(IngressResources resources, wire::Capabilities capabilities,
-                                 wire::PlanningTransport transport)
-    : impl_(std::make_unique<Impl>(resources, std::move(capabilities), transport)) {}
+                                 wire::PlanningTransport transport,
+                                 std::function<std::string()> identity_source)
+    : impl_(std::make_unique<Impl>(resources, std::move(capabilities), transport,
+                                   std::move(identity_source))) {}
 
 PlanningIngress::~PlanningIngress() = default;
 
@@ -238,6 +281,12 @@ wire::OpenSessionResponse PlanningIngress::open(std::uint64_t peer,
   std::lock_guard<std::mutex> lock(impl_->mutex);
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
   impl_->expire_locked(steady_ns);
+  if (impl_->stopped) return impl_->rejected_locked(request.open_request_id(),
+      impl_->failure == "ADMISSION_GENERATION_EXHAUSTED" ? impl_->failure : "STOPPED");
+  // 域复核必须先于holder幂等/退役键查找；旧域请求永久无准入资格。
+  if (!request.has_opening_domain() || !impl_->matches_domain_locked(request.opening_domain())) {
+    return impl_->rejected_locked(request.open_request_id(), "OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE");
+  }
   if (request.schema_version_presence_case() != wire::OpenSessionRequest::kSchemaVersion ||
       request.schema_version() != 1 || !impl_->valid_peer_locked(peer) ||
       !valid_identity(request.holder_nonce()) || !valid_identity(request.open_request_id())) {
@@ -266,10 +315,11 @@ wire::OpenSessionResponse PlanningIngress::open(std::uint64_t peer,
   }
   std::string token;
   try {
-    token = random_identity();
+    token = impl_->identity_source();
+    if (!valid_identity(token) || token == std::string(16, '\0')) throw std::runtime_error("invalid token");
   } catch (const std::exception &) {
     impl_->failure = "RANDOM_SOURCE_FAILED";
-    return impl_->rejected_locked(request.open_request_id());
+    return impl_->rejected_locked(request.open_request_id(), impl_->failure);
   }
   ++impl_->epoch;
   impl_->holder = Impl::Holder{peer, request.holder_nonce(), request.open_request_id()};
@@ -292,6 +342,7 @@ wire::OpenSessionResponse PlanningIngress::keep(std::uint64_t peer,
   impl_->expire_locked(steady_ns);
   if (request.schema_version_presence_case() != wire::KeepSessionRequest::kSchemaVersion ||
       request.schema_version() != 1 ||
+      !request.has_opening_domain() || !impl_->matches_domain_locked(request.opening_domain()) ||
       request.keepalive_sequence_presence_case() != wire::KeepSessionRequest::kKeepaliveSequence || !impl_->live_locked() ||
       !impl_->holder->matches(peer, request.holder_nonce(), request.open_request_id()) ||
       request.keepalive_sequence() <= impl_->keep_sequence) {
@@ -310,6 +361,7 @@ wire::OpenSessionResponse PlanningIngress::close(std::uint64_t peer,
   impl_->counters.set_rpc_received_count(impl_->counters.rpc_received_count() + 1);
   if (request.schema_version_presence_case() != wire::CloseSessionRequest::kSchemaVersion ||
       request.schema_version() != 1 || !impl_->holder ||
+      !request.has_opening_domain() || !impl_->matches_domain_locked(request.opening_domain()) ||
       !impl_->holder->matches(peer, request.holder_nonce(), request.open_request_id())) {
     return impl_->rejected_locked(request.open_request_id());
   }
@@ -367,6 +419,12 @@ void PlanningIngress::revoke(const std::string &reason) {
   impl_->revoke_locked(reason);
 }
 
+void PlanningIngress::stop() {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->stopped = true;
+  impl_->revoke_locked("STOPPED");
+}
+
 bool PlanningIngress::revoke_if_current(std::uint64_t epoch, const std::string &reason) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (epoch != impl_->epoch || impl_->state == wire::CONTROL_SESSION_STATE_REVOKING) return false;
@@ -385,6 +443,16 @@ bool PlanningIngress::finish_release(std::uint64_t revoked_epoch) {
     }
     impl_->retired.insert(key);
   }
+  if (impl_->domain.generation() >= impl_->resources.admission_generation_limit) {
+    impl_->stopped = true;
+    impl_->failure = "ADMISSION_GENERATION_EXHAUSTED";
+    return false;
+  }
+  // 原owner已完成旧publisher释放，且仍持同一撤销epoch。先改变不可回绕域，
+  // 再丢弃永久失效域的记录；这不是驱逐仍能匹配当前域的幂等键。
+  impl_->domain.set_generation(impl_->domain.generation() + 1);
+  *impl_->capabilities.mutable_opening_domain() = impl_->domain;
+  impl_->retired.clear();
   impl_->holder.reset();
   impl_->state = wire::CONTROL_SESSION_STATE_IDLE;
   impl_->reset_session_locked();
@@ -394,7 +462,18 @@ bool PlanningIngress::finish_release(std::uint64_t revoked_epoch) {
 
 IngressSnapshot PlanningIngress::snapshot() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
-  return IngressSnapshot{impl_->epoch, impl_->state, impl_->session, impl_->failure};
+  return IngressSnapshot{impl_->epoch, impl_->state, impl_->session, impl_->failure,
+                          impl_->domain, impl_->retired.size()};
+}
+
+wire::OpenAdmissionDomain PlanningIngress::opening_domain() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->domain;
+}
+
+wire::Capabilities PlanningIngress::capabilities() const {
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  return impl_->capabilities;
 }
 
 bool PlanningIngress::bind_publisher(std::uint64_t epoch, const std::string &gid, const std::string &rmw) {
@@ -470,6 +549,7 @@ void PlanningIngress::update_observations(const std::function<void(wire::StatusS
   observations.clear_transport();
   observations.clear_latest_forwarded();
   observations.clear_latest_gateway_acceptance();
+  observations.clear_opening_domain();
   impl_->observations = std::move(observations);
 }
 

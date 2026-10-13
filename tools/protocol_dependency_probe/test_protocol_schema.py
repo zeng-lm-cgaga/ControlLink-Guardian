@@ -361,6 +361,62 @@ void metadata_versions()
   require(!parsed_receipt.rpc_received(), "schema presence is not received or accepted");
 }
 
+void opening_domain_presence_and_encoding()
+{
+  network::OpenAdmissionDomain absent;
+  require(absent.service_instance_id().empty(), "missing service instance is not inferred");
+  require(absent.generation_presence_case() == network::OpenAdmissionDomain::GENERATION_PRESENCE_NOT_SET, "missing generation distinct");
+  require(absent.domain_version() == 0, "missing domain version is not version one");
+  network::OpenAdmissionDomain explicit_zero;
+  explicit_zero.set_generation(0);
+  auto parsed_zero = round_trip(explicit_zero);
+  require(parsed_zero.generation_presence_case() == network::OpenAdmissionDomain::kGeneration && parsed_zero.generation() == 0, "explicit zero generation presence is not valid admission");
+  require(parsed_zero.ByteSizeLong() != absent.ByteSizeLong(), "missing and zero generation have distinct wire");
+
+  network::OpenAdmissionDomain domain;
+  domain.set_service_instance_id(std::string(16, 'i'));
+  domain.set_generation(1);
+  domain.set_domain_version(1);
+  auto parsed_domain = round_trip(domain);
+  require(parsed_domain.service_instance_id() == domain.service_instance_id(), "16 byte service instance exact");
+  require(parsed_domain.generation_presence_case() == network::OpenAdmissionDomain::kGeneration && parsed_domain.generation() == 1, "initial generation explicit one");
+  require(parsed_domain.domain_version() == 1, "opening subprotocol version explicit one");
+  domain.set_generation(std::numeric_limits<std::uint64_t>::max());
+  require(round_trip(domain).generation() == std::numeric_limits<std::uint64_t>::max(), "generation does not truncate or wrap in codec");
+  domain.set_service_instance_id(std::string(15, 'i'));
+  domain.set_domain_version(2);
+  auto malformed = round_trip(domain);
+  require(malformed.service_instance_id().size() == 15 && malformed.domain_version() == 2, "malformed domain retained for explicit boundary rejection, not normalized");
+
+  network::OpenSessionRequest open;
+  open.set_schema_version(1);
+  open.set_holder_nonce(std::string(16, 'n'));
+  open.set_open_request_id(std::string(16, 'r'));
+  require(!round_trip(open).has_opening_domain(), "old schema-version-one open cannot infer admission domain");
+  open.mutable_opening_domain();
+  require(round_trip(open).has_opening_domain() && round_trip(open).opening_domain().generation_presence_case() == network::OpenAdmissionDomain::GENERATION_PRESENCE_NOT_SET, "present empty domain is not a valid domain");
+  *open.mutable_opening_domain() = parsed_domain;
+  require(round_trip(open).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "open domain exact without refreshing generation");
+  network::KeepSessionRequest keep;
+  network::CloseSessionRequest close;
+  network::SessionInfo session;
+  network::Capabilities capabilities;
+  network::StatusSnapshot status;
+  require(!keep.has_opening_domain() && !close.has_opening_domain(), "legacy keep and close have no implicit domain");
+  require(!session.has_opening_domain() && !capabilities.has_opening_domain() && !status.has_opening_domain(), "missing observed domain remains unknown");
+  *keep.mutable_opening_domain() = parsed_domain;
+  *close.mutable_opening_domain() = parsed_domain;
+  *session.mutable_opening_domain() = parsed_domain;
+  *capabilities.mutable_opening_domain() = parsed_domain;
+  *status.mutable_opening_domain() = parsed_domain;
+  require(round_trip(keep).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "keep bound to original opening domain");
+  require(round_trip(close).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "close bound to original opening domain");
+  require(round_trip(session).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "private session domain exact");
+  require(round_trip(capabilities).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "readonly capabilities exposes domain without holder token");
+  require(round_trip(status).opening_domain().SerializeAsString() == parsed_domain.SerializeAsString(), "readonly status exposes domain without opening holder");
+  require(session.session_token().empty() && !status.has_session(), "public domain is not control qualification");
+}
+
 void control_operation_presence()
 {
   network::ControlSessionRequest request;
@@ -439,6 +495,14 @@ void control_response_facts()
       require(parsed.open_request_id() == std::string(16, 'r'), "only own request key echoed");
     }
   }
+  for (const std::string reason : {"OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE", "STOPPED",
+      "RANDOM_SOURCE_FAILED", "ADMISSION_GENERATION_EXHAUSTED"}) {
+    network::OpenSessionResponse response;
+    response.set_result(network::SESSION_OPERATION_RESULT_REJECTED);
+    response.set_failure_reason(reason);
+    auto parsed = round_trip(response);
+    require(parsed.failure_reason() == reason && !parsed.has_session(), "explicit admission diagnostic encodes without token disclosure");
+  }
 }
 
 int main(int argument_count, char **arguments)
@@ -448,6 +512,8 @@ int main(int argument_count, char **arguments)
     const std::string selected = arguments[1];
     if (selected == "control-operation-presence") {
       control_operation_presence();
+    } else if (selected == "opening-domain-presence-and-encoding") {
+      opening_domain_presence_and_encoding();
     } else if (selected == "control-response-facts") {
       control_response_facts();
     } else if (selected == "metadata-versions") {
@@ -556,6 +622,7 @@ class ProtocolSchemaTest(unittest.TestCase):
             "OpenSessionRequest": ["schema_version"],
             "KeepSessionRequest": ["schema_version", "keepalive_sequence"],
             "CloseSessionRequest": ["schema_version"],
+            "OpenAdmissionDomain": ["generation"],
         }
         for message_name, field_names in expected.items():
             message = self.messages[message_name]
@@ -634,7 +701,7 @@ class ProtocolSchemaTest(unittest.TestCase):
         for message_name in ["StatusEnvelope", "Capabilities", "AvailabilityEnvelope"]:
             fields = {field.name: field for field in self.messages[message_name].field}
             self.assertEqual(fields["schema_fingerprint"].type, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES)
-        self.assertEqual({field.name for field in self.messages["OpenSessionRequest"].field}, {"schema_version", "holder_nonce", "open_request_id"})
+        self.assertEqual({field.name for field in self.messages["OpenSessionRequest"].field}, {"schema_version", "holder_nonce", "open_request_id", "opening_domain"})
         diagnostic = self.messages["DiagnosticObservation"]
         self.assertEqual({field.name for field in diagnostic.field}, {"observation", "level", "name", "message", "hardware_id", "values"})
         fields = {field.name: field for field in diagnostic.field}
@@ -675,7 +742,7 @@ class ProtocolSchemaTest(unittest.TestCase):
                 "close": "CloseSessionRequest"}[field.name])
         for name in ("OpenSessionRequest", "KeepSessionRequest", "CloseSessionRequest"):
             fields = {field.name: field for field in self.messages[name].field}
-            self.assertEqual(set(fields), {"schema_version", "holder_nonce", "open_request_id"} |
+            self.assertEqual(set(fields), {"schema_version", "holder_nonce", "open_request_id", "opening_domain"} |
                              ({"keepalive_sequence"} if name == "KeepSessionRequest" else set()))
             for identity in ("holder_nonce", "open_request_id"):
                 self.assertEqual(fields[identity].type, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES)
@@ -684,9 +751,11 @@ class ProtocolSchemaTest(unittest.TestCase):
                              if field.name == "keepalive_sequence")
         self.assertEqual(keep_sequence.type, descriptor_pb2.FieldDescriptorProto.TYPE_UINT64)
         response_fields = {field.name: field for field in self.messages["OpenSessionResponse"].field}
-        self.assertEqual(set(response_fields), {"session", "capabilities", "result", "open_request_id"})
+        self.assertEqual(set(response_fields), {"session", "capabilities", "result", "open_request_id", "failure_reason"})
         self.assertEqual(response_fields["session"].type_name, ".control_link.network.v1.SessionInfo")
         self.assertEqual(response_fields["result"].type_name, ".control_link.network.v1.SessionOperationResult")
+        self.assertEqual(response_fields["failure_reason"].number, 5)
+        self.assertEqual(response_fields["failure_reason"].type, descriptor_pb2.FieldDescriptorProto.TYPE_STRING)
         session_fields = {field.name: field for field in self.messages["SessionInfo"].field}
         self.assertEqual(session_fields["control_session_state"].number, 7)
         self.assertEqual(session_fields["control_session_state"].type_name, ".control_link.network.v1.ControlSessionState")
@@ -698,6 +767,29 @@ class ProtocolSchemaTest(unittest.TestCase):
         self.assertEqual(enums["SessionOperationResult"], {
             "SESSION_OPERATION_RESULT_" + name: index for index, name in enumerate(
                 ("UNKNOWN", "OPENING", "ADMITTED", "IDEMPOTENT", "BUSY", "REVOKED", "REJECTED", "RESOURCE_EXHAUSTED"))})
+
+    def test_descriptor_and_cpp_opening_domain_presence_and_encoding(self):
+        domain = self.messages["OpenAdmissionDomain"]
+        self.assertEqual([(field.name, field.number, field.type) for field in domain.field], [
+            ("service_instance_id", 1, descriptor_pb2.FieldDescriptorProto.TYPE_BYTES),
+            ("generation", 2, descriptor_pb2.FieldDescriptorProto.TYPE_UINT64),
+            ("domain_version", 3, descriptor_pb2.FieldDescriptorProto.TYPE_UINT32),
+        ])
+        generation = next(field for field in domain.field if field.name == "generation")
+        self.assertTrue(generation.HasField("oneof_index"))
+        self.assertEqual(domain.oneof_decl[generation.oneof_index].name, "generation_presence")
+        for message_name, number in {"OpenSessionRequest": 4, "KeepSessionRequest": 5,
+                                     "CloseSessionRequest": 4, "SessionInfo": 8,
+                                     "Capabilities": 11, "StatusSnapshot": 9}.items():
+            with self.subTest(message=message_name):
+                field = next(field for field in self.messages[message_name].field
+                             if field.name == "opening_domain")
+                self.assertEqual(field.number, number)
+                self.assertEqual(field.label, descriptor_pb2.FieldDescriptorProto.LABEL_OPTIONAL)
+                self.assertEqual(field.type, descriptor_pb2.FieldDescriptorProto.TYPE_MESSAGE)
+                self.assertEqual(field.type_name, ".control_link.network.v1.OpenAdmissionDomain")
+        run_logged([str(self.executable), "opening-domain-presence-and-encoding"], self.output,
+                   "opening-domain-presence-and-encoding")
 
     def test_cpp_control_operation_oneof_and_identity_presence(self):
         run_logged([str(self.executable), "control-operation-presence"], self.output,

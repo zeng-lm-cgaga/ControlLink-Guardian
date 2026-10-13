@@ -371,7 +371,7 @@ void SomeipServer::stop() noexcept {
     std::lock_guard<std::mutex> lock(impl_->gate);
     impl_->stopping = true;
     impl_->registered = false;
-    impl_->ingress->revoke("SOME/IP local stop");
+    impl_->ingress->stop();
   }
   impl_->wake.notify_all();
   try {

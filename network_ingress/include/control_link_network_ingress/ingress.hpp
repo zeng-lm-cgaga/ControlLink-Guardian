@@ -16,5 +16,7 @@ using ::control_link::someip::steady_now_ns;
 using ::control_link::someip::boottime_now_ns;
 using ::control_link::someip::system_now_ns;
 using ::control_link::someip::random_identity;
+using ::control_link::someip::valid_opening_domain;
+using ::control_link::someip::same_opening_domain;
 
 }

@@ -148,6 +148,17 @@ message ObservationMetadata {
   ObservationValidity validity = 3;
 }
 
+// 开立域不是控制 token 或认证。服务实例随机16B + 不回绕代次定义永久失效边界，
+// 不依赖客户端换nonce、网络最大迟到或墙钟TTL。旧域先拒绝，才回收其退役键。
+message OpenAdmissionDomain {
+  bytes service_instance_id = 1;
+  oneof generation_presence {
+    uint64 generation = 2;
+  }
+  // 必须显式为1；旧client缺少此域不允许以默认值开立。
+  uint32 domain_version = 3;
+}
+
 message SessionInfo {
   // 仅 holder 的握手回复可带控制 token；所有只读/事件反馈须移除包括嵌套 key 的 token。
   bytes session_token = 1;
@@ -159,6 +170,7 @@ message SessionInfo {
   PublisherIdentity ingress_publisher = 5;
   ClockDomain clock_domain = 6;
   ControlSessionState control_session_state = 7;
+  OpenAdmissionDomain opening_domain = 8;
 }
 
 message TransportCounters {
@@ -258,6 +270,8 @@ message StatusSnapshot {
   VehicleObservation vehicle = 6;
   GatewayAcceptanceObservation latest_gateway_acceptance = 7;
   repeated DiagnosticObservation alerts = 8;
+  // 公开的当前开立域，不取得/续期/撤销holder；只读取消不改变此值。
+  OpenAdmissionDomain opening_domain = 9;
 }
 
 // gRPC 状态、未来 SOME/IP 状态事件及 MQTT JSON 映射共用此字段 owner。
@@ -316,6 +330,7 @@ message Capabilities {
   uint32 max_status_subscribers = 9;
   // 恰好 32 字节，原 .proto 源字节 SHA-256；独立于 Contract/config hash。
   bytes schema_fingerprint = 10;
+  OpenAdmissionDomain opening_domain = 11;
 }
 
 message OpenSessionRequest {
@@ -327,6 +342,8 @@ message OpenSessionRequest {
   // 只在同一存活 holder 中重试使用原值；终止后新握手必须重新生成。
   bytes holder_nonce = 2;
   bytes open_request_id = 3;
+  // 新应用握手先观察当前域；同一握手重试冻结原域，不自动改为最新域。
+  OpenAdmissionDomain opening_domain = 4;
 }
 
 message OpenSessionResponse {
@@ -336,6 +353,8 @@ message OpenSessionResponse {
   SessionOperationResult result = 3;
   // 仅回显本请求的幂等键；readonly 状态不携带此字段。
   bytes open_request_id = 4;
+  // 缺域/旧域、终止、随机源或代次耗尽的显式诊断；拒绝不携带控制token。
+  string failure_reason = 5;
 }
 
 message KeepSessionRequest {
@@ -348,6 +367,7 @@ message KeepSessionRequest {
   oneof keepalive_sequence_presence {
     uint64 keepalive_sequence = 4;
   }
+  OpenAdmissionDomain opening_domain = 5;
 }
 
 message CloseSessionRequest {
@@ -356,6 +376,7 @@ message CloseSessionRequest {
   }
   bytes holder_nonce = 2;
   bytes open_request_id = 3;
+  OpenAdmissionDomain opening_domain = 4;
 }
 
 message ControlSessionRequest {

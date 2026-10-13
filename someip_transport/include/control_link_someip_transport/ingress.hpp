@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -13,12 +14,19 @@ namespace control_link::someip {
 
 namespace wire = ::control_link::network::v1;
 
+// 子协议结构校验共享于两种transport；不校验命令业务时效或认证身份。
+bool valid_opening_domain(const wire::OpenAdmissionDomain &domain);
+bool same_opening_domain(const wire::OpenAdmissionDomain &left,
+                         const wire::OpenAdmissionDomain &right);
+
 // 公共入口只需传输资源预算；gRPC 不必构造 SOME/IP 地址、method 或 SD 配置。
 // idle_timeout_ms 仅 SOME/IP 使用，gRPC holder 存活由 control RPC owner 撤销。
 struct IngressResources {
   std::uint32_t max_payload_bytes{0};
   std::uint32_t retired_open_capacity{0};
   std::uint32_t idle_timeout_ms{0};
+  // 默认uint64边界；focused可缩小以验证不回绕，生产配置不提供扩大入口。
+  std::uint64_t admission_generation_limit{std::numeric_limits<std::uint64_t>::max()};
 };
 
 struct IngressSnapshot {
@@ -26,6 +34,8 @@ struct IngressSnapshot {
   wire::ControlSessionState state{wire::CONTROL_SESSION_STATE_IDLE};
   wire::SessionInfo session;
   std::string failure;
+  wire::OpenAdmissionDomain opening_domain;
+  std::size_t retired_open_count{0};
 };
 
 // 只拥有网络holder、epoch和容量1转发资格；业务合法性、lease和仲裁始终归Gateway。
@@ -35,7 +45,8 @@ class PlanningIngress final {
   explicit PlanningIngress(Config config, wire::Capabilities capabilities,
                            wire::PlanningTransport transport = wire::PLANNING_TRANSPORT_SOMEIP);
   explicit PlanningIngress(IngressResources resources, wire::Capabilities capabilities,
-                           wire::PlanningTransport transport = wire::PLANNING_TRANSPORT_SOMEIP);
+                           wire::PlanningTransport transport = wire::PLANNING_TRANSPORT_SOMEIP,
+                           std::function<std::string()> identity_source = {});
   ~PlanningIngress();
   PlanningIngress(const PlanningIngress &) = delete;
   PlanningIngress &operator=(const PlanningIngress &) = delete;
@@ -57,9 +68,14 @@ class PlanningIngress final {
   bool cancel_pending_submission(std::uint64_t epoch, std::uint64_t submission_id);
   void expire(std::uint64_t steady_ns);
   void revoke(const std::string &reason);
+  // 永久关闭本实例的开立资格；释放ROS资源仍归原串行owner。
+  void stop();
   bool revoke_if_current(std::uint64_t epoch, const std::string &reason);
   bool finish_release(std::uint64_t revoked_epoch);
   IngressSnapshot snapshot() const;
+  // 公开域发现不占有holder，不刷新Keep或业务时间。
+  wire::OpenAdmissionDomain opening_domain() const;
+  wire::Capabilities capabilities() const;
   bool bind_publisher(std::uint64_t epoch, const std::string &gid,
                       const std::string &rmw);
   bool set_admitted(std::uint64_t epoch, bool ready,

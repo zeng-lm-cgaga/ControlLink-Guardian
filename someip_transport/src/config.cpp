@@ -50,6 +50,11 @@ std::size_t mandatory_payload_bytes(const ::control_link::network::v1::Capabilit
   observation.set_validity(wire::OBSERVATION_VALIDITY_INVALID);
   wire::OpenSessionResponse response;
   *response.mutable_capabilities() = capabilities;
+  wire::OpenAdmissionDomain opening_domain;
+  opening_domain.set_service_instance_id(std::string(codec::kSessionTokenSize, 'i'));
+  opening_domain.set_generation(maximum64);
+  opening_domain.set_domain_version(1);
+  *response.mutable_capabilities()->mutable_opening_domain() = opening_domain;
   response.set_result(wire::SESSION_OPERATION_RESULT_ADMITTED);
   response.set_open_request_id(std::string(codec::kSessionTokenSize, 'o'));
   auto *session = response.mutable_session();
@@ -60,6 +65,7 @@ std::size_t mandatory_payload_bytes(const ::control_link::network::v1::Capabilit
   *session->mutable_ingress_publisher() = publisher;
   session->set_clock_domain(wire::CLOCK_DOMAIN_SYSTEM);
   session->set_control_session_state(wire::CONTROL_SESSION_STATE_ADMITTED);
+  *session->mutable_opening_domain() = opening_domain;
   wire::StatusEnvelope envelope;
   envelope.set_schema_version(1);
   envelope.set_schema_fingerprint(capabilities.schema_fingerprint());
@@ -68,6 +74,7 @@ std::size_t mandatory_payload_bytes(const ::control_link::network::v1::Capabilit
   envelope.set_published_system_ns(-1);
   envelope.set_published_boottime_ns(maximum64);
   auto *snapshot = envelope.mutable_status();
+  *snapshot->mutable_opening_domain() = opening_domain;
   *snapshot->mutable_session() = *session;
   snapshot->mutable_session()->clear_session_token();
   auto *counters = snapshot->mutable_transport();

@@ -19,7 +19,7 @@ safety_owners:
   fingerprint_algorithm: sha256_proto_source_bytes
 
 control_session_resources:
-  # 仅保留退役幂等键；满额拒绝新开立，不驱逐旧键而允许旧握手复活。
+  # 当前开立域内退役幂等键预算；释放后先关闭旧域，再回收其键，不限制服务总轮换次数。
   retired_open_capacity: 64
 
 someip:

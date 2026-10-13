@@ -101,6 +101,7 @@ struct GrpcServer::Impl {
     capabilities.set_schema_version(1);
     capabilities.set_schema_fingerprint(network::schema_fingerprint());
     capabilities.set_planning_transport(wire::PLANNING_TRANSPORT_GRPC);
+    *capabilities.mutable_opening_domain() = ingress->opening_domain();
     if (config.max_message_bytes < network::required_protocol_payload_bytes(capabilities, "r"))
       throw std::invalid_argument("gRPC payload cannot hold mandatory capabilities/session/status replies");
   }
@@ -286,7 +287,7 @@ struct GrpcServer::Impl {
         terminate(call, grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "Missing/unknown schema version"), "INVALID_SCHEMA");
         return;
       }
-      call.capabilities_response = capabilities;
+      call.capabilities_response = ingress->capabilities();
     } else if (call.kind == Kind::status || call.kind == Kind::subscription) {
       const bool valid = call.kind == Kind::status ?
           call.status_request.schema_version_presence_case() == wire::GetStatusRequest::kSchemaVersion && call.status_request.schema_version() == 1 :
@@ -435,7 +436,7 @@ struct GrpcServer::Impl {
     std::lock_guard<std::mutex> shutdown_lock(shutdown_mutex);
     if (!server) return;
     stopping.store(true);
-    ingress->revoke("GRPC_STOP");
+    ingress->stop();
     std::vector<std::shared_ptr<Call>> active;
     {
       std::lock_guard<std::mutex> lock(calls_mutex);

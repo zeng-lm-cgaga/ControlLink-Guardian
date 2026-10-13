@@ -277,6 +277,7 @@ class Probe final {
     close.set_schema_version(1);
     close.set_holder_nonce(nonce_);
     close.set_open_request_id(open_key_);
+    *close.mutable_opening_domain() = opening_domain_;
     const auto closed = client_.close(close, timeout(100));
     emit("\"event\":\"close\",\"result\":" + std::to_string(closed.result()));
     client_.stop();
@@ -295,6 +296,7 @@ class Probe final {
   Steady::time_point deadline_;
   std::string nonce_;
   std::string open_key_;
+  wire::OpenAdmissionDomain opening_domain_;
   std::string token_;
   std::string gid_;
   std::uint64_t generation_{0};
@@ -380,6 +382,7 @@ class Probe final {
   void new_keys() {
     nonce_ = network::random_identity();
     open_key_ = network::random_identity();
+    opening_domain_.Clear();
     token_.clear();
     gid_.clear();
     sequence_ = 0;
@@ -414,6 +417,7 @@ class Probe final {
     request.set_holder_nonce(nonce_);
     request.set_open_request_id(open_key_);
     request.set_keepalive_sequence(++keep_sequence_);
+    *request.mutable_opening_domain() = opening_domain_;
     next_keep_ = Steady::now() + Milliseconds(arguments_.keep_period_ms);
     reply(client_.keep(request, timeout()));
   }
@@ -439,6 +443,8 @@ class Probe final {
         request.set_schema_version(1);
         request.set_holder_nonce(nonce_);
         request.set_open_request_id(open_key_);
+        if (!opening_domain_.has_generation()) opening_domain_ = client_.get_capabilities().opening_domain();
+        *request.mutable_opening_domain() = opening_domain_;
         requested = true;
         next_open = Steady::now() + Milliseconds(config_.reconnect_initial_ms);
         try { reply(client_.open(request, timeout(100))); }

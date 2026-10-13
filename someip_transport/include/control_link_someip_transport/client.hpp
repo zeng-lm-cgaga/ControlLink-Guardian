@@ -38,6 +38,8 @@ class SomeipClient final {
   bool wait_available(std::chrono::milliseconds timeout);
   // 只影响只读订阅；不会 Close、续期或重开控制 holder/token/publisher generation。
   void set_status_subscription(bool enabled);
+  // Open/Keep/Close均要求调用者显式保存同一opening_domain；SDK不发现或重绑定旧请求。
+  // 新键对可先GetStatus发现当前域，响应丢失重试必须保留原请求，域不是授权或认证。
   wire::OpenSessionResponse open(const wire::OpenSessionRequest &request,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
   wire::OpenSessionResponse keep(const wire::KeepSessionRequest &request,

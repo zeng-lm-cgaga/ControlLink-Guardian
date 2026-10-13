@@ -42,11 +42,12 @@ wire::Capabilities fixture_capabilities() {
   return capabilities;
 }
 
-wire::OpenSessionRequest open_request(char identity = 'a') {
+wire::OpenSessionRequest open_request(const PlanningIngress &ingress, char identity = 'a') {
   wire::OpenSessionRequest request;
   request.set_schema_version(1);
   request.set_holder_nonce(std::string(16, identity));
   request.set_open_request_id(std::string(16, identity + 1));
+  *request.mutable_opening_domain() = ingress.opening_domain();
   return request;
 }
 
@@ -57,6 +58,7 @@ wire::KeepSessionRequest keep_request(const wire::OpenSessionRequest &open,
   request.set_holder_nonce(open.holder_nonce());
   request.set_open_request_id(open.open_request_id());
   request.set_keepalive_sequence(sequence);
+  *request.mutable_opening_domain() = open.opening_domain();
   return request;
 }
 
@@ -65,6 +67,7 @@ wire::CloseSessionRequest close_request(const wire::OpenSessionRequest &open) {
   request.set_schema_version(1);
   request.set_holder_nonce(open.holder_nonce());
   request.set_open_request_id(open.open_request_id());
+  *request.mutable_opening_domain() = open.opening_domain();
   return request;
 }
 
@@ -93,7 +96,7 @@ class SomeipIngress : public ::testing::Test {
 
   Config config;
   PlanningIngress ingress;
-  wire::OpenSessionRequest request = open_request();
+  wire::OpenSessionRequest request = open_request(ingress);
   const std::string gid = std::string(24, 'g');
   const std::uint64_t initial_ns = 1000000000;
   std::uint64_t epoch{0};
@@ -126,7 +129,7 @@ TEST_F(SomeipIngress, CompetitorOrChangedKeyIsBusyWithoutLeakingOrChangingSessio
   EXPECT_EQ(competitor.result(), wire::SESSION_OPERATION_RESULT_BUSY);
   EXPECT_FALSE(competitor.has_session());
   EXPECT_EQ(competitor.open_request_id(), request.open_request_id());
-  const auto changed = ingress.open(0x3101, open_request('c'), initial_ns + 2);
+  const auto changed = ingress.open(0x3101, open_request(ingress, 'c'), initial_ns + 2);
   EXPECT_EQ(changed.result(), wire::SESSION_OPERATION_RESULT_BUSY);
   EXPECT_FALSE(changed.has_session());
   EXPECT_EQ(ingress.snapshot().epoch, epoch);
@@ -172,7 +175,7 @@ TEST_F(SomeipIngress, LateKeepCannotReviveExpiredHolderAndTimeRegressionFailsClo
   EXPECT_FALSE(late.has_session());
   EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_REVOKING);
   ASSERT_TRUE(ingress.finish_release(ingress.snapshot().epoch));
-  ASSERT_EQ(ingress.open(0x3101, open_request('c'), initial_ns + 6000000000).result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  ASSERT_EQ(ingress.open(0x3101, open_request(ingress, 'c'), initial_ns + 6000000000).result(), wire::SESSION_OPERATION_RESULT_OPENING);
   ingress.expire(initial_ns + 5999999999);
   EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_REVOKING);
   EXPECT_EQ(ingress.snapshot().failure, "STEADY_CLOCK_REGRESSION");
@@ -319,31 +322,102 @@ TEST_F(SomeipIngress, MatchingCloseRevokesOnceAndReleaseRequiresCurrentRevokedEp
   EXPECT_EQ(ingress.snapshot().epoch, revoked_epoch);
   EXPECT_FALSE(ingress.publish_pending(epoch, 11, [](const auto &) {}));
   EXPECT_FALSE(ingress.finish_release(epoch));
-  EXPECT_EQ(ingress.open(0x3102, open_request('c'), initial_ns + 1).result(), wire::SESSION_OPERATION_RESULT_BUSY);
+  EXPECT_EQ(ingress.open(0x3102, open_request(ingress, 'c'), initial_ns + 1).result(), wire::SESSION_OPERATION_RESULT_BUSY);
   ASSERT_TRUE(ingress.finish_release(revoked_epoch));
   EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_IDLE);
   EXPECT_TRUE(ingress.snapshot().session.session_token().empty());
   EXPECT_FALSE(ingress.finish_release(revoked_epoch));
 }
 
-TEST_F(SomeipIngress, RetiredKeysCannotReviveWithReusedPeerAndCapacityNeverEvicts) {
+TEST_F(SomeipIngress, RetiredDomainRequestsCannotReviveWithReusedPeerAfterBoundedReclamation) {
   auto small = config;
   small.retired_open_capacity = 2;
   PlanningIngress limited(small, fixture_capabilities());
-  const auto first = open_request('a');
-  const auto second = open_request('c');
-  for (const auto &key : {first, second}) {
-    ASSERT_EQ(limited.open(0x3101, key, initial_ns).result(), wire::SESSION_OPERATION_RESULT_OPENING);
-    limited.revoke("fixture close");
-    ASSERT_TRUE(limited.finish_release(limited.snapshot().epoch));
-  }
-  EXPECT_EQ(limited.open(0x3102, first, initial_ns).result(), wire::SESSION_OPERATION_RESULT_REJECTED);
-  const auto rejected = limited.open(0x3101, open_request('e'), initial_ns);
-  EXPECT_EQ(rejected.result(), wire::SESSION_OPERATION_RESULT_RESOURCE_EXHAUSTED);
-  EXPECT_FALSE(rejected.has_session());
-  EXPECT_NE(limited.snapshot().failure.find("RESOURCE_EXHAUSTED"), std::string::npos);
+  const auto first = open_request(limited, 'a');
+  const auto first_bytes = first.SerializeAsString();
+  ASSERT_EQ(limited.open(0x3101, first, initial_ns).result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  ASSERT_EQ(limited.close(0x3101, close_request(first)).result(), wire::SESSION_OPERATION_RESULT_REVOKED);
+  ASSERT_TRUE(limited.finish_release(limited.snapshot().epoch));
+  EXPECT_EQ(limited.snapshot().retired_open_count, 0U);
+  const auto second = open_request(limited, 'c');
+  ASSERT_EQ(limited.open(0x3101, second, initial_ns + 1).result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  ASSERT_EQ(limited.close(0x3101, close_request(second)).result(), wire::SESSION_OPERATION_RESULT_REVOKED);
+  ASSERT_TRUE(limited.finish_release(limited.snapshot().epoch));
   EXPECT_EQ(limited.snapshot().state, wire::CONTROL_SESSION_STATE_IDLE);
-  EXPECT_EQ(limited.open(0x3101, second, initial_ns).result(), wire::SESSION_OPERATION_RESULT_REJECTED);
+  EXPECT_EQ(limited.snapshot().retired_open_count, 0U);
+  for (const auto &retired : {first, second}) {
+    for (const auto peer : {0x3101, 0x3102}) {
+      const auto rejected = limited.open(peer, retired, initial_ns + 2);
+      EXPECT_EQ(rejected.result(), wire::SESSION_OPERATION_RESULT_REJECTED);
+      EXPECT_EQ(rejected.failure_reason(), "OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE");
+      EXPECT_FALSE(rejected.has_session());
+    }
+  }
+  EXPECT_EQ(first.SerializeAsString(), first_bytes);
+  const auto fresh = open_request(limited, 'a');
+  EXPECT_EQ(fresh.holder_nonce(), first.holder_nonce());
+  EXPECT_EQ(fresh.open_request_id(), first.open_request_id());
+  EXPECT_NE(fresh.opening_domain().generation(), first.opening_domain().generation());
+  EXPECT_EQ(limited.open(0x3101, fresh, initial_ns + 3).result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  EXPECT_LE(limited.snapshot().retired_open_count, small.retired_open_capacity);
+}
+
+TEST_F(SomeipIngress, OldDomainKeepCloseAndOpenCannotAffectReusedPeerKeysOrExtendNewHolderIdle) {
+  admit();
+  const auto retired_request = request;
+  const auto retired_bytes = retired_request.SerializeAsString();
+  const auto retired_token = token;
+  ASSERT_EQ(ingress.close(0x3101, close_request(retired_request)).result(), wire::SESSION_OPERATION_RESULT_REVOKED);
+  ASSERT_TRUE(ingress.finish_release(ingress.snapshot().epoch));
+  const auto new_request = open_request(ingress);
+  EXPECT_EQ(new_request.holder_nonce(), retired_request.holder_nonce());
+  EXPECT_EQ(new_request.open_request_id(), retired_request.open_request_id());
+  EXPECT_NE(new_request.opening_domain().generation(), retired_request.opening_domain().generation());
+  const auto opened_at = initial_ns + 1;
+  const auto opened = ingress.open(0x3101, new_request, opened_at);
+  ASSERT_EQ(opened.result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  const auto new_epoch = ingress.snapshot().epoch;
+  const auto new_token = opened.session().session_token();
+  ASSERT_NE(new_token, retired_token);
+  ASSERT_TRUE(ingress.bind_publisher(new_epoch, std::string(24, 'h'), "rmw_fastrtps_cpp"));
+  ASSERT_TRUE(ingress.set_admitted(new_epoch, true));
+  const auto target = command(new_token, 1);
+  ASSERT_EQ(ingress.submit(0x3101, target, 10).forwarding_state(), wire::FORWARDING_STATE_PENDING);
+  const auto before = ingress.snapshot();
+  const auto before_counters = ingress.readonly_status().transport();
+  auto missing_keep = keep_request(new_request, 1);
+  missing_keep.clear_opening_domain();
+  auto missing_close = close_request(new_request);
+  missing_close.clear_opening_domain();
+  const auto stale_open = ingress.open(0x3101, retired_request, opened_at + 4000000000);
+  EXPECT_EQ(stale_open.failure_reason(), "OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE");
+  for (const auto &response : {
+           stale_open,
+           ingress.keep(0x3101, keep_request(retired_request, 100), opened_at + 4000000000),
+           ingress.close(0x3101, close_request(retired_request)),
+           ingress.keep(0x3101, missing_keep, opened_at + 4000000000),
+           ingress.close(0x3101, missing_close)}) {
+    EXPECT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_REJECTED);
+    EXPECT_FALSE(response.has_session());
+    EXPECT_EQ(response.SerializeAsString().find(new_token), std::string::npos);
+  }
+  EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_ADMITTED);
+  EXPECT_EQ(ingress.snapshot().epoch, before.epoch);
+  EXPECT_EQ(ingress.snapshot().session.SerializeAsString(), before.session.SerializeAsString());
+  EXPECT_EQ(ingress.snapshot().opening_domain.SerializeAsString(), before.opening_domain.SerializeAsString());
+  EXPECT_EQ(ingress.readonly_status().transport().dropped_count(), before_counters.dropped_count());
+  auto obsolete = command(retired_token, 100);
+  obsolete.source_stamp_ns += 1000000000;
+  EXPECT_EQ(ingress.submit(0x3101, obsolete, 11).forwarding_state(), wire::FORWARDING_STATE_REJECTED);
+  ASSERT_TRUE(ingress.publish_pending(new_epoch, 12, [&](const auto &forwarded) {
+    EXPECT_EQ(forwarded.command_sequence, target.command_sequence);
+    EXPECT_EQ(forwarded.source_stamp_ns, target.source_stamp_ns);
+    EXPECT_EQ(forwarded.session_token.bytes, target.session_token.bytes);
+  }));
+  EXPECT_EQ(retired_request.SerializeAsString(), retired_bytes);
+  ingress.expire(opened_at + static_cast<std::uint64_t>(config.idle_timeout_ms) * 1000000);
+  EXPECT_EQ(ingress.snapshot().state, wire::CONTROL_SESSION_STATE_REVOKING);
+  EXPECT_EQ(ingress.snapshot().failure, "HOLDER_IDLE_TIMEOUT");
 }
 
 TEST_F(SomeipIngress, OldEpochTimeoutCompletionAndOldTokenCannotKillOrUseNewSession) {
@@ -353,7 +427,7 @@ TEST_F(SomeipIngress, OldEpochTimeoutCompletionAndOldTokenCannotKillOrUseNewSess
   ASSERT_TRUE(ingress.revoke_if_current(old_epoch, "graph timeout"));
   const auto revoked = ingress.snapshot().epoch;
   ASSERT_TRUE(ingress.finish_release(revoked));
-  const auto next = ingress.open(0x3101, open_request('c'), initial_ns + 1);
+  const auto next = ingress.open(0x3101, open_request(ingress, 'c'), initial_ns + 1);
   ASSERT_EQ(next.result(), wire::SESSION_OPERATION_RESULT_OPENING);
   const auto next_epoch = ingress.snapshot().epoch;
   ASSERT_TRUE(ingress.bind_publisher(next_epoch, std::string(24, 'h'), "rmw_fastrtps_cpp"));
@@ -396,7 +470,7 @@ TEST_F(SomeipIngress, FinalPublishAndRevocationShareOneSynchronizedCommitBoundar
   EXPECT_EQ(ingress.readonly_status().transport().forwarded_count(), 1);
   EXPECT_FALSE(ingress.publish_pending(epoch, 12, [](const auto &) { FAIL() << "old epoch published"; }));
   ASSERT_TRUE(ingress.finish_release(ingress.snapshot().epoch));
-  EXPECT_EQ(ingress.open(0x3101, open_request('c'), initial_ns + 1).result(), wire::SESSION_OPERATION_RESULT_OPENING);
+  EXPECT_EQ(ingress.open(0x3101, open_request(ingress, 'c'), initial_ns + 1).result(), wire::SESSION_OPERATION_RESULT_OPENING);
   EXPECT_FALSE(ingress.publish_pending(epoch, 13, [](const auto &) { FAIL() << "retired epoch published"; }));
 }
 
@@ -538,11 +612,12 @@ TEST_F(SomeipIngress, CapabilitiesAreCopiedForEveryReplyAndDoNotOwnBusinessThres
   auto advertised = fixture_capabilities();
   PlanningIngress local(config, advertised);
   advertised.set_contract_id("changed outside owner");
-  const auto opened = local.open(0x3101, request, initial_ns);
+  const auto local_request = open_request(local);
+  const auto opened = local.open(0x3101, local_request, initial_ns);
   EXPECT_EQ(opened.capabilities().contract_id(), "control-link-fixture");
   EXPECT_EQ(opened.capabilities().schema_version(), 1);
   EXPECT_EQ(opened.capabilities().schema_fingerprint().size(), 32);
-  const auto busy = local.open(0x3102, request, initial_ns + 1);
+  const auto busy = local.open(0x3102, local_request, initial_ns + 1);
   EXPECT_EQ(busy.capabilities().contract_id(), "control-link-fixture");
   EXPECT_FALSE(busy.has_session());
   EXPECT_EQ(busy.capabilities().schema_fingerprint(), opened.capabilities().schema_fingerprint());
@@ -596,7 +671,7 @@ TEST_F(SomeipIngress, RejectedHolderOperationsKeepPendingAndNeverDiscloseHolderT
   admit();
   const auto original = command(token);
   ASSERT_EQ(ingress.submit(0x3101, original, 10).forwarding_state(), wire::FORWARDING_STATE_PENDING);
-  const auto changed_key = open_request('k');
+  const auto changed_key = open_request(ingress, 'k');
   const auto wrong_peer_keep = ingress.keep(0x3102, keep_request(request, 1), initial_ns + 1);
   const auto changed_key_keep = ingress.keep(0x3101, keep_request(changed_key, 1), initial_ns + 2);
   const auto wrong_peer_close = ingress.close(0x3102, close_request(request));
@@ -630,7 +705,7 @@ TEST_F(SomeipIngress, RevocationBeforeCommitCannotPublishOrDropReplacementEpochT
   EXPECT_FALSE(ingress.publish_pending(old_epoch, 11, [&](const auto &) { old_published = true; }));
   EXPECT_FALSE(old_published);
   ASSERT_TRUE(ingress.finish_release(ingress.snapshot().epoch));
-  const auto replacement = ingress.open(0x3101, open_request('k'), initial_ns + 1);
+  const auto replacement = ingress.open(0x3101, open_request(ingress, 'k'), initial_ns + 1);
   ASSERT_EQ(replacement.result(), wire::SESSION_OPERATION_RESULT_OPENING);
   const auto replacement_epoch = ingress.snapshot().epoch;
   const auto replacement_gid = std::string(24, 'n');
@@ -656,7 +731,7 @@ TEST_F(SomeipIngress, RevocationBeforeCommitCannotPublishOrDropReplacementEpochT
 TEST_F(SomeipIngress, InvalidPublishCommitRevokesInsteadOfInventingForwardedObservation) {
   for (const bool missing_callback : {true, false}) {
     PlanningIngress local(config, fixture_capabilities());
-    const auto opened = local.open(0x3101, request, initial_ns);
+    const auto opened = local.open(0x3101, open_request(local), initial_ns);
     ASSERT_EQ(opened.result(), wire::SESSION_OPERATION_RESULT_OPENING);
     const auto current_epoch = local.snapshot().epoch;
     ASSERT_TRUE(local.bind_publisher(current_epoch, gid, "rmw_fastrtps_cpp"));

@@ -29,6 +29,8 @@ namespace {
 
 namespace network = ::control_link::network;
 using Milliseconds = std::chrono::milliseconds;
+using network::same_opening_domain;
+using network::valid_opening_domain;
 
 std::chrono::system_clock::time_point rpc_deadline(Milliseconds budget) {
   const auto count = static_cast<std::uint64_t>(budget.count());
@@ -55,6 +57,13 @@ bool readonly_has_token(const wire::StatusSnapshot &snapshot) {
   return !snapshot.session().session_token().empty() ||
       !snapshot.latest_forwarded().key().session_token().empty() ||
       !snapshot.latest_gateway_acceptance().key().session_token().empty();
+}
+
+template <typename Request>
+void require_opening_domain(const Request &request) {
+  if (!request.has_opening_domain() || !valid_opening_domain(request.opening_domain())) {
+    throw std::invalid_argument("gRPC Open/Keep/Close requires an explicit V1 opening domain; retain it for retries");
+  }
 }
 
 void valid_open(const wire::OpenSessionRequest &request) {
@@ -98,6 +107,7 @@ struct GrpcClient::Impl {
     std::shared_ptr<ControlExchange> exchange;
     std::string holder_nonce;
     std::string open_request_id;
+    wire::OpenAdmissionDomain opening_domain;
     std::uint64_t generation{0};
     bool start_pending{false};
     bool started{false};
@@ -199,7 +209,8 @@ struct GrpcClient::Impl {
 
   void validate_capabilities(const wire::Capabilities &capabilities) const {
     if (capabilities.schema_version() != 1 || capabilities.schema_fingerprint() != fingerprint ||
-        capabilities.planning_transport() != wire::PLANNING_TRANSPORT_GRPC) {
+        capabilities.planning_transport() != wire::PLANNING_TRANSPORT_GRPC ||
+        !capabilities.has_opening_domain() || !valid_opening_domain(capabilities.opening_domain())) {
       throw std::runtime_error("gRPC capabilities schema/fingerprint/transport mismatch");
     }
     bounded_message(capabilities, config.max_message_bytes);
@@ -231,6 +242,8 @@ struct GrpcClient::Impl {
       throw std::runtime_error("gRPC revoked session is not the matching private Close receipt");
     }
     if (session.session_token().size() != 16 ||
+        !session.has_opening_domain() || !same_opening_domain(session.opening_domain(), call.opening_domain) ||
+        !same_opening_domain(response.capabilities().opening_domain(), call.opening_domain) ||
         session.planning_transport() != wire::PLANNING_TRANSPORT_GRPC ||
         session.clock_domain() != wire::CLOCK_DOMAIN_SYSTEM ||
         (!session.ingress_publisher().gid().empty() && session.ingress_publisher().gid().size() != 24) ||
@@ -249,6 +262,10 @@ struct GrpcClient::Impl {
         envelope.published_system_presence_case() != wire::StatusEnvelope::kPublishedSystemNs ||
         envelope.published_boottime_presence_case() != wire::StatusEnvelope::kPublishedBoottimeNs ||
         envelope.published_boottime_ns() == 0 || !envelope.has_status() ||
+        !envelope.status().has_opening_domain() || !valid_opening_domain(envelope.status().opening_domain()) ||
+        (envelope.status().has_session() &&
+         (!envelope.status().session().has_opening_domain() ||
+          !same_opening_domain(envelope.status().session().opening_domain(), envelope.status().opening_domain()))) ||
         readonly_has_token(envelope.status())) {
       throw std::runtime_error("gRPC readonly envelope schema/presence/token-redaction mismatch");
     }
@@ -271,6 +288,8 @@ struct GrpcClient::Impl {
     // readonly 只能撤可提交提示；不得借脱敏状态开立、升级或旋转控制 holder。
     if (envelope.status().has_session() &&
         (!envelope.status().session().submission_ready() ||
+         (current.session.has_opening_domain() &&
+          !same_opening_domain(current.session.opening_domain(), envelope.status().opening_domain())) ||
          (!current.session.ingress_publisher().gid().empty() &&
           current.session.ingress_publisher().gid() != envelope.status().session().ingress_publisher().gid()))) {
       ++readiness_revision;
@@ -343,7 +362,7 @@ struct GrpcClient::Impl {
             }
           }
           if (!call->incoming.has_session()) {
-            cancel_control_locked(call, "gRPC holder rejected or revoked");
+            cancel_control_locked(call, "gRPC holder rejected or revoked: " + call->incoming.failure_reason());
           }
         } catch (const std::exception &failure) {
           if (call->exchange) call->exchange->error = failure.what();
@@ -399,6 +418,7 @@ struct GrpcClient::Impl {
     auto call = std::make_shared<ControlCall>();
     call->holder_nonce = request.holder_nonce();
     call->open_request_id = request.open_request_id();
+    call->opening_domain = request.opening_domain();
     call->generation = ++current.control_generation;
     call->context.set_deadline(rpc_deadline(Milliseconds(config.max_control_stream_lifetime_ms)));
     call->context.set_wait_for_ready(false);
@@ -441,6 +461,11 @@ struct GrpcClient::Impl {
     if (request.has_close()) { nonce = request.close().holder_nonce(); key = request.close().open_request_id(); }
     if (nonce != call->holder_nonce || key != call->open_request_id) {
       throw std::invalid_argument("gRPC live RPC requires unchanged holder nonce/open_request_id");
+    }
+    const auto &opening_domain = request.has_open() ? request.open().opening_domain() :
+        request.has_keep() ? request.keep().opening_domain() : request.close().opening_domain();
+    if (!same_opening_domain(opening_domain, call->opening_domain)) {
+      throw std::invalid_argument("gRPC live RPC requires its original opening domain");
     }
     if (call->closing || call->exchange) {
       throw std::runtime_error("gRPC control request slot busy or RPC closing");
@@ -660,12 +685,14 @@ bool GrpcClient::wait_available(Milliseconds timeout) {
 
 wire::OpenSessionResponse GrpcClient::open(const wire::OpenSessionRequest &request, Milliseconds timeout) {
   valid_open(request);
+  require_opening_domain(request);
   wire::ControlSessionRequest operation;
   *operation.mutable_open() = request;
   return impl_->control_exchange(operation, timeout);
 }
 
 wire::OpenSessionResponse GrpcClient::keep(const wire::KeepSessionRequest &request, Milliseconds timeout) {
+  require_opening_domain(request);
   if (request.schema_version_presence_case() != wire::KeepSessionRequest::kSchemaVersion || request.schema_version() != 1 ||
       request.holder_nonce().size() != 16 || request.open_request_id().size() != 16 ||
       request.keepalive_sequence_presence_case() != wire::KeepSessionRequest::kKeepaliveSequence) {
@@ -677,6 +704,7 @@ wire::OpenSessionResponse GrpcClient::keep(const wire::KeepSessionRequest &reque
 }
 
 wire::OpenSessionResponse GrpcClient::close(const wire::CloseSessionRequest &request, Milliseconds timeout) {
+  require_opening_domain(request);
   if (request.schema_version_presence_case() != wire::CloseSessionRequest::kSchemaVersion || request.schema_version() != 1 ||
       request.holder_nonce().size() != 16 || request.open_request_id().size() != 16) {
     throw std::invalid_argument("gRPC close requires V1 presence and exact holder keys");
@@ -969,6 +997,7 @@ int run_planning_example(int argc, char **argv) {
         << " source=planning frame=body clock=SYSTEM units=m/s,rad/s" << std::endl;
     auto nonce = network::random_identity();
     auto open_key = network::random_identity();
+    wire::OpenAdmissionDomain opening_domain;
     std::string token;
     std::uint64_t sequence = 0;
     std::uint64_t keep_sequence = 0;
@@ -1011,6 +1040,7 @@ int run_planning_example(int argc, char **argv) {
       if (used_rpc && !state.control_rpc_live) {
         nonce = network::random_identity();
         open_key = network::random_identity();
+        opening_domain.Clear();
         token.clear();
         sequence = 0;
         keep_sequence = 0;
@@ -1037,6 +1067,7 @@ int run_planning_example(int argc, char **argv) {
             request.set_schema_version(1);
             request.set_holder_nonce(nonce);
             request.set_open_request_id(open_key);
+            *request.mutable_opening_domain() = opening_domain;
             if (keep_sequence == std::numeric_limits<std::uint64_t>::max()) {
               throw std::runtime_error("Keep sequence exhausted; explicit new RPC required");
             }
@@ -1046,10 +1077,15 @@ int run_planning_example(int argc, char **argv) {
           }
           now = std::chrono::steady_clock::now();
           if (!ready && now >= next_open) {
+            // 仅新键对取一次公开域；同live RPC的重试与Keep永远保留原域。
+            if (!valid_opening_domain(opening_domain)) {
+              opening_domain = client.get_capabilities(command_wait).opening_domain();
+            }
             wire::OpenSessionRequest request;
             request.set_schema_version(1);
             request.set_holder_nonce(nonce);
             request.set_open_request_id(open_key);
+            *request.mutable_opening_domain() = opening_domain;
             next_open = now + Milliseconds(open_backoff);
             open_backoff = static_cast<std::uint32_t>(std::min<std::uint64_t>(
                 config.reconnect_max_ms, static_cast<std::uint64_t>(open_backoff) * 2));
@@ -1126,6 +1162,7 @@ int run_planning_example(int argc, char **argv) {
       request.set_schema_version(1);
       request.set_holder_nonce(nonce);
       request.set_open_request_id(open_key);
+      *request.mutable_opening_domain() = opening_domain;
       try { client.close(request, Milliseconds(std::min<std::uint32_t>(100, config.max_unary_deadline_ms))); }
       catch (const std::exception &failure) { std::cerr << "close=" << failure.what() << std::endl; }
     }

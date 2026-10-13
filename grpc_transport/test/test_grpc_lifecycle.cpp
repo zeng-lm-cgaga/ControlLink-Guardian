@@ -77,7 +77,7 @@ class LoopbackPort final {
   std::string address_;
 };
 
-wire::ControlSessionRequest open_request(char identity) {
+wire::ControlSessionRequest make_open_request(char identity) {
   wire::ControlSessionRequest request;
   auto *open = request.mutable_open();
   open->set_schema_version(1);
@@ -94,6 +94,7 @@ wire::ControlSessionRequest keep_request(const wire::ControlSessionRequest &open
   keep->set_holder_nonce(open.open().holder_nonce());
   keep->set_open_request_id(open.open().open_request_id());
   keep->set_keepalive_sequence(sequence);
+  *keep->mutable_opening_domain() = open.open().opening_domain();
   return request;
 }
 
@@ -228,6 +229,11 @@ std::size_t expect_redacted(const google::protobuf::Message &message) {
 
 class GrpcLifecycle : public ::testing::Test {
  protected:
+  wire::ControlSessionRequest open_request(char identity) {
+    auto request = make_open_request(identity);
+    *request.mutable_open()->mutable_opening_domain() = ingress_->opening_domain();
+    return request;
+  }
   void SetUp() override {
     config_ = load_config(CONTROL_LINK_PROTOCOL_CONFIG_PATH);
     start_fresh();
@@ -309,6 +315,80 @@ TEST(GrpcReplyPolicy, LaterReadonlyRevocationCannotBeUndoneByEarlierRequestReply
   EXPECT_TRUE(reply_preserves_readiness(true, 3, 3));
 }
 
+TEST_F(GrpcLifecycle, BoundedOpeningDomainsRotateThroughRealRpcAndRejectFrozenOldRequests) {
+  server_->stop();
+  expect_drained();
+  config_.ingress.retired_open_capacity = 1;
+  start_fresh();
+  wire::ControlSessionRequest original;
+  std::string previous_token;
+  for (std::uint64_t iteration = 0; iteration < 128; ++iteration) {
+    grpc::ClientContext query_context;
+    query_context.set_deadline(std::chrono::system_clock::now() + 1s);
+    wire::GetCapabilitiesRequest query;
+    query.set_schema_version(1);
+    wire::Capabilities observed;
+    ASSERT_TRUE(stub_->GetCapabilities(&query_context, query, &observed).ok());
+    ASSERT_EQ(observed.opening_domain().domain_version(), 1U);
+    ASSERT_EQ(observed.opening_domain().generation(), iteration + 1);
+    ASSERT_EQ(observed.opening_domain().service_instance_id().size(), 16U);
+    auto request = make_open_request('r');
+    *request.mutable_open()->mutable_opening_domain() = observed.opening_domain();
+    if (iteration == 0) original = request;
+    ControlStream holder(*stub_, 5s);
+    wire::OpenSessionResponse response;
+    ASSERT_TRUE(holder.write(request));
+    ASSERT_TRUE(holder.read(&response));
+    ASSERT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_OPENING);
+    ASSERT_TRUE(response.has_session());
+    const auto token = response.session().session_token();
+    EXPECT_NE(token, previous_token);
+    previous_token = token;
+    const auto epoch = ingress_->snapshot().epoch;
+    ASSERT_TRUE(holder.write(request));
+    ASSERT_TRUE(holder.read(&response));
+    EXPECT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_IDEMPOTENT);
+    EXPECT_EQ(response.session().session_token(), token);
+    EXPECT_EQ(ingress_->snapshot().epoch, epoch);
+    if (iteration == 0) {
+      ControlStream missing(*stub_, 2s);
+      ASSERT_TRUE(missing.write(make_open_request('x')));
+      ASSERT_TRUE(missing.read(&response));
+      EXPECT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_REJECTED);
+      EXPECT_EQ(response.failure_reason(), "OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE");
+      EXPECT_FALSE(response.has_session());
+      missing.cancel();
+      missing.finish();
+      ControlStream competing(*stub_, 2s);
+      ASSERT_TRUE(competing.write(request));
+      ASSERT_TRUE(competing.read(&response));
+      EXPECT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_BUSY);
+      EXPECT_FALSE(response.has_session());
+      competing.cancel();
+      competing.finish();
+    } else {
+      ControlStream stale(*stub_, 2s);
+      ASSERT_TRUE(stale.write(original));
+      ASSERT_TRUE(stale.read(&response));
+      EXPECT_EQ(response.result(), wire::SESSION_OPERATION_RESULT_REJECTED);
+      EXPECT_EQ(response.failure_reason(), "OPEN_ADMISSION_DOMAIN_REQUIRED_OR_STALE");
+      EXPECT_FALSE(response.has_session());
+      stale.cancel();
+      stale.finish();
+    }
+    ASSERT_TRUE(holder.write(keep_request(request, 1)));
+    ASSERT_TRUE(holder.read(&response));
+    EXPECT_EQ(response.session().session_token(), token);
+    ASSERT_TRUE(holder.half_close());
+    ASSERT_TRUE(await([this] { return ingress_->snapshot().state == wire::CONTROL_SESSION_STATE_REVOKING; }));
+    holder.finish();
+    EXPECT_FALSE(ingress_->publish_pending(epoch, 100, [](const auto &) { FAIL() << "old epoch published"; }));
+    ASSERT_TRUE(release_revoked());
+    EXPECT_EQ(ingress_->snapshot().retired_open_count, 0U);
+    EXPECT_EQ(ingress_->snapshot().opening_domain.generation(), iteration + 2);
+  }
+}
+
 TEST_F(GrpcLifecycle, InstalledSdkControlAndReadonlyCloseKeepSeparateResponsibilities) {
   GrpcClient client(config_);
   client.start();
@@ -331,6 +411,7 @@ TEST_F(GrpcLifecycle, InstalledSdkControlAndReadonlyCloseKeepSeparateResponsibil
   close.set_schema_version(1);
   close.set_holder_nonce(request.open().holder_nonce());
   close.set_open_request_id(request.open().open_request_id());
+  *close.mutable_opening_domain() = request.open().opening_domain();
   const auto closed = client.close(close);
   EXPECT_EQ(closed.result(), wire::SESSION_OPERATION_RESULT_REVOKED);
   EXPECT_EQ(closed.session().session_token(), opened.session().session_token());

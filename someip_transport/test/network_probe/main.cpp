@@ -515,13 +515,22 @@ class Probe final {
 
  private:
   void new_keys() {
+    const auto discovered = peer_.get_status().status();
+    require(discovered.has_opening_domain() && net::valid_opening_domain(discovered.opening_domain()),
+            "New handshake requires a structurally valid public opening domain");
     request_.Clear();
     request_.set_schema_version(1);
     request_.set_holder_nonce(net::random_identity());
     request_.set_open_request_id(net::random_identity());
+    *request_.mutable_opening_domain() = discovered.opening_domain();
     keep_sequence_ = 0;
     command_sequence_ = 0;
     next_keep_ = Clock::now();
+    log_.emit("new_keys_domain_frozen", {
+        {"service_instance_id", quoted(hex(request_.opening_domain().service_instance_id()))},
+        {"opening_generation", std::to_string(request_.opening_domain().generation())},
+        {"domain_version", std::to_string(request_.opening_domain().domain_version())},
+        {"open_key_sha256", quoted(digest(request_.open_request_id()))}});
   }
 
   void log_session(const std::string &event, const wire::OpenSessionResponse &response) {
@@ -530,14 +539,23 @@ class Probe final {
         {"ready", response.session().submission_ready() ? "true" : "false"},
         {"token_sha256", quoted(response.has_session() ? digest(response.session().session_token()) : "")},
         {"gid", quoted(hex(response.session().ingress_publisher().gid()))},
+        {"opening_generation", std::to_string(request_.opening_domain().generation())},
         {"open_key_sha256", quoted(digest(request_.open_request_id()))}});
   }
 
   void validate_reply(const wire::OpenSessionResponse &response) {
     require(response.open_request_id() == request_.open_request_id() && response.has_capabilities() &&
             response.capabilities().schema_version() == 1 &&
-            response.capabilities().schema_fingerprint() == net::network_schema_fingerprint(),
+            response.capabilities().schema_fingerprint() == net::network_schema_fingerprint() &&
+            response.capabilities().has_opening_domain() &&
+            net::valid_opening_domain(response.capabilities().opening_domain()),
             "Session response key/schema/fingerprint mismatch");
+    if (response.has_session()) {
+      require(response.session().has_opening_domain() &&
+                  net::same_opening_domain(response.session().opening_domain(), request_.opening_domain()) &&
+                  net::same_opening_domain(response.capabilities().opening_domain(), request_.opening_domain()),
+              "Private holder reply did not preserve the requested opening domain");
+    }
   }
 
   void same_session(const wire::OpenSessionResponse &response) {
@@ -557,6 +575,7 @@ class Probe final {
     request.set_schema_version(1);
     request.set_holder_nonce(request_.holder_nonce());
     request.set_open_request_id(request_.open_request_id());
+    *request.mutable_opening_domain() = request_.opening_domain();
     request.set_keepalive_sequence(++keep_sequence_);
     next_keep_ = Clock::now() + Milliseconds(options_.keep_ms);
     const auto response = peer_.keep(request);
@@ -565,6 +584,8 @@ class Probe final {
   }
 
   void establish(bool discard_first) {
+    require(request_.has_opening_domain() && net::valid_opening_domain(request_.opening_domain()),
+            "Handshake domain must be frozen before the first Open or response discard");
     wire::OpenSessionResponse response;
     if (discard_first && peer_.is_raw()) {
       const auto first = peer_.discard_first_open(request_);
@@ -736,6 +757,7 @@ class Probe final {
     request.set_schema_version(1);
     request.set_holder_nonce(request_.holder_nonce());
     request.set_open_request_id(request_.open_request_id());
+    *request.mutable_opening_domain() = request_.opening_domain();
     const auto response = peer_.close(request);
     validate_reply(response);
     require(response.result() == wire::SESSION_OPERATION_RESULT_REVOKED &&

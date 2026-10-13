@@ -41,6 +41,8 @@ class GrpcClient final {
 
   void start();
   bool wait_available(std::chrono::milliseconds timeout);
+  // 新键对先GetCapabilities发现域并保存；Open/Keep/Close必须显式带同一域。
+  // SDK不更新旧请求的域；readonly发现及透明重连不能使旧开立或旧目标复活。
   wire::OpenSessionResponse open(const wire::OpenSessionRequest &request,
       std::chrono::milliseconds timeout = std::chrono::milliseconds(500));
   wire::OpenSessionResponse keep(const wire::KeepSessionRequest &request,

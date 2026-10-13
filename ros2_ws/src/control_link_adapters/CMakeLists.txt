@@ -98,6 +98,7 @@ add_library(${PROJECT_NAME} SHARED
 	src/hardware_component_monitor.cpp
 	src/tf_health_monitor.cpp
 	src/twist_ingress_adapter.cpp
+	src/control_command_ingress_adapter.cpp
 	src/ros2_control_adapter.cpp
 )
 
@@ -140,6 +141,10 @@ add_executable(twist_ingress_adapter_node
 
 add_executable(socketcan_adapter_node
 	src/socketcan_adapter_main.cpp
+)
+
+add_executable(control_command_ingress_adapter_node
+	src/control_command_ingress_adapter_main.cpp
 )
 
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
@@ -227,11 +232,13 @@ target_compile_options(mock_control_source_node PRIVATE -Wall -Wextra -Wpedantic
 target_compile_options(mock_vehicle_adapter_node PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(ros2_control_adapter_node PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(twist_ingress_adapter_node PRIVATE -Wall -Wextra -Wpedantic)
+target_compile_options(control_command_ingress_adapter_node PRIVATE -Wall -Wextra -Wpedantic)
 target_compile_options(socketcan_adapter_node PRIVATE -Wall -Wextra -Wpedantic)
 target_link_libraries(mock_control_source_node ${PROJECT_NAME})
 target_link_libraries(mock_vehicle_adapter_node ${PROJECT_NAME})
 target_link_libraries(ros2_control_adapter_node ${PROJECT_NAME})
 target_link_libraries(twist_ingress_adapter_node ${PROJECT_NAME})
+target_link_libraries(control_command_ingress_adapter_node ${PROJECT_NAME})
 target_link_libraries(socketcan_adapter_node ${PROJECT_NAME})
 ament_target_dependencies(mock_control_source_node
 	builtin_interfaces
@@ -251,6 +258,9 @@ ament_target_dependencies(ros2_control_adapter_node
 	rclcpp
 )
 ament_target_dependencies(twist_ingress_adapter_node
+	rclcpp
+)
+ament_target_dependencies(control_command_ingress_adapter_node
 	rclcpp
 )
 ament_target_dependencies(socketcan_adapter_node
@@ -305,6 +315,17 @@ if(BUILD_TESTING)
 		CONTROL_LINK_TEST_CONTRACT_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/gateway_contract.yaml"
 	)
 	target_compile_options(test_adapter_core PRIVATE -Wall -Wextra -Wpedantic)
+
+	ament_add_gtest(test_control_command_ingress test/test_control_command_ingress.cpp)
+	target_link_libraries(test_control_command_ingress ${PROJECT_NAME})
+	target_compile_definitions(test_control_command_ingress PRIVATE
+		CONTROL_LINK_TEST_ADAS_PROFILE="${CMAKE_CURRENT_SOURCE_DIR}/../../../config/adas/adas_profile.yaml"
+		CONTROL_LINK_TEST_CONFIG_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../../../config"
+	)
+	target_compile_options(test_control_command_ingress PRIVATE -Wall -Wextra -Wpedantic)
+	set_tests_properties(test_control_command_ingress PROPERTIES ENVIRONMENT
+		"RMW_IMPLEMENTATION=rmw_fastrtps_cpp;RMW_FASTRTPS_USE_QOS_FROM_XML=0;FASTRTPS_DEFAULT_PROFILES_FILE=${CMAKE_CURRENT_SOURCE_DIR}/../../../config/common/fastdds_default_profiles.xml"
+	)
 
 	ament_add_gtest(test_can_codec
 		test/test_can_codec.cpp
@@ -399,7 +420,7 @@ install(
 	INCLUDES DESTINATION include
 )
 install(
-	TARGETS mock_control_source_node mock_vehicle_adapter_node ros2_control_adapter_node twist_ingress_adapter_node socketcan_adapter_node
+	TARGETS mock_control_source_node mock_vehicle_adapter_node ros2_control_adapter_node twist_ingress_adapter_node control_command_ingress_adapter_node socketcan_adapter_node
 	RUNTIME DESTINATION lib/${PROJECT_NAME}
 )
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)

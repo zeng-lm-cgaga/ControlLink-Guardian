@@ -178,6 +178,7 @@ def _launch_replay(context, *args, **kwargs):
 		launch_arguments={
 			"can_interface": requested_interface,
 			"start_source": "false",
+			"ingress_mode": "mock",
 			"start_lifecycle_activator": "false",
 		}.items(),
 	)

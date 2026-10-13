@@ -138,6 +138,9 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	start_lifecycle_activator = _bool_argument(
 		context, "start_lifecycle_activator")
 	start_secondary_source = _bool_argument(context, "start_secondary_source")
+	ingress_mode = LaunchConfiguration("ingress_mode").perform(context).lower()
+	if ingress_mode not in ("real", "mock"):
+		raise RuntimeError("ingress_mode must be real or mock; actual=" + ingress_mode)
 	planning_transport = LaunchConfiguration("planning_transport").perform(context).lower()
 	if planning_transport not in ("ros2", "edge", "someip", "grpc"):
 		raise RuntimeError(
@@ -152,6 +155,10 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	if source_id not in enabled_sources:
 		raise RuntimeError(
 			"source_id must be enabled by ADAS Profile; actual=" + source_id)
+	if ingress_mode == "real" and source_id != "planning":
+		raise RuntimeError("real ingress fixes source binding to planning; actual=" + source_id)
+	if ingress_mode == "real" and start_secondary_source:
+		raise RuntimeError("start_secondary_source is mock-only; real teleop ingress is already enabled")
 	if planning_transport in ("edge", "someip", "grpc") and source_id != "planning":
 		raise RuntimeError(
 			"planning_transport=" + planning_transport + " fixes source binding to planning; actual=" +
@@ -303,6 +310,13 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		simulator,
 		adapter_node,
 	]
+	# 同一来源只装配一个 producer；真实 teleop 独立于 planning transport。
+	if ingress_mode == "real":
+		actions.append(Node(
+			package="control_link_adapters", executable="twist_ingress_adapter_node",
+			name="teleop_ingress", namespace="control_link", output="screen",
+			emulate_tty=True, additional_env=participant_env,
+			parameters=[{**common_parameters, "source_id": "teleop"}]))
 	if planning_transport == "edge":
 		actions.append(bridge_node)
 		if start_source:
@@ -312,7 +326,14 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		actions.append(LogInfo(msg=(
 			planning_transport + " planning uses an external installed client; start_source does not start a ROS planning publisher")))
 	elif start_source:
-		actions.append(source_node)
+		if ingress_mode == "mock":
+			actions.append(source_node)
+		else:
+			actions.append(Node(
+				package="control_link_adapters", executable="control_command_ingress_adapter_node",
+				name="planning_ingress", namespace="control_link", output="screen",
+				emulate_tty=True, additional_env=participant_env,
+				parameters=[{**common_parameters, "source_id": "planning"}]))
 	if start_secondary_source:
 		actions.append(
 			TimerAction(
@@ -355,7 +376,12 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"start_source",
 			default_value="true",
-			description="Start the bundled ROS2/Edge source; SOME/IP requires an external client",
+			description="Enable ROS2 planning ingress (mock in mock mode) or bundled Edge client; network clients are external",
+		),
+		DeclareLaunchArgument(
+			"ingress_mode",
+			default_value="real",
+			description="real: configured planning + Twist teleop; mock: explicit demo producers instead of real ROS ingress",
 		),
 		DeclareLaunchArgument(
 			"start_lifecycle_activator",
@@ -380,7 +406,7 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"source_id",
 			default_value="planning",
-			description="ROS2 source used in ros2 mode; edge/someip/grpc fix this to planning",
+			description="Source for explicit ROS2 mock mode; real/edge/someip/grpc bind planning",
 		),
 		DeclareLaunchArgument(
 			"edge_command_channel",
@@ -405,7 +431,7 @@ def generate_launch_description():
 		DeclareLaunchArgument(
 			"start_secondary_source",
 			default_value="false",
-			description="Start a second Contract-bound source after a delay for switch observation",
+			description="Mock-only: start a second Contract-bound source after a delay",
 		),
 		DeclareLaunchArgument(
 			"secondary_source_id",

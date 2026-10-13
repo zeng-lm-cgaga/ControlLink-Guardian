@@ -358,6 +358,9 @@ def evaluate_snapshot(snapshot_dir, expected_manifest_sha=None):
         raise InvalidEvidence("new GID equals retired GID")
     receipt = parse_json(inputs["receipt.json"])
     window = parse_json(inputs["window.json"])
+    expected_source = window.get("expected_source_id", "planning")
+    if not isinstance(expected_source, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,31}", expected_source):
+        raise InvalidEvidence("invalid expected source in frozen window")
     validate_receipt(receipt, window, manifest["waited_exit"])
     validate_capture_metadata(inputs, receipt)
     mapping = load_can_map(inputs["can_signal_map.yaml"])
@@ -366,7 +369,7 @@ def evaluate_snapshot(snapshot_dir, expected_manifest_sha=None):
         selected[name], totals[name] = records_in_window(
             inputs[name + ".jsonl"], name, receipt, window)
     sources = [record for record in selected["source"]
-               if record["message"].get("source_id") == "planning"]
+               if record["message"].get("source_id") == expected_source]
     admitted, mismatch = [], 0
     for record in sources:
         message = record["message"]
@@ -386,7 +389,7 @@ def evaluate_snapshot(snapshot_dir, expected_manifest_sha=None):
         integer(record["message"]["active_source_sequence"], "active_source_sequence", maximum=2 ** 64 - 1)
     failures = []
     if len(admitted) < 2 or mismatch:
-        failures.append("window lacks exclusively stable sole expected planning GID")
+        failures.append("window lacks exclusively stable sole expected " + expected_source + " GID")
     baseline_count = admitted[0]["message"]["accepted_count"] if admitted else 0
     baseline_sequence = admitted[0]["message"]["last_source_sequence"] if admitted else 0
     counts = [record["message"]["accepted_count"] for record in admitted]
@@ -402,11 +405,11 @@ def evaluate_snapshot(snapshot_dir, expected_manifest_sha=None):
                       record["message"].get("lease_valid") is True}
     active = [record for record in selected["gateway"]
               if record["message"].get("state") == 1 and
-              record["message"].get("active_source_id") == "planning" and
+              record["message"].get("active_source_id") == expected_source and
               (observed_ns(record["message"]), record["message"].get("active_source_sequence"))
               in accepted_ticks]
     if not active:
-        failures.append("no planning ACTIVE tick correlated to new GID acceptance")
+        failures.append("no " + expected_source + " ACTIVE tick correlated to new GID acceptance")
     first_active_wall = min((observed_ns(record["message"]) for record in active), default=None)
     can_counts = {name: 0 for name in ("other", "invalid", "hold", "active_zero", "active_nonzero")}
     correlated_nonzero = 0
@@ -435,7 +438,7 @@ def evaluate_snapshot(snapshot_dir, expected_manifest_sha=None):
             "input_sha256": {name: sha256(data) for name, data in sorted(inputs.items())},
             "window": window, "expected_gid": target_gid, "previous_gid": previous,
             "total_records": totals, "window_records": {name: len(records) for name, records in selected.items()},
-            "planning_source_records": len(sources), "sole_gid_records": len(admitted),
+            expected_source + "_source_records": len(sources), "sole_gid_records": len(admitted),
             "mismatched_gid_records": mismatch, "accepted_first": baseline_count,
             "accepted_last": counts[-1] if counts else None,
             "sequence_first": baseline_sequence, "sequence_last": sequences[-1] if sequences else None,

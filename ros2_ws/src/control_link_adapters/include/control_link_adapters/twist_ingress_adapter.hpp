@@ -12,7 +12,7 @@
 
 namespace control_link_adapters
 {
-	// 将 Robot Profile 的外部 Twist 输入转换为 source 专属 ControlCommand
+	// 将 Robot/ADAS Profile 的外部 Twist 输入转换为 source 专属 ControlCommand
 	// 只负责来源绑定、序号和接收时刻，不复制 Gateway 的数值校验与仲裁规则
 	class TwistIngressAdapter final : public rclcpp::Node
 	{

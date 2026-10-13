@@ -148,6 +148,22 @@ class EvidenceTests(unittest.TestCase):
         frozen, digest = self.freeze(self.fixture(records))
         return judge.evaluate_snapshot(frozen, digest)
 
+    def test_explicit_teleop_window_reuses_source_gid_and_active_can_predicates(self):
+        records = synthetic_records()
+        for record in records["source"]:
+            record["message"]["source_id"] = "teleop"
+        for record in records["gateway"]:
+            record["message"]["active_source_id"] = "teleop"
+        fixture = self.fixture(records)
+        window = judge.parse_json(fixture[2].read_bytes())
+        window["expected_source_id"] = "teleop"
+        fixture[2].write_bytes(judge.json_bytes(window))
+        frozen, digest = self.freeze(fixture)
+        result = judge.evaluate_snapshot(frozen, digest)
+        self.assertEqual(result["verdict"], "PASS")
+        self.assertEqual(result["teleop_source_records"], 3)
+        self.assertEqual(result["correlated_active_records"], 2)
+
     def rewrite_input(self, frozen, name, value):
         frozen.chmod(0o755)
         path = frozen / name

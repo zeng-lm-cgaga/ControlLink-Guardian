@@ -37,6 +37,7 @@ def generate_test_description():
 		launch_arguments={
 			"can_interface": "vcan0",
 			"start_source": "true",
+			"ingress_mode": "mock",
 			"source_id": "planning",
 		}.items(),
 	)

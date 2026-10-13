@@ -45,6 +45,7 @@ class PlanningTransportSelector(unittest.TestCase):
 			"start_lifecycle_activator": "false",
 			"start_secondary_source": "false",
 			"planning_transport": "ros2",
+			"ingress_mode": "real",
 			"source_id": "planning",
 			"secondary_source_id": "teleop",
 			"secondary_source_delay_seconds": "5.0",
@@ -88,9 +89,33 @@ class PlanningTransportSelector(unittest.TestCase):
 
 	def test_ros2_default_has_exactly_one_planning_source_and_no_network(self):
 		actions = self.actions(vsomeip_config_path="")
-		planning = [action for action in actions if action.get("name") == "mock_source_planning"]
+		planning = [action for action in actions if action.get("name") == "planning_ingress"]
 		self.assertEqual(len(planning), 1)
+		self.assertEqual(planning[0]["executable"], "control_command_ingress_adapter_node")
+		self.assertEqual(planning[0]["parameters"][0]["source_id"], "planning")
+		self.assertEqual(sum(action.get("name") == "teleop_ingress" for action in actions), 1)
+		self.assertFalse(any(action.get("executable") == "mock_control_source_node" for action in actions))
 		self.assertFalse(any("bridge" in action.get("executable", "") for action in actions))
+
+	def test_mock_is_explicit_and_excludes_both_real_ingresses(self):
+		actions = self.actions(ingress_mode="mock", start_secondary_source="true")
+		self.assertEqual(sum(action.get("name") == "mock_source_planning" for action in actions), 1)
+		timer = next(action for action in actions if action["action"] == "timer")
+		self.assertEqual(timer["actions"][0]["name"], "mock_source_teleop")
+		self.assertFalse(any("ingress" in action.get("name", "") for action in actions))
+
+	def test_real_teleop_remains_without_planning_ingress(self):
+		actions = self.actions(start_source="false")
+		self.assertFalse(any(action.get("name") == "planning_ingress" for action in actions))
+		self.assertEqual(sum(action.get("name") == "teleop_ingress" for action in actions), 1)
+
+	def test_real_rejects_mock_secondary_or_rebinding_and_unknown_mode(self):
+		with self.assertRaisesRegex(RuntimeError, "mock-only"):
+			self.actions(start_secondary_source="true")
+		with self.assertRaisesRegex(RuntimeError, "fixes source binding to planning"):
+			self.actions(start_secondary_source="false", source_id="teleop")
+		with self.assertRaisesRegex(RuntimeError, "ingress_mode must"):
+			self.actions(source_id="planning", ingress_mode="unknown")
 
 	def test_unimplemented_mqtt_and_unknown_selector_fail(self):
 		for selector in ("mqtt", "unknown"):
@@ -172,7 +197,7 @@ class PlanningTransportSelector(unittest.TestCase):
 		for selector in ("edge", "someip", "grpc"):
 			with self.subTest(selector=selector):
 				with self.assertRaisesRegex(RuntimeError, "fixes source binding to planning"):
-					self.actions(planning_transport=selector, source_id="teleop")
+					self.actions(planning_transport=selector, source_id="teleop", ingress_mode="mock")
 
 	def test_network_mode_rejects_second_ros_planning_publisher(self):
 		for selector in ("edge", "someip", "grpc"):
@@ -180,6 +205,7 @@ class PlanningTransportSelector(unittest.TestCase):
 				with self.assertRaisesRegex(RuntimeError, "cannot start a second ROS planning publisher"):
 					self.actions(
 						planning_transport=selector,
+						ingress_mode="mock",
 						start_secondary_source="true",
 						secondary_source_id="planning")
 
@@ -188,9 +214,10 @@ class PlanningTransportSelector(unittest.TestCase):
 			with self.subTest(selector=selector):
 				self.install_executable(selector + "_planning_bridge_node")
 				actions = self.actions(
-					planning_transport=selector, start_source="false", start_secondary_source="true")
-				timer = next(action for action in actions if action["action"] == "timer")
-				self.assertEqual(timer["actions"][0]["name"], "mock_source_teleop")
+					planning_transport=selector, start_source="false")
+				teleop = next(action for action in actions if action.get("name") == "teleop_ingress")
+				self.assertEqual(teleop["executable"], "twist_ingress_adapter_node")
+				self.assertFalse(any(action.get("name") == "planning_ingress" for action in actions))
 				self.assertFalse(any(action.get("name") == "mock_source_planning" for action in actions))
 
 	def test_edge_mode_still_uses_existing_supervisor(self):

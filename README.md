@@ -44,6 +44,7 @@ Nav2 / teleop
 
 ADAS
 planning / teleop
+  -> ControlCommand ingress / Twist ingress
   -> Guardian
   -> SocketCAN adapter
   -> vcan0 0x180 / 0x280
@@ -52,7 +53,65 @@ planning / teleop
 
 Robot 与 ADAS 复用相同的 Contract、命令校验、来源仲裁和状态治理核心，平台差异只留在 ingress、执行 adapter 与 bringup 边界
 
-## 外部规划程序接入
+## 业务构建、配置与启动
+
+主产物是常驻的 `control_link_gateway_node` 和执行 adapter；SDK 只是外部规划程序的可选边界。完整 ROS2 业务工程使用 **CMake / ament / colcon**，不是 Bazel 迁移工程。
+
+在 Ubuntu / ROS2 Humble 中，从仓库根目录构建并加载同一工作区：
+
+```bash
+source /opt/ros/humble/setup.bash
+cd ros2_ws
+export MAKEFLAGS=-j1 CMAKE_BUILD_PARALLEL_LEVEL=1
+colcon build --symlink-install --executor sequential --parallel-workers 1 \
+  --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
+source install/setup.bash
+```
+
+配置责任只有一份：`config/common/gateway_contract.yaml` 拥有 Topic QoS、输出周期、时效、恢复数和速度边界；`config/common/source_policy.yaml` 拥有来源 Topic、priority 和 lease；`config/adas/adas_profile.yaml` 拥有真实入口映射、vcan interface 和 adapter/simulator 周期；`config/adas/can_signal_map.yaml` 拥有 demo CAN 布局。Fast DDS XML 只管理 participant transport，不覆盖 Topic QoS。修改后须在同一 overlay 中重新装配/启动，不能混用旧安装配置和新源码。
+
+Robot 启动仍为 `ros2 launch control_link_bringup robot_demo.launch.py`。ADAS 先检查 `ip -details link show vcan0`；只有设备不存在时才创建，不删除已有设备：
+
+```bash
+sudo modprobe vcan
+sudo ip link add dev vcan0 type vcan   # 仅当检查确认不存在时
+sudo ip link set vcan0 up
+ros2 launch control_link_bringup adas_vcan_demo.launch.py \
+  can_interface:=vcan0 planning_transport:=ros2 ingress_mode:=real
+```
+
+默认真实 ADAS 不自产生目标，也不自动运动。上游 planning 以 `control_link_interfaces/msg/ControlCommand` 发布 `/planning/control_cmd`，薄 adapter 绑定配置中的 `planning` 并转发到 `/control_link/input/planning`，**原 `source_stamp`、`source_sequence`、mode 和速度不变**；旧目标不重新盖章、不补新 sequence。上游须提供 SYSTEM/ROS clock 时间、新计算目标的递增 sequence，并使用 common `control_input` QoS（包括 deadline/lifespan/liveliness）；当前正常输入周期为 50ms。无有效命令时网关持续软件 HOLD。
+
+遥控以 `geometry_msgs/msg/Twist` 发布 `/teleop/cmd_vel`；复用 `TwistIngressAdapter` 为无 stamp/sequence 的 Twist 在接收时生成这些字段，再发布公共 `teleop` 命令。不是把 planning 降格为 Twist。有限值、速度边界、时效与 sequence 判断仍由唯一 Gateway 承担。按现有 SourcePolicy，teleop 优先于 planning；停遥控后合格 planning 可回退，全部有效目标停更则 SAFE_STOP/HOLD。Twist 自身无法表达上游生成时间，接收时间不是原始遥控目标年龄证明。
+
+`planning_transport=ros2|edge|someip|grpc` 只装配一个 planning producer，真实 ROS teleop 在各 transport 中保留。显式 `ingress_mode:=mock` 才关闭真实 ROS 入口并启用原 demo mock；`start_secondary_source:=true` 仅在 mock 模式增加第二个不同来源。`start_source:=false` 禁止 ROS planning relay / mock 或 bundled Edge client，不关闭 real teleop，也不关闭网络 bridge。ADAS 回放显式禁用真实 ingress，避免同 source 重复 publisher。不要同时向公共来源 Topic 再启动同 source 的 publisher。
+
+Graph 在公共来源边界核对 `ControlCommand` type、DDS compatibility、exact QoS 和唯一 publisher GID；来源的 node FQN 不充当认证。canonical 和 VehicleState 的关键 role 分别固定为 `/control_link/gateway` 和 `/control_link/vehicle_adapter`，VehicleState 只能有一个 publisher。观察订阅、连接成功或发布目标都不是 Gateway accepted / ACTIVE / 执行 ACK；用 `/control_link/source_status`、`/control_link/state`、`/control_link/vehicle_state` 和 `/diagnostics` 查证。新启动的来源须经过原 Graph 稳定窗口与健康 gate，不修改优先级或阈值。
+
+### 异常与致命 CAN 重建
+
+先用 `ros2 topic info -v /control_link/vehicle_state`、`ros2 topic echo --once /control_link/vehicle_state` 和 `/diagnostics` 区分来源停更、普通 CRC/counter/反馈超时与 fatal CAN I/O。前者仍使用原有效样本恢复机制；**`SocketCanAdapter` 是普通 Node，fatal 锁存且 I/O worker 退出，Gateway Lifecycle reconfigure 不会重开 CAN fd**。
+
+fatal 的人工操作顺序：检查 Profile 指定的 interface、执行端和原故障原因；停止旧 adapter 并等进程真正退出（确认实际 PID/path，不对同名进程批量 kill）；修复接口/执行端后，用同一配置、overlay 和 participant 环境重建 adapter 进程。若分开启动，默认 Profile 的示例为：
+
+```bash
+CONFIG="$(realpath ../config)"  # 当前目录 ros2_ws；自定义 Profile 须使用其真实 config_root
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp RMW_FASTRTPS_USE_QOS_FROM_XML=0
+export FASTRTPS_DEFAULT_PROFILES_FILE="$CONFIG/common/fastdds_default_profiles.xml"
+ros2 run control_link_adapters socketcan_adapter_node --ros-args \
+  -r __node:=vehicle_adapter -r __ns:=/control_link \
+  -p profile_path:="$CONFIG/adas/adas_profile.yaml" -p config_root:="$CONFIG"
+```
+
+不得在旧 publisher 尚在时启动第二个 adapter，也不要为重开 CAN 同时再 launch 一套 Gateway/simulator。Gateway ACTIVE 期间持续软件 HOLD；fatal fd 无法保证该 HOLD 到达 CAN，adapter 停止后靠更下游 simulator/controller/vehicle watchdog 兜底。新 GID 须经单 publisher Graph 重新准入，先接收合法 HOLD、获得健康 VehicleState/CAN 有效帧，再由原 recovery gate 和新有效业务目标恢复。若 Gateway 已 INACTIVE，须另走正常 Lifecycle activation gate；这不是自动重连、HA、硬实时急停或功能安全方案。
+
+### 可选构建边界
+
+SOME/IP / gRPC 默认关闭，启用需真实依赖与对应 `CONTROL_LINK_ENABLE_*` 选项；配置/启动细节归下列外部集成附录。gRPC 实现强制 loopback-only，SOME/IP 当前验收也仅限开发 loopback，不能描述为跨机器部署。MQTT 暂缓，没有生产控制入口。
+
+Bazel 只对应另一个 worktree 已完成的 ROS-free codec/SDK/network 生成与示例范围的历史可选实验；不替换 ROS2/rosidl/ament/bringup，不自动同步本业务改动。当前 adapters 用 `add_subdirectory` 编译仓库内 ControlLink SDK，**设置 Bazel SDK 的 `CMAKE_PREFIX_PATH` 不会令现有 colcon 自动消费它**；可选第三方 EdgeRuntime 的 `find_package(EdgeRuntime)` 是另一边界。固定 Edge 依赖身份与网络安装责任不因本入口装配改变。
+
+## 外部集成附录：规划程序接入
 
 ADAS Profile 可选使用 EdgeRuntime、SOME/IP 或 gRPC 将外部规划或轨迹跟踪结果接入同一条控制链；`planning_transport=ros2|edge|someip|grpc` 显式互斥，ROS teleop 仍经同一 Gateway 仲裁。SOME/IP 与 gRPC 复用 ROS-free `control_link_network_ingress` 的 schema、session/epoch、单槽 pending 和原 command codec，不复制 Gateway 的 Binding、Validator、Arbiter 或 StateMachine。
 
@@ -136,29 +195,7 @@ Robot Profile 使用 Nav2、AMCL、tf2、ros2_control 和 Gazebo，Gateway 的 c
 
 ## 快速运行
 
-在已安装 ROS2 Humble 与项目依赖的 Ubuntu 环境中构建工作区：
-
-```bash
-cd ros2_ws
-source /opt/ros/humble/setup.bash
-colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=RelWithDebInfo
-source install/setup.bash
-```
-
-启动 Robot/Nav2/Gazebo 闭环：
-
-```bash
-ros2 launch control_link_bringup robot_demo.launch.py
-```
-
-首次创建 vcan 设备后启动 ADAS 软件闭环：
-
-```bash
-sudo modprobe vcan
-sudo ip link add dev vcan0 type vcan
-sudo ip link set vcan0 up
-ros2 launch control_link_bringup adas_vcan_demo.launch.py can_interface:=vcan0
-```
+构建、真实 ADAS / Robot 启动、配置责任与异常操作统一见本文“业务构建、配置与启动”。默认真实入口等待上游，不把 mock 演示误当成外部规划接入。
 
 ## 虚拟机性能基线
 

@@ -7,11 +7,11 @@
 
 int main(int argc, char **argv)
 {
-	rclcpp::init(argc, argv);
 	int exit_code = 0;
 
 	try
 	{
+		rclcpp::init(argc, argv);
 		auto node = std::make_shared<control_link_gateway::ControlGatewayNode>();
 		rclcpp::ExecutorOptions executor_options;
 		rclcpp::executors::MultiThreadedExecutor executor(
@@ -36,10 +36,8 @@ int main(int argc, char **argv)
 		exit_code = 1;
 	}
 
-	if (rclcpp::ok())
-	{
-		rclcpp::shutdown();
-	}
+	// SIGINT 已关闭 Context 时仍须全局 shutdown，卸载信号处理器并 join 其线程。
+	rclcpp::shutdown();
 
 	return exit_code;
 }

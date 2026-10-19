@@ -38,7 +38,9 @@ jobs:
       - name: Install CI utilities
         run: |
           sudo apt-get update
-          sudo apt-get install --yes jq python3-yaml shellcheck
+          # Ubuntu runner 的 LLVM libunwind 开发包与 Nav2/glog 的依赖冲突；
+          # 显式选择 Ubuntu libunwind-dev，由 apt 解析开发包替换。
+          sudo apt-get install --yes jq python3-yaml shellcheck libunwind-dev
 
       - name: Initialize rosdep
         shell: bash

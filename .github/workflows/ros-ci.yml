@@ -40,6 +40,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes jq python3-yaml shellcheck
 
+      - name: Initialize rosdep
+        shell: bash
+        run: |
+          # 系统源只初始化一次；用户索引须由后续构建所用的 runner 用户更新。
+          if [[ ! -f /etc/ros/rosdep/sources.list.d/20-default.list ]]; then
+            sudo rosdep init
+          fi
+          rosdep update --rosdistro "${ROS_DISTRO}"
+
       - name: Build and test
         run: ./scripts/build_and_test.sh --domain-id "${ROS_DOMAIN_ID}"
 

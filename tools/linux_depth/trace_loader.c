@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <bpf/libbpf.h>
 #include <bpf/bpf.h>
+#include <bpf/btf.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -57,6 +58,14 @@ static unsigned long parse(const char *text, unsigned long maximum)
 }
 int main(int argc, char **argv)
 {
+	if (argc == 3 && !strcmp(argv[1], "--check-btf")) {
+		struct btf *types = btf__parse(argv[2], NULL);
+		long error = libbpf_get_error(types);
+		printf("{\"libbpf_version\":\"%s\",\"btf_parse_error\":%ld,\"btf_type_count\":%u}\n",
+			libbpf_version_string(), error, error ? 0 : btf__type_cnt(types));
+		if (!error) btf__free(types);
+		return error ? 1 : 0;
+	}
 	if (argc < 5 || argc > 6) {
 		fprintf(stderr, "usage: %s OBJECT TGID SECONDS(1..300) OUTPUT.csv [TID]\n", argv[0]); return 2;
 	}
@@ -68,7 +77,7 @@ int main(int argc, char **argv)
 	struct consumer sink = { .output = fopen(argv[4], "wx") };
 	if (!sink.output) { perror("exclusive output"); return 2; }
 	setvbuf(sink.output, NULL, _IOFBF, 1024 * 1024);
-	fprintf(sink.output, "# monotonic_ns target_tgid=%u start_ticks=%llu hz=%ld ring_bytes=8388608 thread_capacity=4096\n", tgid, initial, ticks);
+	fprintf(sink.output, "# monotonic_ns target_tgid=%u start_ticks=%llu hz=%ld target_tid=%u ring_bytes=8388608 thread_capacity=4096\n", tgid, initial, ticks, tid);
 	fprintf(sink.output, "kind,tgid,tid,cpu,task_start_boottime_ns,at_ns,duration_ns,auxiliary_ns,value\n");
 	struct bpf_object *object = NULL;
 	struct bpf_link *links[8] = {0};

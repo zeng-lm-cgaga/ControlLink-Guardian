@@ -66,6 +66,28 @@ class TimingAnalysisTest(unittest.TestCase):
         self.assertEqual(summary["upstream_to_canonical_publisher_gid_edges"], [("a1", "b2")])
         self.assertAlmostEqual(summary["latencies_ms"]["source_publish_to_first_CAN_write_return_ms"]["mean"], .000054)
         self.assertAlmostEqual(summary["latencies_ms"]["publish_enter_to_first_adapter_callback_ms"]["mean"], .000002)
+        self.assertEqual(summary["mailbox_worker_handoff"]["counts"]["first_active_command"], 1)
+        self.assertAlmostEqual(summary["latencies_ms"]["mailbox_update_mark_to_worker_frame_ready_first_active_command_ms"]["mean"], .000007)
+
+    def test_mailbox_distinguishes_reuse_hold_and_ambiguous_generation(self):
+        self.prepare()
+        inputs = analyze.load_inputs(self.scene)
+        rows, unused = analyze.timing(inputs['gateway-timing.csv'], inputs['gateway-timing.csv.status.json'])
+        consume = next(row for row in rows if row['phase'] == 'mailbox_consume')
+        send = next(row for row in rows if row['phase'] == 'can_write')
+        repeated = [{**consume, 'frame_id': 2, 'end_ns': 2160}, {**send, 'frame_id': 2, 'begin_ns': 2161, 'end_ns': 2162}]
+        hold = [{**consume, 'frame_id': 3, 'result': 0, 'end_ns': 2170}, {**send, 'frame_id': 3, 'begin_ns': 2171, 'end_ns': 2172}]
+        values, result = analyze.mailbox_handoffs(rows + repeated + hold, 2000, 3000)
+        self.assertEqual(result['counts']['first_active_command'], 1)
+        self.assertEqual(result['counts']['reused_active'], 1)
+        self.assertEqual(result['counts']['hold'], 1)
+        conflicting = [{**row, 'result': 1} for row in rows if row['phase'] == 'canonical_publish']
+        self.assertFalse(analyze.mailbox_handoffs(rows + conflicting, 2000, 3000)[0])
+        other_generation = [{**row, 'gid': 'c3'} if row['phase'] == 'mailbox_consume' else row for row in rows]
+        self.assertFalse(analyze.mailbox_handoffs(other_generation, 2000, 3000)[0])
+        values, boundary = analyze.mailbox_handoffs(rows + repeated, 2155, 3000)
+        self.assertNotIn('first_active_command', boundary['counts'])
+        self.assertEqual(boundary['counts']['reused_active'], 1)
 
     def test_drops_remain_visible_not_complete_population(self):
         self.prepare(lost=3)

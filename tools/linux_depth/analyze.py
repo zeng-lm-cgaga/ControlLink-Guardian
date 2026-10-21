@@ -88,6 +88,54 @@ def groups(rows, key):
     return result
 
 
+def mailbox_handoffs(rows, start, end):
+    """marker 来自 consume.begin；写回调区间、完整身份与本次 frame/mode 必须同时闭合。"""
+    accepted = [row for row in rows if row["phase"] == "mailbox_write" and row["result"] == 1]
+    updates = groups(accepted, lambda row: (row["pid"], identity_key(row)))
+    frames = groups([row for row in rows if row["phase"] == "can_write" and row["result"] == 16],
+                    lambda row: (row["pid"], row["frame_id"], identity_key(row)))
+    modes = groups([row for row in rows if row["phase"] == "canonical_publish"], identity_key)
+    seen, used_updates, evidence, counts, values = set(), set(), [], Counter(), defaultdict(list)
+    for consume in sorted((row for row in rows if row["phase"] == "mailbox_consume" and row["end_ns"] < end), key=lambda row: row["end_ns"]):
+        in_window = start <= consume["end_ns"]
+        identity = identity_key(consume)
+        candidates = [row for row in updates.get((consume["pid"], identity), []) if row["begin_ns"] <= consume["begin_ns"] <= row["end_ns"]]
+        sends = frames.get((consume["pid"], consume["frame_id"], identity), [])
+        command_modes = {row["result"] for row in modes.get(identity, [])}
+        if len(candidates) != 1 or len(command_modes) != 1 or consume["result"] not in (0, 1):
+            if in_window: counts["unmatched_update_or_ambiguous_mode"] += 1
+            continue
+        if len(sends) != 1 or sends[0]["begin_ns"] < consume["end_ns"] or sends[0]["value"] != consume["value"]:
+            if in_window: counts["missing_or_ambiguous_successful_frame"] += 1
+            continue
+        canonical_mode = next(iter(command_modes))
+        if consume["result"] == 1 and canonical_mode != 0:
+            if in_window: counts["mode_mismatch"] += 1
+            continue
+        key = (consume["pid"], identity)
+        category = "hold" if consume["result"] == 0 else "reused_active" if key in seen else "first_active_command"
+        if consume["result"] == 1:
+            seen.add(key)
+        if not in_window:
+            continue
+        update = candidates[0]
+        used_updates.add((update["pid"], update["begin_ns"], update["end_ns"], identity))
+        span = (consume["end_ns"] - consume["begin_ns"]) / 1e6
+        values["mailbox_update_mark_to_worker_frame_ready_" + category + "_ms"].append(span)
+        counts[category] += 1
+        evidence.append({"identity": identity, "pid": consume["pid"], "frame_id": consume["frame_id"], "counter": consume["value"],
+                         "canonical_mode": canonical_mode, "can_mode": consume["result"], "category": category,
+                         "mailbox_mark_ns": consume["begin_ns"], "worker_ready_ns": consume["end_ns"], "span_ms": span,
+                         "write_callback_begin_ns": update["begin_ns"], "write_callback_end_ns": update["end_ns"],
+                         "can_write_return_ns": sends[0]["end_ns"]})
+    counts["observed_overwrite_flags"] = sum(row["value"] == 1 for row in accepted if start <= row["end_ns"] < end)
+    counts["accepted_updates_without_observed_consume"] = sum((row["pid"], row["begin_ns"], row["end_ns"], identity_key(row)) not in used_updates
+                                                             for row in accepted if start <= row["end_ns"] < end)
+    return values, {"counts": dict(counts), "events": evidence,
+                    "definition": "mailbox internal update mark to worker finished fetch/watchdog/frame generation, including locking/encoding; NOT pure queue wait; first per full command identity, reused ACTIVE and HOLD separate",
+                    "limits": "observed records only; no matched consume may mean overwritten, cutoff or recorder loss; ambiguous canonical modes are not guessed; successful CAN write is not bus completion/ACK"}
+
+
 def resources(rows, start, end, hz):
     result = {}
     for role, samples in groups(rows, lambda row: row["role"]).items():
@@ -301,6 +349,8 @@ def analyze(directory):
         result["expired_snapshot_identities_in_window"] = len({identity_key(row) for row in by_phase["source_snapshot"] if
             start <= row["begin_ns"] < end and row["sequence"] and row["result"] != 3})
         result["feedback_rejections_in_window"] = sum(row["result"] != 1 for row in by_phase["feedback_validate"] if start <= row["begin_ns"] < end)
+        handoff_values, result["mailbox_worker_handoff"] = mailbox_handoffs(phase_events, start, end)
+        latencies.update(handoff_values)
     result["latencies_ms"] = {name: distribution(values) for name, values in sorted(latencies.items())}
     result["metrics_population"] = "observed events only; nonzero recorder losses prohibit complete-population claims"
     return result

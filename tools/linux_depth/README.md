@@ -5,7 +5,7 @@
 ## 运行时改变
 
 - `SocketCanTransport` 继续使用非阻塞 CAN、独立 worker 和 `poll`，增加 `CLOCK_MONOTONIC` 绝对周期 `timerfd`。过期次数在读计数中合并，handler 期间错过的周期跳过，不补发旧周期。
-- RX 每轮最多 64 帧、2ms，另外受 TX deadline 和 stop flag 限制；这是 I/O 公平性预算，不是业务时效规则。`receive_budget_yields` 包含 deadline 提前让出，可大于收到的帧数，不代表丢帧。
+- RX 每轮最多 64 帧、2ms，另外受 TX deadline 和 stop flag 限制；这是 I/O 公平性预算，不是业务时效规则。`receive_budget_yields` 包含 deadline 提前让出，可大于收到的帧数，不代表丢帧。它统计进入预算/deadline分支的次数；同一未读就绪数据可反复触发，不是不同帧或完整poll迭代计数，不能单独据此判定CPU忙循环。
 - EAGAIN/EWOULDBLOCK/ENOBUFS 不缓存待重试的运动帧；下一次尝试重新调用 adapter 原来的 mailbox/watchdog 逻辑。CAN write 和 wake 的 EINTR 重试都有上限，退出仍依次请求、唤醒、join、关闭所有 fd。handler 自身必须有限，不承诺硬实时退出。
 - Contract、优先级、来源绑定、100ms watchdog、恢复门槛和协议不在这里复制或放宽。fatal CAN 仍按根 README 的人工重建契约处理。
 - transport 类和 stats 布局有变化；依赖它的 simulator/消费者必须使用同一源码头文件重编。不能仅靠替换 `.so` 混用旧 ABI。
@@ -72,6 +72,8 @@ unshare -Urn bash -c 'ip link set lo up; ip link add vcan0 type vcan; ip link se
 
 `summarize.py BASE NEW_OUTPUT` 读取冻结输入，输出阶段统计、资源、未匹配命令和恢复时间线；同一输入重放可逐字节比较。分析必须保留右截止未匹配和 recovery 期间 latest-value 覆盖，不能把它们补成成功或直接判丢命令缺陷。缺少 100 样本不报 p99。`run_scenarios.bash` 为固定批次入口，不是后台监控。
 
+`analyze.py` 的 mailbox/worker 分段以 consume.begin 的内部 mailbox 更新标记为起点，以 consume.end（取值/watchdog/帧生成完成）为终点；包含锁和编码，不叫纯排队等待。必须匹配写回调区间、完整 source/GID/sequence/stamp、该 PID 的 frame_id、冻结 counter 和成功 write；canonical mode 有歧义则不猜。首次已观察 ACTIVE 身份、重复使用 latest-value、HOLD、覆盖标记和未关联记录分列。首次判断含预热历史，分母为 worker ready 落入固定窗的已观察记录，不是源窗 cohort；非零日志丢失不支持完整人口结论。
+
 ## BPF C 与 loader
 
 `scheduler.bpf.c` 用实际内核 BTF/CO-RE 读取 task，并使用 raw sched_wakeup/sched_switch/sched_process_exit 与 raw_syscalls sys_enter/sys_exit tracepoint。loader 在挂载前写 TGID、可选 TID 和 leader `/proc/starttime` 区间；线程状态带 task start_boottime，退出删除，TID 复用重置。目标退出/换 PID 后结束，重启需用新 PID/starttime 新开采集；不承诺 exec 同 PID 热替换的连续身份。
@@ -79,21 +81,24 @@ unshare -Urn bash -c 'ip link set lo up; ip link add vcan0 type vcan; ip link se
 thread map 容量 4096，ring buffer 8MiB，统计 reserve/map 失败、cold switch、unmatched syscall、复用和已输出事件。PERCPU 计数原子累加；调度关联仍须在实际内核验收，编译不证明 verifier/attach 或跨 CPU 事件关联通过。`prev_state==0`/preempt 对应可运行切出，其余阻塞状态不自动归因为 mutex、磁盘或 CAN。syscall 保存实际编号，业务序号仅来自同 PID/TID 时间区间相交。
 
 ```bash
-bash tools/linux_depth/build_bpf.bash /absolute/new/bpf
-python3 tools/linux_depth/bpf_preflight.py --output /absolute/new/preflight.json
+bash tools/linux_depth/prepare_libbpf.bash /absolute/new/toolchain
+bash tools/linux_depth/build_bpf.bash /absolute/new/build-bpf /absolute/new/toolchain/prefix
+python3 tools/linux_depth/bpf_preflight.py --loader /absolute/new/build-bpf/trace_loader --output /absolute/new/preflight.json
 ```
 
-构建脚本使用本批已独立解包的 clang14/libbpf 开发包，libbpf 静态链接到 loader，未安装系统软件。BPF obj 带 BTF 和 CO-RE 信息；是否可用仍取决于目标内核、tracefs 和权限。本轮环境 trivial probe 已返回 EPERM（无 capabilities、unprivileged BPF 禁用且处于受限 sandbox），**没有内核事件、verifier 或 BPF 开销的运行通过结论**。
+构建脚本复用独立解包的 clang14，但明确要求新的私有 libbpf 1.4.0 prefix，不再使用旧0.5.0。prepare 从官方v1.4.0 tag下载、核对固定archive SHA、串行j1并仅安装到私有prefix；libbpf静态链接，系统工具链不变。BPF obj仍带BTF/CO-RE，不篡改内核BTF。preflight直接执行指定loader的 `--check-btf`，记录其真实libbpf版本、解析结果和ELF SHA，bpftool能解析不再代替loader兼容证明。独立root复审的旧0.5.0加载失败实际是BTF兼容错误，不能继续仅归EPERM；当前固定库解析BTF成功也不证明verifier/attach或采集已通过。
 
 未来由已获授权的宿主管理员在初始 PID namespace、非受限终端使用：
 
 ```bash
-bash tools/linux_depth/run_privileged_trace.bash /absolute/this-batch/remote /absolute/new/trace-evidence
+bash tools/linux_depth/run_privileged_trace.bash /absolute/bpf-build-parent /absolute/new/trace-evidence /absolute/verified/controlled_workload
 ```
 
 入口自身不 sudo、不索密码、不 mount 或更改 sysctl；要求管理员已准备可读 tracefs、BPF/perf_event 权限及可执行环境。只启动短 controlled_workload 和 8s loader，外层总期限 20s、额外 3s 强制收束，wait/清理本次子进程，无 pin/自动重连。超时/强制终止是 incomplete，不是 graceful/通过。权限失败保留日志，不能靠关闭 suppressions、过滤慢样本或丢失 footer 生成 PASS。
 
-`analyze_bpf.py` 要求完整 footer 和 loader 的最终 I/O/退出状态；调度等待与 syscall 区间可重叠，不能相加冒充独占耗时。它只给带质量标记的重叠证据，不自动判根因。已知 CPU/sleep/锁夹具的用户态结果与合成解析器测试不能替代实际 BPF 运行。
+`analyze_bpf.py` 要求完整footer和loader最终I/O/退出状态。accounting_complete只表示计数闭合；空采集的population_complete为false，绝不当smoke成功。受控入口强制 `--require-controlled-workload --target-identity`：核对独立/proc TGID/leader starttime/各TID实例、五个挂点、非零wake/switch/syscall、100轮CPU/sleep/锁/holder应用记录及同TID内核区间交叠，含同序号跨线程holder/lock交叠。当前ABI是x86_64，futex202、clock_nanosleep230；不用于别的架构。缺失/丢弃/身份错误/无交叠均写INCOMPLETE并返回非零，进程存活或exit0不足以通过。
+
+调度等待与syscall区间可重叠，不能相加冒充独占耗时；即使受控夹具通过也不自动判真实业务阻塞根因，更不等于Gateway/CAN业务序号关联或BPF开销已完成。没有特权入口时仅交付有界命令，不修改sudoers/sysctl/挂载，不传播认证信息；旧失败证据保留。
 
 ## 边界
 

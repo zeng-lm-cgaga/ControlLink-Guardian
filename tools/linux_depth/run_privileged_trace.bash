@@ -7,6 +7,7 @@ if [[ ${CONTROL_LINK_TRACE_BOUNDED:-0} != 1 ]]; then
 fi
 BUILD=$(realpath "${1:?BPF/fixture build root required}")
 OUT=${2:?new evidence directory required}
+WORKLOAD=$(realpath "${3:-$BUILD/build-focused/controlled_workload}")
 if [[ $EUID != 0 ]]; then
   echo 'Needs an authorized host administrator outside the restricted sandbox; no sudo/password escalation is performed.' >&2
   exit 2
@@ -19,7 +20,7 @@ for event in sched/sched_wakeup sched/sched_switch sched/sched_process_exit raw_
 done
 mkdir "$OUT"
 OUT=$(realpath "$OUT")
-python3 "$ROOT/tools/linux_depth/bpf_preflight.py" --output "$OUT/preflight.json"
+python3 "$ROOT/tools/linux_depth/bpf_preflight.py" --loader "$BUILD/build-bpf/trace_loader" --output "$OUT/preflight.json"
 target_pid=
 loader_pid=
 stop_children() {
@@ -31,15 +32,23 @@ stop_children() {
 }
 trap stop_children EXIT
 trap 'exit 130' INT TERM
-"$BUILD/build-focused/controlled_workload" "$OUT/application.csv" >"$OUT/application.log" 2>&1 &
+"$WORKLOAD" "$OUT/application.csv" >"$OUT/application.log" 2>&1 &
 target_pid=$!
+for attempt in {1..100}; do
+  if grep -q 'worker_tid=' "$OUT/application.log"; then break; fi
+  if ! kill -0 "$target_pid" 2>/dev/null; then echo 'workload exited before READY' >&2; exit 1; fi
+  sleep .01
+done
+grep -q 'worker_tid=' "$OUT/application.log" || { echo 'workload READY timeout' >&2; exit 1; }
+python3 "$ROOT/tools/linux_depth/capture_target.py" "$target_pid" "$OUT/target-identity.json"
 cat "/proc/$target_pid/status" >"$OUT/target-status.txt"
 cat "/proc/$target_pid/stat" >"$OUT/target-stat.txt"
 cat "/proc/$target_pid/maps" >"$OUT/target-maps.txt"
 readlink "/proc/$target_pid/exe" >"$OUT/target-exe.txt"
-sha256sum "$BUILD/build-focused/controlled_workload" "$BUILD/build-bpf/trace_loader" "$BUILD/build-bpf/scheduler.bpf.o" >"$OUT/elf.sha256"
+sha256sum "$WORKLOAD" "$BUILD/build-bpf/trace_loader" "$BUILD/build-bpf/scheduler.bpf.o" >"$OUT/elf.sha256"
 "$BUILD/build-bpf/trace_loader" "$BUILD/build-bpf/scheduler.bpf.o" "$target_pid" 8 "$OUT/kernel.csv" >"$OUT/loader.log" 2>&1 &
 loader_pid=$!
+python3 "$ROOT/tools/linux_depth/capture_target.py" "$loader_pid" "$OUT/loader-identity.json" || echo 'loader exited before /proc identity snapshot; keep its actual wait status/log' >&2
 set +e
 wait "$loader_pid"; loader_exit=$?; loader_pid=
 wait "$target_pid"; application_exit=$?; target_pid=
@@ -48,4 +57,5 @@ printf '%s\n' "$loader_exit" >"$OUT/loader.exit"
 printf '%s\n' "$application_exit" >"$OUT/application.exit"
 if [[ $loader_exit != 0 || $application_exit != 0 ]]; then exit 1; fi
 python3 "$ROOT/tools/linux_depth/analyze_bpf.py" "$OUT/kernel.csv" "$OUT/loader.log" \
-  --application "$OUT/application.csv" --output "$OUT/summary.json"
+  --application "$OUT/application.csv" --target-identity "$OUT/target-identity.json" \
+  --require-controlled-workload --output "$OUT/summary.json"

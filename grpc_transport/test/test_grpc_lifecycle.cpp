@@ -8,9 +8,11 @@
 #include <unistd.h>
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <stdexcept>
@@ -313,6 +315,151 @@ TEST(GrpcReplyPolicy, LaterReadonlyRevocationCannotBeUndoneByEarlierRequestReply
   EXPECT_FALSE(reply_preserves_readiness(true, 2, 3));
   EXPECT_FALSE(reply_preserves_readiness(false, 3, 3));
   EXPECT_TRUE(reply_preserves_readiness(true, 3, 3));
+}
+
+TEST_F(GrpcLifecycle, AsyncFuturesAndCallbacksDoNotBlockCompletionQueue) {
+  GrpcClient client(config_);
+  client.start();
+  ASSERT_TRUE(client.wait_available(1s));
+  std::atomic<bool> entered{false};
+  auto first = client.get_capabilities_async(500ms, [&](const auto &) {
+    entered.store(true);
+    std::this_thread::sleep_for(200ms);
+    throw std::runtime_error("bounded callback failure fixture");
+  });
+  ASSERT_TRUE(await([&] { return entered.load(); }));
+  auto second = client.get_status_async();
+  ASSERT_EQ(second.future().wait_for(150ms), std::future_status::ready);
+  EXPECT_TRUE(second.future().get().ok());
+  EXPECT_TRUE(first.future().get().ok());
+  client.stop();
+  EXPECT_EQ(client.status().callback_exceptions, 1U);
+  first.cancel();
+}
+
+TEST_F(GrpcLifecycle, AsyncDeadlineCancelAndStopCompleteEachRequestOnce) {
+  class WaitingService final : public wire::PlanningIngress::Service {
+   public:
+    grpc::Status OpenSession(grpc::ServerContext *context,
+        grpc::ServerReaderWriter<wire::OpenSessionResponse, wire::ControlSessionRequest> *stream) override {
+      wire::ControlSessionRequest request;
+      if (!stream->Read(&request)) return {grpc::StatusCode::CANCELLED, "fixture read cancelled"};
+      const auto end = std::chrono::steady_clock::now() + 2s;
+      while (!context->IsCancelled() && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(1ms);
+      return {grpc::StatusCode::CANCELLED, "bounded unanswered control fixture"};
+    }
+    grpc::Status GetCapabilities(grpc::ServerContext *context, const wire::GetCapabilitiesRequest *,
+                                 wire::Capabilities *) override {
+      const auto end = std::chrono::steady_clock::now() + 2s;
+      while (!context->IsCancelled() && std::chrono::steady_clock::now() < end)
+        std::this_thread::sleep_for(1ms);
+      return {grpc::StatusCode::CANCELLED, "bounded waiting fixture"};
+    }
+  } service;
+  LoopbackPort port;
+  auto settings = config_;
+  settings.listen_address = port.address();
+  port.close();
+  grpc::ServerBuilder builder;
+  builder.AddListeningPort(settings.listen_address, grpc::InsecureServerCredentials());
+  builder.RegisterService(&service);
+  auto server = builder.BuildAndStart();
+  ASSERT_TRUE(server);
+  GrpcClient client(settings);
+  client.start();
+  ASSERT_TRUE(client.wait_available(1s));
+  std::atomic<int> deliveries{0};
+  auto expired = client.get_capabilities_async(30ms, [&](const auto &) { ++deliveries; });
+  ASSERT_EQ(expired.future().wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(expired.future().get().ok());
+  EXPECT_EQ(expired.future().get().rpc_code, grpc::StatusCode::DEADLINE_EXCEEDED);
+  auto control = client.open_async(open_request('d').open(), 30ms, [&](const auto &) { ++deliveries; });
+  ASSERT_EQ(control.future().wait_for(1s), std::future_status::ready);
+  EXPECT_FALSE(control.future().get().ok());
+  EXPECT_NE(control.future().get().error.find("deadline"), std::string::npos);
+  auto cancelled = client.get_capabilities_async(500ms, [&](const auto &) { ++deliveries; });
+  auto stopped = client.get_capabilities_async(500ms, [&](const auto &) { ++deliveries; });
+  cancelled.cancel();
+  client.stop();
+  EXPECT_FALSE(cancelled.future().get().ok());
+  EXPECT_FALSE(stopped.future().get().ok());
+  EXPECT_EQ(deliveries.load(), 4);
+  expired.cancel(); cancelled.cancel(); stopped.cancel();
+  EXPECT_THROW(client.get_capabilities_async(), std::runtime_error);
+  server->Shutdown();
+  server->Wait();
+}
+
+TEST_F(GrpcLifecycle, RateLimitedStatusPreservesOtherMethodAndShutdown) {
+  config_.rate_limits.per_caller_burst = 2;
+  config_.rate_limits.per_caller_per_second = 1;
+  server_->stop();
+  expect_drained();
+  start_fresh();
+  GrpcClient client(config_);
+  client.start();
+  ASSERT_TRUE(client.wait_available(1s));
+  EXPECT_NO_THROW(client.get_status());
+  EXPECT_NO_THROW(client.get_status());
+  EXPECT_THROW(client.get_status(), std::runtime_error);
+  EXPECT_NO_THROW(client.get_capabilities());
+  client.stop();
+  EXPECT_EQ(server_->runtime().rate_limits[static_cast<std::size_t>(network::IngressMethod::Status)].caller_limited, 1U);
+}
+
+TEST_F(GrpcLifecycle, AsyncCallbackReservationsBoundCompletedAndInFlightWork) {
+  auto settings = config_;
+  settings.client_async_capacity = 2;
+  settings.client_submit_inflight_limit = 2;
+  GrpcClient client(settings);
+  client.start();
+  ASSERT_TRUE(client.wait_available(1s));
+  std::atomic<bool> entered{false};
+  std::atomic<int> deliveries{0};
+  auto first = client.get_capabilities_async(500ms, [&](const auto &) {
+    entered.store(true);
+    std::this_thread::sleep_for(300ms);
+    ++deliveries;
+  });
+  ASSERT_TRUE(await([&] { return entered.load(); }));
+  auto second = client.get_status_async(500ms, [&](const auto &) { ++deliveries; });
+  EXPECT_THROW(client.get_capabilities_async(), std::runtime_error);
+  client.stop();
+  EXPECT_EQ(deliveries.load(), 2);
+  EXPECT_EQ(first.future().wait_for(0ms), std::future_status::ready);
+  EXPECT_EQ(second.future().wait_for(0ms), std::future_status::ready);
+  EXPECT_EQ(client.status().async_overloaded, 1U);
+}
+
+TEST_F(GrpcLifecycle, AsyncSubmitCancellationDoesNotCancelControlStream) {
+  GrpcClient client(config_);
+  client.start();
+  ASSERT_TRUE(client.wait_available(1s));
+  const auto opening = open_request('a');
+  auto opened = client.open_async(opening.open());
+  ASSERT_EQ(opened.future().wait_for(1s), std::future_status::ready);
+  ASSERT_TRUE(opened.future().get().ok());
+  ASSERT_TRUE(admit(ingress_->snapshot().epoch));
+  const auto ready = client.keep(keep_request(opening, 1).keep());
+  ASSERT_TRUE(ready.session().submission_ready());
+  codec::CommandFrame target;
+  std::memcpy(target.session_token.bytes.data(), ready.session().session_token().data(), target.session_token.bytes.size());
+  target.clock_domain = codec::ClockDomain::kSystem;
+  target.source_stamp_ns = network::system_now_ns();
+  target.command_sequence = 1;
+  target.linear_velocity_mps = 0.3;
+  std::atomic<int> completions{0};
+  auto first = client.submit_async(target, 500ms, [&](const auto &) { ++completions; });
+  target.command_sequence = 2;
+  auto second = client.submit_async(target, 500ms, [&](const auto &) { ++completions; });
+  first.cancel();
+  ASSERT_EQ(first.future().wait_for(1s), std::future_status::ready);
+  ASSERT_EQ(second.future().wait_for(1s), std::future_status::ready);
+  EXPECT_TRUE(client.status().control_rpc_live);
+  EXPECT_TRUE(client.status().control_active);
+  client.stop();
+  EXPECT_EQ(completions.load(), 2);
 }
 
 TEST_F(GrpcLifecycle, BoundedOpeningDomainsRotateThroughRealRpcAndRejectFrozenOldRequests) {

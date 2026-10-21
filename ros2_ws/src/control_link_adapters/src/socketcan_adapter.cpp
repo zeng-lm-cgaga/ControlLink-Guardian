@@ -186,6 +186,10 @@ namespace control_link_adapters
 	{
 		declare_parameter<std::string>(kProfilePathParameter, "");
 		declare_parameter<std::string>(kConfigRootParameter, "");
+		rcl_interfaces::msg::ParameterDescriptor supervision_descriptor;
+		supervision_descriptor.read_only = true;
+		exit_on_fatal_can_io_ = declare_parameter<bool>("exit_on_fatal_can_io", false, supervision_descriptor);
+		awaiting_bootstrap_hold_ = exit_on_fatal_can_io_;
 		rcl_interfaces::msg::ParameterDescriptor timing_descriptor;
 		timing_descriptor.read_only = true;
 		declare_parameter<std::string>("runtime_timing_path", "", timing_descriptor);
@@ -429,6 +433,7 @@ namespace control_link_adapters
 					confirmed_gateway_publisher_ = snapshot.confirmed_publisher;
 					local_watchdog_->reset();
 					latest_command_.reset();
+					awaiting_bootstrap_hold_ = exit_on_fatal_can_io_;
 					last_canonical_reject_reason_ = CanonicalRejectReason::kNone;
 					require_immediate_hold = true;
 				}
@@ -477,6 +482,11 @@ namespace control_link_adapters
 		{
 			std::lock_guard<std::mutex> lock{runtime_mutex_};
 			// 先完整复制命令，再刷新 steady watchdog，拒绝或复制失败都不能延长 lease
+			if (awaiting_bootstrap_hold_ && command.mode != ControlCommand::MODE_HOLD)
+			{
+				return;
+			}
+			awaiting_bootstrap_hold_ = false;
 			latest_command_ = command;
 			try
 			{
@@ -563,6 +573,12 @@ namespace control_link_adapters
 				can_link_healthy_ = true;
 			}
 		}
+	}
+
+	bool SocketCanAdapter::restart_requested() const
+	{
+		std::lock_guard<std::mutex> lock{runtime_mutex_};
+		return exit_on_fatal_can_io_ && fatal_can_io_;
 	}
 
 	void SocketCanAdapter::handle_can_error(

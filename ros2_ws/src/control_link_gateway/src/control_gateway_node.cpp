@@ -324,6 +324,7 @@ namespace control_link_gateway
 		declare_parameter<std::string>(kProfilePathParameter, "");
 		declare_parameter<std::string>(kConfigRootParameter, "");
 		declare_parameter<std::string>(kDecisionTracePathParameter, "");
+		declare_parameter<std::string>("decision_trace_capture_config", "");
 		declare_parameter<std::int64_t>(kDecisionTraceQueueCapacityParameter, 4096);
 		rcl_interfaces::msg::ParameterDescriptor timing_descriptor;
 		timing_descriptor.read_only = true;
@@ -930,7 +931,8 @@ namespace control_link_gateway
 				{
 					const auto recorder_status = decision_trace_recorder_->status();
 					trace_recording_failed_ = trace_recording_failed_ ||
-						!recorder_status.trace_valid;
+						recorder_status.writer_failed || recorder_status.trace_overflow ||
+						(!recorder_status.capture_mode && !recorder_status.trace_valid);
 					trace_status = make_diagnostic_status(
 						"gateway/decision_trace",
 						trace_recording_failed_ ?
@@ -964,6 +966,12 @@ namespace control_link_gateway
 						trace_status,
 						"accepted_result_count",
 						std::to_string(recorder_status.accepted_result_count));
+					add_diagnostic_value(trace_status, "capture_mode", recorder_status.capture_mode ? "true" : "false");
+					add_diagnostic_value(trace_status, "dropped_events", std::to_string(recorder_status.dropped_events));
+					add_diagnostic_value(trace_status, "capture_budget_exhausted", std::to_string(recorder_status.capture.budget_exhausted));
+					add_diagnostic_value(trace_status, "capture_io_errors", std::to_string(recorder_status.capture.io_errors));
+					add_diagnostic_value(trace_status, "capture_dropped", std::to_string(recorder_status.capture.dropped));
+					add_diagnostic_value(trace_status, "capture_truncated", std::to_string(recorder_status.capture.truncated));
 					if (!recorder_status.error_message.empty())
 					{
 						add_diagnostic_value(
@@ -2043,6 +2051,9 @@ namespace control_link_gateway
 				get_parameter(kDecisionTracePathParameter).as_string()};
 			const auto trace_capacity_value =
 				get_parameter(kDecisionTraceQueueCapacityParameter).as_int();
+			const auto capture_config = get_parameter("decision_trace_capture_config").as_string();
+			const auto capture_policy = capture_config.empty() ? FaultCapturePolicy{} : load_fault_capture_policy(capture_config);
+			if (capture_policy.enabled && trace_path.empty()) throw std::invalid_argument("capture mode needs a new owned decision_trace_path directory");
 			if (trace_capacity_value <= 0)
 			{
 				throw std::invalid_argument(
@@ -2060,7 +2071,11 @@ namespace control_link_gateway
 					throw std::invalid_argument(
 						"decision_trace_path parent must be an existing directory");
 				}
-				if (std::filesystem::exists(trace_path) &&
+				if (capture_policy.enabled && std::filesystem::exists(trace_path))
+				{
+					throw std::invalid_argument("capture directory must not already exist");
+				}
+				if (!capture_policy.enabled && std::filesystem::exists(trace_path) &&
 					!std::filesystem::is_regular_file(trace_path))
 				{
 					throw std::invalid_argument(
@@ -2074,7 +2089,7 @@ namespace control_link_gateway
 				decision_trace_recorder = std::make_unique<DecisionTraceRecorder>(
 					trace_path,
 					make_decision_trace_header(*bundle, rmw_implementation),
-					static_cast<std::size_t>(trace_capacity_value));
+					static_cast<std::size_t>(trace_capacity_value), capture_policy);
 			}
 			DecisionEvent configure_event{
 				decision_engine->next_event_sequence(),
@@ -2650,7 +2665,8 @@ namespace control_link_gateway
 			try
 			{
 				const auto status = trace_recorder->stop();
-				if (!status.trace_valid)
+				if (status.writer_failed || status.trace_overflow ||
+					!status.error_message.empty() || (!status.capture_mode && !status.trace_valid))
 				{
 					RCLCPP_ERROR(
 						get_logger(),

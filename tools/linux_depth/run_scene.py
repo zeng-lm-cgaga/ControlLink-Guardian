@@ -62,13 +62,23 @@ def identity(pid):
 
 def run(args):
     control = getattr(args, 'bpf_control', None)
+    supervisor_policy = getattr(args, 'supervisor_policy', None)
+    capture_config = getattr(args, 'fault_capture_config', None)
+    grpc_client = getattr(args, 'grpc_client', None)
+    kill_adapter = getattr(args, 'kill_adapter', False)
+    if (control and (supervisor_policy or capture_config or grpc_client or kill_adapter)) or (kill_adapter and not supervisor_policy):
+        raise ValueError('functional supervision scene is separate from the fixed BPF comparison')
+    if grpc_client and args.pause_source:
+        raise ValueError('source pause applies only to the ROS fixture producer')
     if control and (os.geteuid() == 0 or not args.timing):
         raise ValueError('BPF business must run as an ordinary user with identical application timing enabled')
     import yaml
     import rclpy
     from rclpy.signals import SignalHandlerOptions
+    from rclpy.qos import QoSProfile
     from rosidl_runtime_py.convert import message_to_ordereddict
     from control_link_interfaces.msg import ControlCommand, GatewayState, SourceStatus, VehicleState
+    from diagnostic_msgs.msg import DiagnosticArray
     from rcl_interfaces.srv import SetParametersAtomically
     from rclpy.parameter import Parameter
 
@@ -83,6 +93,9 @@ def run(args):
                    "idle_teleop": args.runtime / "build/control_link_adapters/twist_ingress_adapter_node",
                    "simulator": args.runtime / "build/peers/vcan_vehicle_simulator",
                    "activator": old / "build/control_link_bringup/gateway_lifecycle_activator"}
+    if grpc_client:
+        executables['planning_ingress'] = args.runtime / 'build/control_link_adapters/grpc_planning_bridge_node'
+        executables['grpc_client'] = grpc_client
     events = {"schema": 1, "uid": os.getuid(), "euid": os.geteuid(), "driver_sha256": digest(str(Path(__file__).resolve())), "arguments": vars(args).copy(), "commands": {}, "identities": {}, "errors": [],
               "environment": dict(os.environ), "kernel": list(os.uname()), "vcpus": os.cpu_count(),
               "meminfo": Path("/proc/meminfo").read_text(), "clk_tck": os.sysconf("SC_CLK_TCK"),
@@ -148,9 +161,17 @@ def run(args):
             return runtime_qos({"qos_profiles": contract["qos_profiles"], "state_topics": {
                 key: {"qos_profile": name} for key in ("gateway_state", "source_status", "vehicle_state")}})
 
-        publisher = node.create_publisher(ControlCommand, "/planning/control_cmd", qos(contract["input"]["qos_profile"]))
+        publisher = None if grpc_client else node.create_publisher(ControlCommand, "/planning/control_cmd", qos(contract["input"]["qos_profile"]))
         subscriptions = [node.create_subscription(ControlCommand, contract["output"]["topic"],
             lambda message: callback("canonical", message), qos(contract["output"]["qos_profile"]))]
+        if grpc_client:
+            streams['ingress_observation'] = []
+            subscriptions.append(node.create_subscription(ControlCommand, '/control_link/input/planning',
+                lambda message: callback('ingress_observation', message), qos(contract['input']['qos_profile'])))
+        if supervisor_policy:
+            streams['diagnostics'] = []
+            subscriptions.append(node.create_subscription(DiagnosticArray, '/diagnostics',
+                lambda message: callback('diagnostics', message), QoSProfile(depth=10)))
         for kind, key, message_type in (("gateway", "gateway_state", GatewayState),
                                        ("status", "source_status", SourceStatus), ("vehicle", "vehicle_state", VehicleState)):
             subscriptions.append(node.create_subscription(message_type, contract["state_topics"][key]["topic"],
@@ -167,9 +188,21 @@ def run(args):
             else:
                 command += ["-p", "profile_path:=" + str(config / "adas/adas_profile.yaml"), "-p", "config_root:=" + str(config)]
             if role in ("planning_ingress", "idle_teleop"):
-                command += ["-p", "source_id:=" + ("planning" if role == "planning_ingress" else "teleop")]
+                if role == 'planning_ingress' and grpc_client:
+                    command += ['-p', 'network_config_path:=' + str(config / 'adas/protocol_transports.yaml')]
+                else:
+                    command += ["-p", "source_id:=" + ("planning" if role == "planning_ingress" else "teleop")]
             if args.timing and role in ("gateway", "can_adapter"):
                 command += ["-p", "runtime_timing_path:=" + str(args.output / (role + "-timing.csv"))]
+            if capture_config and role == 'gateway':
+                command += ['-p', 'decision_trace_capture_config:=' + str(capture_config),
+                            '-p', 'decision_trace_path:=' + str(args.output / 'fault-capture')]
+            if supervisor_policy and role == 'can_adapter':
+                if args.timing:
+                    raise ValueError('restarted timing files need instance naming; use fault capture for this scene')
+                command += ['-p', 'exit_on_fatal_can_io:=true']
+                command = [sys.executable, str(ROOT / 'ros2_ws/src/control_link_bringup/control_link_bringup/adapter_supervisor.py'),
+                           '--policy', str(supervisor_policy), '--', *command]
             events["commands"][role] = command
             logs[role] = (args.output / (role + ".log")).open("xb")
             children[role] = subprocess.Popen(command, stdout=logs[role], stderr=subprocess.STDOUT, start_new_session=True)
@@ -182,16 +215,43 @@ def run(args):
         parameter_checks = {}
         window = None
         identity_done = False
+        adapter_instances = set()
+        next_supervision = started
         while not interrupted:
             now = time.monotonic_ns()
             for role, child in children.items():
                 if role != "activator" and child.poll() is not None:
                     raise RuntimeError(role + " exited: " + str(child.returncode))
-            if now >= next_send:
+            if grpc_client and 'grpc_client' not in children and now - started >= 2000000000:
+                command = [str(grpc_client), str(config / 'adas/protocol_transports.yaml'), '120']
+                events['commands']['grpc_client'] = command
+                logs['grpc_client'] = (args.output / 'grpc_client.log').open('xb')
+                children['grpc_client'] = subprocess.Popen(command, stdout=logs['grpc_client'], stderr=subprocess.STDOUT,
+                                                           start_new_session=True)
+            if supervisor_policy and now >= next_supervision:
+                next_supervision = now + 50000000
+                descendants = Path(f'/proc/{children["can_adapter"].pid}/task/{children["can_adapter"].pid}/children').read_text().split()
+                for descendant in descendants:
+                    pid = int(descendant)
+                    try:
+                        instance = (pid, sample(pid)['starttime'])
+                        if instance not in adapter_instances:
+                            fact = identity(pid)
+                            if Path(fact['exe']).resolve() != executables['can_adapter'].resolve():
+                                continue
+                            events.setdefault('adapter_instances', []).append(fact)
+                            adapter_instances.add(instance)
+                        if kill_adapter and window and now >= window['start_ns'] + 5000000000 and 'adapter_kill' not in events:
+                            events['adapter_kill'] = {'pid': pid, 'starttime': instance[1], 'monotonic_ns': time.monotonic_ns(), 'signal': int(signal.SIGKILL)}
+                            os.kill(pid, signal.SIGKILL)
+                    except (FileNotFoundError, ProcessLookupError, StopIteration):
+                        continue
+            if now >= next_send and publisher is not None:
                 skip = (now - next_send) // 50000000
                 missed += skip
                 scheduled, next_send = next_send, next_send + (skip + 1) * 50000000
-                paused = args.pause_source and window and window["start_ns"] + 5000000000 <= now < window["start_ns"] + 6000000000
+                pause_offset = 12000000000 if kill_adapter else 5000000000
+                paused = args.pause_source and window and window["start_ns"] + pause_offset <= now < window["start_ns"] + pause_offset + 1000000000
                 if paused:
                     events["intentional_pause_slots"] = events.get("intentional_pause_slots", 0) + 1
                 else:
@@ -224,6 +284,17 @@ def run(args):
                     break
                 append("can", {"monotonic_ns": mono, "wall_ns": wall, "frame": frame})
             if now >= next_sample:
+                if supervisor_policy:
+                    graph = {}
+                    for topic, query in (('/control_link/vehicle_state', node.get_publishers_info_by_topic),
+                                         ('/control_link/output/control_cmd', node.get_subscriptions_info_by_topic)):
+                        before = time.monotonic_ns()
+                        endpoints = query(topic)
+                        graph[topic] = {'begin_ns': before, 'end_ns': time.monotonic_ns(), 'endpoints': [
+                            {'gid': bytes(endpoint.endpoint_gid).hex(), 'node_name': endpoint.node_name,
+                             'node_namespace': endpoint.node_namespace, 'topic_type': endpoint.topic_type}
+                            for endpoint in endpoints]}
+                    events.setdefault('endpoint_graph_samples', []).append(graph)
                 events["vm_resource_samples"].append({"monotonic_ns": time.monotonic_ns(),
                     "wall_ns": time.time_ns(), "loadavg": Path("/proc/loadavg").read_text(),
                     "meminfo": Path("/proc/meminfo").read_text(), "cpu_stat": Path("/proc/stat").read_text()})
@@ -257,7 +328,8 @@ def run(args):
                           "end_ns": anchor + (args.warmup + args.seconds) * 1000000000}
                 events["window"] = window
                 if args.pause_source:
-                    events["planned_source_pause"] = [window["start_ns"] + 5000000000, window["start_ns"] + 6000000000]
+                    pause_offset = 12000000000 if kill_adapter else 5000000000
+                    events["planned_source_pause"] = [window["start_ns"] + pause_offset, window["start_ns"] + pause_offset + 1000000000]
                 if args.check_readonly:
                     for role, fqn in (("gateway", "/control_link/gateway"), ("can_adapter", "/control_link/vehicle_adapter")):
                         client = node.create_client(SetParametersAtomically, fqn + "/set_parameters_atomically")
@@ -283,7 +355,7 @@ def run(args):
                 break
             if not window and now - started >= 60000000000:
                 raise RuntimeError("bounded readiness timeout")
-        events["missed_send_slots"] = missed
+        events["missed_send_slots"] = missed if publisher is not None else None
         events["result"] = 0 if window and events.get("stop_reason") == "fixed_window_complete" else 2
     except Exception as error:
         events["errors"].append(type(error).__name__ + ": " + str(error))
@@ -339,4 +411,8 @@ if __name__ == "__main__":
     parser.add_argument("--pause-source", action="store_true")
     parser.add_argument("--check-readonly", action="store_true")
     parser.add_argument("--bpf-control", type=lambda path: Path(path).resolve())
+    parser.add_argument('--supervisor-policy', type=lambda path: Path(path).resolve())
+    parser.add_argument('--fault-capture-config', type=lambda path: Path(path).resolve())
+    parser.add_argument('--grpc-client', type=lambda path: Path(path).resolve())
+    parser.add_argument('--kill-adapter', action='store_true')
     raise SystemExit(run(parser.parse_args()))

@@ -95,7 +95,7 @@ struct GrpcServer::Impl {
 
   Impl(Config configuration, std::shared_ptr<network::PlanningIngress> resource, wire::Capabilities advertised)
       : config(std::move(configuration)), ingress(std::move(resource)), capabilities(std::move(advertised)),
-        instance(network::random_identity()) {
+        instance(network::random_identity()), rate_limiter(config.rate_limits) {
     validate_config(config);
     if (!ingress) throw std::invalid_argument("gRPC requires the shared PlanningIngress");
     capabilities.set_schema_version(1);
@@ -216,6 +216,12 @@ struct GrpcServer::Impl {
       terminate(call, grpc::Status(grpc::StatusCode::INVALID_ARGUMENT, "First control frame must be OpenSession"), "INVALID_CONTROL", true);
       return;
     }
+    const auto method = request.has_open() ? network::IngressMethod::Open :
+        request.has_keep() ? network::IngressMethod::Keep : network::IngressMethod::Close;
+    if (!rate_limiter.admit(call.context.peer(), method, network::steady_now_ns())) {
+      terminate(call, grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "RATE_LIMITED"), "RATE_LIMITED", true);
+      return;
+    }
     wire::OpenSessionResponse response;
     if (request.has_open()) {
       response = ingress->open(call.id, request.open(), network::steady_now_ns());
@@ -263,6 +269,13 @@ struct GrpcServer::Impl {
     if (call.kind == Kind::control) {
       call.opened_at = network::steady_now_ns();
       read(call);
+      return;
+    }
+    const auto method = call.kind == Kind::submit ? network::IngressMethod::Submit :
+        call.kind == Kind::status ? network::IngressMethod::Status :
+        call.kind == Kind::subscription ? network::IngressMethod::Subscribe : network::IngressMethod::Capabilities;
+    if (!rate_limiter.admit(call.context.peer(), method, network::steady_now_ns())) {
+      terminate(call, grpc::Status(grpc::StatusCode::RESOURCE_EXHAUSTED, "RATE_LIMITED"), "RATE_LIMITED");
       return;
     }
     if (call.kind == Kind::submit) {
@@ -468,6 +481,7 @@ struct GrpcServer::Impl {
   std::shared_ptr<network::PlanningIngress> ingress;
   wire::Capabilities capabilities;
   std::string instance;
+  network::IngressRateLimiter rate_limiter;
   wire::PlanningIngress::AsyncService service;
   std::unique_ptr<grpc::ServerCompletionQueue> cq;
   std::unique_ptr<grpc::Server> server;
@@ -492,7 +506,7 @@ ServerRuntime GrpcServer::runtime() const {
   std::lock_guard<std::mutex> lock(impl_->calls_mutex);
   return {impl_->calls.size(), impl_->peak_calls.load(), impl_->completed_tags.load(),
           impl_->dropped_updates.load(), impl_->unstarted_requests.load(), impl_->unresolved_calls.load(),
-          impl_->cq_drained.load(), impl_->processing_failed.load()};
+          impl_->cq_drained.load(), impl_->processing_failed.load(), impl_->rate_limiter.snapshot()};
 }
 
 }

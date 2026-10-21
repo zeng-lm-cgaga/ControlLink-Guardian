@@ -65,6 +65,7 @@ add_library(${PROJECT_NAME} SHARED
 	src/decision_replay.cpp
 	src/decision_trace.cpp
 	src/decision_trace_recorder.cpp
+	src/fault_capture.cpp
 	src/graph_monitor.cpp
 	src/source_binding.cpp
 	src/source_runtime.cpp
@@ -74,7 +75,7 @@ add_library(${PROJECT_NAME} SHARED
 	src/vehicle_state_validator.cpp
 	src/vehicle_state_runtime.cpp
 )
-target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json control_link_runtime_timing)
+target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json control_link_runtime_timing yaml-cpp)
 
 add_executable(${PROJECT_NAME}_node
 	src/control_gateway_main.cpp
@@ -161,6 +162,9 @@ if(BUILD_TESTING)
 	ament_add_gtest(test_decision_trace_recorder
 		test/test_decision_trace_recorder.cpp
 	)
+	ament_add_gtest(test_fault_capture test/test_fault_capture.cpp)
+	target_link_libraries(test_fault_capture ${PROJECT_NAME} nlohmann_json::nlohmann_json)
+	target_compile_definitions(test_fault_capture PRIVATE CONTROL_LINK_FAULT_TEST_ROOT="${CMAKE_CURRENT_BINARY_DIR}/fault-test-artifacts")
 	target_link_libraries(test_decision_trace_recorder ${PROJECT_NAME})
 	target_compile_definitions(test_decision_trace_recorder PRIVATE
 		CONTROL_LINK_TEST_DECISION_TRACE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/decision_traces/robot_nominal.jsonl"

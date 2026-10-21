@@ -1,0 +1,9 @@
+schema_version: 1
+pre_events: 256
+post_events: 256
+post_window_ms: 2000
+cooldown_ms: 5000
+max_record_bytes: 65536
+segment_bytes: 1048576
+total_bytes: 16777216
+max_files: 32

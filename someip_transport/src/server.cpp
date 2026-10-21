@@ -89,9 +89,10 @@ struct SomeipServer::Impl {
   std::uint64_t publication_sequence{0};
   std::map<vsomeip::client_t, std::uint8_t> readonly_peers;
   std::chrono::steady_clock::time_point next_error_log{};
+  ::control_link::network::IngressRateLimiter rate_limiter;
 
   Impl(Config settings, std::shared_ptr<PlanningIngress> target, std::string json)
-      : config(std::move(settings)), ingress(std::move(target)), path(std::move(json)) {
+      : config(std::move(settings)), ingress(std::move(target)), path(std::move(json)), rate_limiter(config.rate_limits) {
     if (!ingress) throw std::invalid_argument("PlanningIngress is required");
   }
 
@@ -118,6 +119,7 @@ struct SomeipServer::Impl {
       }
       return true;
     }
+    if (!rate_limiter.admit(std::to_string(peer), ::control_link::network::IngressMethod::Subscribe, steady_now_ns())) return false;
     if (existing == readonly_peers.end()) {
       if (readonly_peers.size() >= config.readonly_inflight_limit) {
         log_error("readonly subscriber RESOURCE_EXHAUSTED");
@@ -136,6 +138,11 @@ struct SomeipServer::Impl {
     auto response = vsomeip::runtime::get()->create_response(request);
     response->set_message_type(vsomeip::message_type_e::MT_ERROR);
     response->set_return_code(code);
+    if (reason == "RATE_LIMITED") {
+      auto payload = vsomeip::runtime::get()->create_payload();
+      payload->set_data(reinterpret_cast<const vsomeip::byte_t *>(reason.data()), static_cast<vsomeip::length_t>(reason.size()));
+      response->set_payload(payload);
+    }
     app->send(response);
   }
 
@@ -190,6 +197,14 @@ struct SomeipServer::Impl {
         return;
       }
       const auto method = message->get_method();
+      const auto budget_method = method == config.open_method ? ::control_link::network::IngressMethod::Open :
+          method == config.keep_method ? ::control_link::network::IngressMethod::Keep :
+          method == config.close_method ? ::control_link::network::IngressMethod::Close :
+          method == config.submit_method ? ::control_link::network::IngressMethod::Submit : ::control_link::network::IngressMethod::Status;
+      if (!rate_limiter.admit(std::to_string(message->get_client()), budget_method, steady_now_ns())) {
+        error_reply(message, vsomeip::return_code_e::E_NOT_OK, "RATE_LIMITED");
+        return;
+      }
       if (method == config.open_method) {
         wire::OpenSessionRequest input;
         if (!parse_versioned(payload, input) || input.holder_nonce().size() != 16 ||
@@ -318,6 +333,10 @@ SomeipServer::SomeipServer(Config config, std::shared_ptr<PlanningIngress> ingre
                                   std::move(vsomeip_config_path))) {}
 
 SomeipServer::~SomeipServer() { stop(); }
+
+::control_link::network::RateLimitSnapshot SomeipServer::rate_limits() const {
+  return impl_->rate_limiter.snapshot();
+}
 
 void SomeipServer::start() {
   if (impl_->started) throw std::logic_error("SomeipServer cannot be started twice");

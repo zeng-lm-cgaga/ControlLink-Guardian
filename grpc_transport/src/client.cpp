@@ -4,9 +4,11 @@
 #include "client_reply_policy.hpp"
 
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/alarm.h>
 
 #include <algorithm>
 #include <condition_variable>
+#include <deque>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -85,6 +87,13 @@ std::string rpc_failure(const grpc::Status &status) {
 }
 
 struct GrpcClient::Impl {
+  template <typename Response>
+  struct Completion {
+    std::mutex cancel_mutex;
+    std::promise<AsyncResult<Response>> promise;
+    Callback<Response> callback;
+    bool done{false};
+  };
   struct Tag {
     std::function<void(bool)> complete;
   };
@@ -96,6 +105,8 @@ struct GrpcClient::Impl {
     bool write_complete{false};
     bool response_complete{false};
     std::string error;
+    std::shared_ptr<Completion<wire::OpenSessionResponse>> completion;
+    grpc::Alarm deadline;
   };
 
   struct ControlCall {
@@ -157,6 +168,10 @@ struct GrpcClient::Impl {
   std::unique_ptr<wire::PlanningIngress::Stub> stub;
   grpc::CompletionQueue cq;
   std::thread poller;
+  std::thread dispatcher;
+  std::deque<std::function<void()>> callbacks;
+  std::size_t async_pending{0};
+  bool callbacks_shutdown{false};
   mutable std::mutex mutex;
   std::condition_variable wake;
   ClientStatus current;
@@ -171,6 +186,67 @@ struct GrpcClient::Impl {
   bool started{false};
   bool stopping{false};
   bool queue_shutdown{false};
+
+  template <typename Response>
+  std::shared_ptr<Completion<Response>> reserve_locked(Callback<Response> callback) {
+    require_running_locked();
+    if (async_pending >= config.client_async_capacity) {
+      ++current.async_overloaded;
+      throw std::runtime_error("gRPC async/callback capacity exhausted");
+    }
+    auto completion = std::make_shared<Completion<Response>>();
+    completion->callback = std::move(callback);
+    ++async_pending;
+    return completion;
+  }
+
+  template <typename Response>
+  void complete_locked(const std::shared_ptr<Completion<Response>> &completion,
+                       AsyncResult<Response> result) {
+    if (!completion) return;
+    std::lock_guard<std::mutex> cancel_lock(completion->cancel_mutex);
+    if (completion->done) return;
+    completion->done = true;
+    if (completion->callback) {
+      auto delivery = std::make_shared<AsyncResult<Response>>(std::move(result));
+      callbacks.emplace_back([completion, delivery] { completion->callback(*delivery); });
+      completion->promise.set_value(*delivery);
+    } else {
+      completion->promise.set_value(std::move(result));
+      --async_pending;
+    }
+    wake.notify_all();
+  }
+
+  void complete_exchange_locked(const std::shared_ptr<ControlExchange> &exchange) {
+    if (!exchange || !exchange->completion) return;
+    if (exchange->error.empty() && !(exchange->write_complete && exchange->response_complete)) return;
+    AsyncResult<wire::OpenSessionResponse> result;
+    result.response = exchange->response;
+    result.error = exchange->error;
+    if (result.response.has_session() && exchange->readiness_revision != readiness_revision) {
+      result.response.mutable_session()->set_submission_ready(false);
+    }
+    complete_locked(exchange->completion, std::move(result));
+    exchange->deadline.Cancel();
+  }
+
+  void dispatch() noexcept {
+    std::unique_lock<std::mutex> lock(mutex);
+    while (true) {
+      wake.wait(lock, [this] { return callbacks_shutdown || !callbacks.empty(); });
+      if (callbacks.empty() && callbacks_shutdown) return;
+      auto callback = std::move(callbacks.front());
+      callbacks.pop_front();
+      lock.unlock();
+      bool failed = false;
+      try { callback(); } catch (...) { failed = true; }
+      lock.lock();
+      if (failed) ++current.callback_exceptions;
+      --async_pending;
+      wake.notify_all();
+    }
+  }
 
   explicit Impl(Config settings) : config(std::move(settings)), fingerprint(network::schema_fingerprint()) {}
 
@@ -308,6 +384,7 @@ struct GrpcClient::Impl {
       if (call->exchange && !call->exchange->response_complete && call->exchange->error.empty()) {
         call->exchange->error = ok ? rpc_failure(call->result) : "gRPC control Finish completion failed";
       }
+      complete_exchange_locked(call->exchange);
       if (control == call) {
         control.reset();
         current.control_rpc_live = false;
@@ -324,6 +401,7 @@ struct GrpcClient::Impl {
     if (call->exchange && !call->exchange->response_complete && call->exchange->error.empty()) {
       call->exchange->error = reason;
     }
+    complete_exchange_locked(call->exchange);
     call->half_closed = false;
     call->context.TryCancel();
     finish_control_locked(call);
@@ -369,6 +447,7 @@ struct GrpcClient::Impl {
           cancel_control_locked(call, failure.what());
         }
       }
+      complete_exchange_locked(call->exchange);
       if (call->exchange && call->exchange->write_complete && call->exchange->response_complete) {
         call->exchange.reset();
       }
@@ -403,6 +482,7 @@ struct GrpcClient::Impl {
         exchange->error = "gRPC control Write completion failed";
         cancel_control_locked(call, exchange->error);
       }
+      complete_exchange_locked(exchange);
       if (exchange->response_complete && call->exchange == exchange) call->exchange.reset();
       writes_done_locked(call);
       finish_control_locked(call);
@@ -443,12 +523,16 @@ struct GrpcClient::Impl {
     return call;
   }
 
-  wire::OpenSessionResponse control_exchange(const wire::ControlSessionRequest &request,
-                                            Milliseconds timeout) {
+  RequestHandle<wire::OpenSessionResponse> control_exchange(const wire::ControlSessionRequest &request,
+      Milliseconds timeout, Callback<wire::OpenSessionResponse> callback) {
     bounded_timeout(timeout, config.max_control_stream_lifetime_ms);
     bounded_message(request, config.max_message_bytes);
     std::unique_lock<std::mutex> lock(mutex);
     require_running_locked();
+    if (async_pending >= config.client_async_capacity) {
+      ++current.async_overloaded;
+      throw std::runtime_error("gRPC async/callback capacity exhausted");
+    }
     auto call = control;
     if (!call) {
       if (!request.has_open()) throw std::runtime_error("gRPC no live control RPC");
@@ -473,23 +557,27 @@ struct GrpcClient::Impl {
     const auto exchange = std::make_shared<ControlExchange>();
     exchange->readiness_revision = readiness_revision;
     exchange->request = request;
+    exchange->completion = reserve_locked<wire::OpenSessionResponse>(std::move(callback));
+    auto result = exchange->completion->promise.get_future().share();
     call->exchange = exchange;
+    exchange->deadline.Set(&cq, std::chrono::system_clock::now() + timeout,
+        tag([this, call, exchange](bool expired) {
+          if (expired && !exchange->completion->done) {
+            exchange->error = "gRPC control request deadline exceeded; holder revoked";
+            complete_exchange_locked(exchange);
+            cancel_control_locked(call, exchange->error);
+          }
+        }));
     write_control_locked(call);
-    if (!wake.wait_for(lock, timeout, [&] {
-          return !current.running || !exchange->error.empty() ||
-              (exchange->response_complete && exchange->write_complete);
-        })) {
-      // timeout 不重试/旋转 RPC；未完成请求继续占容量1，迟到回复按同 RPC 顺序消费。
-      throw std::runtime_error("gRPC control response timeout; original holder keys retained");
-    }
-    if (!exchange->error.empty()) throw std::runtime_error(exchange->error);
-    if (!current.running) throw std::runtime_error("gRPC client stopped while awaiting control reply");
-    auto response = exchange->response;
-    if (response.has_session() &&
-        (control != call || call->closing || exchange->readiness_revision != readiness_revision)) {
-      response.mutable_session()->set_submission_ready(false);
-    }
-    return response;
+    return {std::move(result), [weak = std::weak_ptr<ControlCall>(call),
+                               pending = std::weak_ptr<Completion<wire::OpenSessionResponse>>(exchange->completion)] {
+      const auto operation = pending.lock();
+      if (!operation) return;
+      std::lock_guard<std::mutex> cancel_lock(operation->cancel_mutex);
+      if (!operation->done) {
+        if (auto active = weak.lock()) active->context.TryCancel();
+      }
+    }};
   }
 
   void finish_readonly_locked(const std::shared_ptr<ReadonlyCall> &call) {
@@ -561,14 +649,15 @@ struct GrpcClient::Impl {
   }
 
   template <typename Request, typename Response, typename Start>
-  Response unary(const Request &request, Milliseconds timeout, bool submission, Start start_call) {
+  RequestHandle<Response> unary(const Request &request, Milliseconds timeout, bool submission,
+                                Start start_call, Callback<Response> callback) {
     bounded_timeout(timeout, config.max_unary_deadline_ms);
     bounded_message(request, config.max_message_bytes);
     std::unique_lock<std::mutex> lock(mutex);
     require_running_locked();
     std::size_t matching = 0;
     for (const auto &entry : unary_calls) if (entry.second->submission == submission) ++matching;
-    if (matching >= (submission ? 1U : config.readonly_inflight_limit)) {
+    if (matching >= (submission ? config.client_submit_inflight_limit : config.readonly_inflight_limit)) {
       throw std::runtime_error("gRPC unary capacity exhausted; no unbounded retry queue");
     }
     if (next_unary_id == std::numeric_limits<std::uint64_t>::max()) {
@@ -587,33 +676,57 @@ struct GrpcClient::Impl {
     }
     call->context.set_deadline(rpc_deadline(timeout));
     call->context.set_wait_for_ready(false);
+    const auto completion = reserve_locked<Response>(std::move(callback));
+    auto result = completion->promise.get_future().share();
     call->reader = start_call(&call->context, call->request, &cq);
-    if (!call->reader) throw std::runtime_error("gRPC unary preparation failed");
+    if (!call->reader) {
+      --async_pending;
+      throw std::runtime_error("gRPC unary preparation failed");
+    }
     const auto identifier = ++next_unary_id;
     unary_calls.emplace(identifier, call);
-    call->reader->Finish(&call->response, &call->result, tag([this, call, identifier](bool ok) {
+    call->reader->Finish(&call->response, &call->result, tag([this, call, identifier, completion](bool ok) {
       call->done = true;
       if (!ok) call->error = "gRPC unary Finish completion failed";
       else if (!call->result.ok()) call->error = rpc_failure(call->result);
       else if (call->response.ByteSizeLong() > config.max_message_bytes) {
         call->error = "gRPC unary response exceeds max_message_bytes";
       }
+      if (!current.running) call->error = "gRPC client stopped while awaiting unary reply";
+      if (call->submission && (call->generation != current.control_generation || !control || control->closing)) {
+        call->error = "gRPC submit completion superseded by control termination; acceptance unknown";
+      }
+      if (call->error.empty()) {
+        try {
+          if constexpr (std::is_same_v<Response, wire::Capabilities>) {
+            validate_capabilities(call->response);
+            current.capabilities = call->response;
+          } else if constexpr (std::is_same_v<Response, wire::StatusEnvelope>) {
+            merge_envelope_locked(call->response);
+          } else if constexpr (std::is_same_v<Response, wire::SubmitReceipt>) {
+            const auto &receipt = call->response;
+            if (receipt.schema_version_presence_case() != wire::SubmitReceipt::kSchemaVersion || receipt.schema_version() != 1 ||
+                !receipt.has_key() || receipt.key().session_token() != call->request.target().key().session_token() ||
+                receipt.key().source_sequence_presence_case() != wire::CommandKey::kSourceSequence ||
+                receipt.key().source_sequence() != call->request.target().key().source_sequence()) {
+              throw std::runtime_error("gRPC SubmitReceipt schema/target-key mismatch; acceptance unknown");
+            }
+          }
+        } catch (const std::exception &failure) { call->error = failure.what(); }
+      }
+      complete_locked(completion, AsyncResult<Response>{call->response, call->error, static_cast<int>(call->result.error_code())});
       unary_calls.erase(identifier);
       wake.notify_all();
     }));
-    if (!wake.wait_for(lock, timeout, [&] { return call->done || !current.running; })) {
-      call->context.TryCancel();
-      throw std::runtime_error("gRPC unary deadline/response timeout; already-published command cannot be recalled");
-    }
-    if (!current.running) {
-      call->context.TryCancel();
-      throw std::runtime_error("gRPC client stopped while awaiting unary reply");
-    }
-    if (!call->error.empty()) throw std::runtime_error(call->error);
-    if (submission && (call->generation != current.control_generation || !control || control->closing)) {
-      throw std::runtime_error("gRPC submit completion superseded by control termination; acceptance unknown");
-    }
-    return call->response;
+    return {std::move(result), [weak = std::weak_ptr<UnaryCall<Request, Response>>(call),
+                               pending = std::weak_ptr<Completion<Response>>(completion)] {
+      const auto operation = pending.lock();
+      if (!operation) return;
+      std::lock_guard<std::mutex> cancel_lock(operation->cancel_mutex);
+      if (!operation->done) {
+        if (auto active = weak.lock()) active->context.TryCancel();
+      }
+    }};
   }
 
   void poll() noexcept {
@@ -644,7 +757,7 @@ GrpcClient::GrpcClient(Config config) : impl_(std::make_unique<Impl>(std::move(c
 GrpcClient::~GrpcClient() { stop(); }
 
 void GrpcClient::start() {
-  std::lock_guard<std::mutex> lock(impl_->mutex);
+  std::unique_lock<std::mutex> lock(impl_->mutex);
   if (impl_->started) throw std::runtime_error("gRPC client cannot be started twice");
   grpc::ChannelArguments arguments;
   arguments.SetMaxReceiveMessageSize(static_cast<int>(impl_->config.max_message_bytes));
@@ -660,11 +773,19 @@ void GrpcClient::start() {
   impl_->current.running = true;
   impl_->started = true;
   try {
+    impl_->dispatcher = std::thread([this] { impl_->dispatch(); });
     impl_->poller = std::thread([this] { impl_->poll(); });
   } catch (...) {
     impl_->current.running = false;
     impl_->cq.Shutdown();
     impl_->queue_shutdown = true;
+    impl_->callbacks_shutdown = true;
+    impl_->wake.notify_all();
+    lock.unlock();
+    if (impl_->dispatcher.joinable()) impl_->dispatcher.join();
+    void *unused_tag = nullptr;
+    bool unused_ok = false;
+    while (impl_->cq.Next(&unused_tag, &unused_ok)) {}
     throw;
   }
 }
@@ -683,15 +804,17 @@ bool GrpcClient::wait_available(Milliseconds timeout) {
   return impl_->current.service_available;
 }
 
-wire::OpenSessionResponse GrpcClient::open(const wire::OpenSessionRequest &request, Milliseconds timeout) {
+RequestHandle<wire::OpenSessionResponse> GrpcClient::open_async(const wire::OpenSessionRequest &request,
+    Milliseconds timeout, Callback<wire::OpenSessionResponse> callback) {
   valid_open(request);
   require_opening_domain(request);
   wire::ControlSessionRequest operation;
   *operation.mutable_open() = request;
-  return impl_->control_exchange(operation, timeout);
+  return impl_->control_exchange(operation, timeout, std::move(callback));
 }
 
-wire::OpenSessionResponse GrpcClient::keep(const wire::KeepSessionRequest &request, Milliseconds timeout) {
+RequestHandle<wire::OpenSessionResponse> GrpcClient::keep_async(const wire::KeepSessionRequest &request,
+    Milliseconds timeout, Callback<wire::OpenSessionResponse> callback) {
   require_opening_domain(request);
   if (request.schema_version_presence_case() != wire::KeepSessionRequest::kSchemaVersion || request.schema_version() != 1 ||
       request.holder_nonce().size() != 16 || request.open_request_id().size() != 16 ||
@@ -700,10 +823,11 @@ wire::OpenSessionResponse GrpcClient::keep(const wire::KeepSessionRequest &reque
   }
   wire::ControlSessionRequest operation;
   *operation.mutable_keep() = request;
-  return impl_->control_exchange(operation, timeout);
+  return impl_->control_exchange(operation, timeout, std::move(callback));
 }
 
-wire::OpenSessionResponse GrpcClient::close(const wire::CloseSessionRequest &request, Milliseconds timeout) {
+RequestHandle<wire::OpenSessionResponse> GrpcClient::close_async(const wire::CloseSessionRequest &request,
+    Milliseconds timeout, Callback<wire::OpenSessionResponse> callback) {
   require_opening_domain(request);
   if (request.schema_version_presence_case() != wire::CloseSessionRequest::kSchemaVersion || request.schema_version() != 1 ||
       request.holder_nonce().size() != 16 || request.open_request_id().size() != 16) {
@@ -712,7 +836,7 @@ wire::OpenSessionResponse GrpcClient::close(const wire::CloseSessionRequest &req
   wire::ControlSessionRequest operation;
   *operation.mutable_close() = request;
   try {
-    return impl_->control_exchange(operation, timeout);
+    return impl_->control_exchange(operation, timeout, std::move(callback));
   } catch (const std::invalid_argument &) {
     // 错键/非法边界请求不能借 SDK 的取消路径撤销合法 holder。
     throw;
@@ -722,8 +846,8 @@ wire::OpenSessionResponse GrpcClient::close(const wire::CloseSessionRequest &req
   }
 }
 
-wire::SubmitReceipt GrpcClient::submit(const control_link_edge_protocol::CommandFrame &target,
-                                     Milliseconds timeout) {
+RequestHandle<wire::SubmitReceipt> GrpcClient::submit_async(const control_link_edge_protocol::CommandFrame &target,
+    Milliseconds timeout, Callback<wire::SubmitReceipt> callback) {
   wire::SubmitRequest request;
   auto *payload = request.mutable_target();
   payload->set_schema_version(1);
@@ -738,42 +862,56 @@ wire::SubmitReceipt GrpcClient::submit(const control_link_edge_protocol::Command
   payload->set_linear_velocity_mps(target.linear_velocity_mps);
   payload->set_angular_velocity_radps(target.angular_velocity_radps);
   // presence 与数值原样映射；finite/mode/重复 sequence/age 仍由唯一 Gateway 判断。
-  auto response = impl_->unary<wire::SubmitRequest, wire::SubmitReceipt>(request, timeout, true,
+  return impl_->unary<wire::SubmitRequest, wire::SubmitReceipt>(request, timeout, true,
       [this](grpc::ClientContext *context, const wire::SubmitRequest &input, grpc::CompletionQueue *queue) {
         return impl_->stub->AsyncSubmit(context, input, queue);
-      });
-  if (response.schema_version_presence_case() != wire::SubmitReceipt::kSchemaVersion || response.schema_version() != 1 || !response.has_key() ||
-      response.key().session_token() != payload->key().session_token() ||
-      response.key().source_sequence_presence_case() != wire::CommandKey::kSourceSequence ||
-      response.key().source_sequence() != target.command_sequence) {
-    throw std::runtime_error("gRPC SubmitReceipt schema/target-key mismatch; acceptance unknown");
-  }
-  return response;
+      }, std::move(callback));
 }
 
-wire::StatusEnvelope GrpcClient::get_status(Milliseconds timeout) {
+RequestHandle<wire::StatusEnvelope> GrpcClient::get_status_async(Milliseconds timeout, Callback<wire::StatusEnvelope> callback) {
   wire::GetStatusRequest request;
   request.set_schema_version(1);
-  auto response = impl_->unary<wire::GetStatusRequest, wire::StatusEnvelope>(request, timeout, false,
+  return impl_->unary<wire::GetStatusRequest, wire::StatusEnvelope>(request, timeout, false,
       [this](grpc::ClientContext *context, const wire::GetStatusRequest &input, grpc::CompletionQueue *queue) {
         return impl_->stub->AsyncGetStatus(context, input, queue);
-      });
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  impl_->merge_envelope_locked(response);
-  return response;
+      }, std::move(callback));
 }
 
-wire::Capabilities GrpcClient::get_capabilities(Milliseconds timeout) {
+RequestHandle<wire::Capabilities> GrpcClient::get_capabilities_async(Milliseconds timeout, Callback<wire::Capabilities> callback) {
   wire::GetCapabilitiesRequest request;
   request.set_schema_version(1);
-  auto response = impl_->unary<wire::GetCapabilitiesRequest, wire::Capabilities>(request, timeout, false,
+  return impl_->unary<wire::GetCapabilitiesRequest, wire::Capabilities>(request, timeout, false,
       [this](grpc::ClientContext *context, const wire::GetCapabilitiesRequest &input, grpc::CompletionQueue *queue) {
         return impl_->stub->AsyncGetCapabilities(context, input, queue);
-      });
-  std::lock_guard<std::mutex> lock(impl_->mutex);
-  impl_->validate_capabilities(response);
-  impl_->current.capabilities = response;
-  return response;
+      }, std::move(callback));
+}
+
+namespace {
+template <typename Response>
+Response wait_response(RequestHandle<Response> request) {
+  const auto &result = request.future().get();
+  if (!result.ok()) throw std::runtime_error(result.error);
+  return result.response;
+}
+}
+
+wire::OpenSessionResponse GrpcClient::open(const wire::OpenSessionRequest &request, Milliseconds timeout) {
+  return wait_response(open_async(request, timeout));
+}
+wire::OpenSessionResponse GrpcClient::keep(const wire::KeepSessionRequest &request, Milliseconds timeout) {
+  return wait_response(keep_async(request, timeout));
+}
+wire::OpenSessionResponse GrpcClient::close(const wire::CloseSessionRequest &request, Milliseconds timeout) {
+  return wait_response(close_async(request, timeout));
+}
+wire::SubmitReceipt GrpcClient::submit(const control_link_edge_protocol::CommandFrame &target, Milliseconds timeout) {
+  return wait_response(submit_async(target, timeout));
+}
+wire::StatusEnvelope GrpcClient::get_status(Milliseconds timeout) {
+  return wait_response(get_status_async(timeout));
+}
+wire::Capabilities GrpcClient::get_capabilities(Milliseconds timeout) {
+  return wait_response(get_capabilities_async(timeout));
 }
 
 void GrpcClient::set_status_subscription(bool enabled) {
@@ -802,6 +940,7 @@ void GrpcClient::half_close() {
   if (call->exchange && !call->exchange->response_complete) {
     call->exchange->error = "gRPC client half-closed control";
   }
+  impl_->complete_exchange_locked(call->exchange);
   impl_->writes_done_locked(call);
 }
 
@@ -812,6 +951,8 @@ void GrpcClient::cancel_control() noexcept {
 
 void GrpcClient::stop() noexcept {
   std::unique_lock<std::mutex> lock(impl_->mutex);
+  if (std::this_thread::get_id() == impl_->dispatcher.get_id() ||
+      std::this_thread::get_id() == impl_->poller.get_id()) std::terminate();
   if (!impl_->started || impl_->queue_shutdown) return;
   impl_->stopping = true;
   impl_->current.running = false;
@@ -833,6 +974,11 @@ void GrpcClient::stop() noexcept {
   impl_->cq.Shutdown();
   lock.unlock();
   if (impl_->poller.joinable()) impl_->poller.join();
+  lock.lock();
+  impl_->callbacks_shutdown = true;
+  impl_->wake.notify_all();
+  lock.unlock();
+  if (impl_->dispatcher.joinable()) impl_->dispatcher.join();
   lock.lock();
   impl_->stub.reset();
   impl_->channel.reset();

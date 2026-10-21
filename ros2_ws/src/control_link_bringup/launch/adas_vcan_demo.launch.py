@@ -128,6 +128,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 	}
 	gateway_parameters = {
 		**common_parameters,
+		"decision_trace_capture_config": LaunchConfiguration("decision_trace_capture_config").perform(context),
 		"decision_trace_path": LaunchConfiguration(
 			"decision_trace_path").perform(context),
 		"decision_trace_queue_capacity": _positive_integer_argument(
@@ -209,6 +210,15 @@ def _launch_adas_vcan(context, *args, **kwargs):
 		additional_env=participant_env,
 		parameters=[common_parameters],
 	)
+	if _bool_argument(context, "supervise_adapter"):
+		adapter_node = ExecuteProcess(
+			cmd=[os.path.join(get_package_prefix("control_link_bringup"), "lib", "control_link_bringup", "socketcan_supervisor"),
+				"--policy", os.path.join(config_root, "adas", "adapter_supervisor.yaml"), "--",
+				os.path.join(get_package_prefix("control_link_adapters"), "lib", "control_link_adapters", "socketcan_adapter_node"),
+				"--ros-args", "-r", "__node:=vehicle_adapter", "-r", "__ns:=/control_link",
+				"-p", "profile_path:=" + profile_path, "-p", "config_root:=" + config_root,
+				"-p", "exit_on_fatal_can_io:=true"],
+			output="screen", additional_env=participant_env)
 	source_node = Node(
 		package="control_link_adapters",
 		executable="mock_control_source_node",
@@ -368,6 +378,10 @@ def _launch_adas_vcan(context, *args, **kwargs):
 
 def generate_launch_description():
 	return LaunchDescription([
+		DeclareLaunchArgument("decision_trace_capture_config", default_value="",
+			description="Optional absolute fault_capture.yaml; decision_trace_path becomes a new owned directory"),
+		DeclareLaunchArgument("supervise_adapter", default_value="false",
+			description="Opt-in bounded SocketCAN child rebuild; Graph and recovery gates remain unchanged"),
 		DeclareLaunchArgument(
 			"can_interface",
 			default_value="",

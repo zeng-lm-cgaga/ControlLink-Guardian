@@ -5,6 +5,10 @@
 #include <stdexcept>
 #include <utility>
 #include <variant>
+#include <memory>
+#include <nlohmann/json.hpp>
+#include "control_link_timing/recorder.hpp"
+#include <unistd.h>
 
 namespace control_link_gateway
 {
@@ -23,10 +27,11 @@ namespace control_link_gateway
 	DecisionTraceRecorder::DecisionTraceRecorder(
 		std::filesystem::path output_path,
 		DecisionTraceHeader header,
-		std::size_t queue_capacity)
+		std::size_t queue_capacity,
+		FaultCapturePolicy capture_policy)
 		: output_path_(std::move(output_path)),
 		  header_(std::move(header)),
-		  queue_capacity_(queue_capacity)
+		  queue_capacity_(queue_capacity), capture_policy_(capture_policy)
 	{
 		if (output_path_.empty())
 		{
@@ -58,12 +63,14 @@ namespace control_link_gateway
 			std::lock_guard lock(mutex_);
 			if (!accepting_)
 			{
+				++dropped_events_;
 				return false;
 			}
 			if (last_accepted_event_sequence_ == std::numeric_limits<std::uint64_t>::max() ||
 				frame.event.event_sequence != last_accepted_event_sequence_ + 1U ||
 				!frame_shape_is_valid(frame))
 			{
+				++dropped_events_;
 				mark_invalid_locked(
 					"Decision Trace recorder received a non-contiguous or malformed frame",
 					false,
@@ -72,6 +79,7 @@ namespace control_link_gateway
 			}
 			if (queue_.size() >= queue_capacity_)
 			{
+				++dropped_events_;
 				mark_invalid_locked(
 					"Decision Trace recorder queue overflow",
 					true,
@@ -86,7 +94,7 @@ namespace control_link_gateway
 			{
 				accepted_result_count_ += 1U;
 			}
-			queue_.push_back(std::move(frame));
+			queue_.push_back(QueuedFrame{std::move(frame), control_link_timing::monotonic_ns(), control_link_timing::thread_id()});
 			condition_.notify_one();
 			return true;
 		}
@@ -94,6 +102,7 @@ namespace control_link_gateway
 		{
 			(void)exception;
 			std::lock_guard lock(mutex_);
+			++dropped_events_;
 			mark_invalid_locked(
 				"Decision Trace recorder enqueue failed",
 				false,
@@ -103,6 +112,7 @@ namespace control_link_gateway
 		catch (...)
 		{
 			std::lock_guard lock(mutex_);
+			++dropped_events_;
 			mark_invalid_locked(
 				"Decision Trace recorder enqueue failed with an unknown exception",
 				false,
@@ -146,6 +156,11 @@ namespace control_link_gateway
 
 	void DecisionTraceRecorder::writer_loop() noexcept
 	{
+		if (capture_policy_.enabled)
+		{
+			capture_loop();
+			return;
+		}
 		try
 		{
 			std::ofstream output{output_path_, std::ios::binary | std::ios::trunc};
@@ -180,7 +195,7 @@ namespace control_link_gateway
 						}
 						continue;
 					}
-					frame = std::move(queue_.front());
+					frame = std::move(queue_.front().frame);
 					queue_.pop_front();
 				}
 
@@ -241,6 +256,68 @@ namespace control_link_gateway
 		}
 	}
 
+	void DecisionTraceRecorder::capture_loop() noexcept
+	{
+		std::unique_ptr<FaultCaptureWriter> writer;
+		try
+		{
+			writer = std::make_unique<FaultCaptureWriter>(output_path_, serialize_decision_trace_record(header_), capture_policy_);
+			std::pair<int, int> previous_fault{-1, -1};
+			for (;;)
+			{
+				QueuedFrame item;
+				{
+					std::unique_lock lock(mutex_);
+					condition_.wait(lock, [this] { return stop_requested_ || !queue_.empty(); });
+					if (queue_.empty() && stop_requested_) break;
+					item = std::move(queue_.front()); queue_.pop_front();
+				}
+				auto &frame = item.frame;
+				nlohmann::json row{{"record_type", "observation"}, {"monotonic_ns", item.monotonic_ns}, {"pid", ::getpid()},
+					{"tid", item.tid}, {"stage", "decision_event"}, {"session", nullptr}, {"source", nullptr}, {"gid", nullptr},
+					{"sequence", nullptr}, {"source_stamp_ns", nullptr}, {"fault_state", nullptr}, {"fault_reason", nullptr},
+					{"event", nlohmann::json::parse(serialize_decision_trace_record(frame.event))}};
+				if (const auto *sample = std::get_if<DecisionSourceSampleEvent>(&frame.event.payload))
+				{
+					row["stage"] = "source_receive"; row["source"] = sample->command.source_id;
+					row["sequence"] = sample->command.source_sequence;
+					row["source_stamp_ns"] = static_cast<std::int64_t>(sample->command.source_stamp.sec) * 1000000000LL + sample->command.source_stamp.nanosec;
+					std::string gid;
+					constexpr char digits[] = "0123456789abcdef";
+					for (const auto byte : sample->publisher_generation.publisher_gid) { gid += digits[byte >> 4]; gid += digits[byte & 15]; }
+					row["gid"] = gid;
+				}
+				bool trigger = false;
+				if (frame.expected_result)
+				{
+					const auto &result = *frame.expected_result;
+					row["stage"] = "canonical_decision";
+					row["result"] = nlohmann::json::parse(serialize_decision_trace_record(result));
+					row["source"] = result.canonical_command.source_id; row["sequence"] = result.canonical_command.source_sequence;
+					row["source_stamp_ns"] = static_cast<std::int64_t>(result.canonical_command.source_stamp.sec) * 1000000000LL + result.canonical_command.source_stamp.nanosec;
+					row["fault_state"] = static_cast<int>(result.state); row["fault_reason"] = static_cast<int>(result.reason);
+					const auto key = std::make_pair(static_cast<int>(result.state), static_cast<int>(result.reason));
+					trigger = key != previous_fault && (result.state == DataState::kDegraded || result.state == DataState::kSafeStop || result.state == DataState::kError);
+					previous_fault = key;
+				}
+				writer->append(row.dump() + '\n', item.monotonic_ns, trigger);
+				std::lock_guard lock(mutex_); capture_status_ = writer->status();
+			}
+			writer->finish();
+			std::lock_guard lock(mutex_); capture_status_ = writer->status();
+		}
+		catch (const std::exception &failure)
+		{
+			std::lock_guard lock(mutex_);
+			if (writer) capture_status_ = writer->status();
+			mark_invalid_locked(failure.what(), false, true);
+		}
+		catch (...)
+		{
+			std::lock_guard lock(mutex_); mark_invalid_locked("fault capture writer failed", false, true);
+		}
+	}
+
 	void DecisionTraceRecorder::mark_invalid_locked(
 		std::string_view message,
 		bool overflow,
@@ -268,11 +345,11 @@ namespace control_link_gateway
 		return DecisionTraceRecorderStatus{
 			accepting_,
 			stopped_,
-			trace_valid_,
+			trace_valid_ && !capture_policy_.enabled,
 			trace_overflow_,
 			writer_failed_,
 			accepted_event_count_,
 			accepted_result_count_,
-			error_message_};
+			error_message_, capture_policy_.enabled, dropped_events_, capture_status_};
 	}
 }  // namespace control_link_gateway

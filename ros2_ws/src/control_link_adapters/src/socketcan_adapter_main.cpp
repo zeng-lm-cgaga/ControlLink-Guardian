@@ -7,11 +7,22 @@
 int main(int argc, char **argv)
 {
 	rclcpp::init(argc, argv);
+	int exit_code = 0;
 	try
 	{
 		auto node = std::make_shared<control_link_adapters::SocketCanAdapter>();
 		// ROS callbacks 串行执行，CAN fd 只由 adapter 内部的独立 I/O thread 访问
-		rclcpp::spin(node);
+		rclcpp::executors::SingleThreadedExecutor executor;
+		executor.add_node(node);
+		while (rclcpp::ok())
+		{
+			executor.spin_once(std::chrono::milliseconds(50));
+			if (node->restart_requested())
+			{
+				exit_code = 2;
+				break;
+			}
+		}
 	}
 	catch (const std::exception &exception)
 	{
@@ -24,5 +35,5 @@ int main(int argc, char **argv)
 	}
 
 	rclcpp::shutdown();
-	return 0;
+	return exit_code;
 }

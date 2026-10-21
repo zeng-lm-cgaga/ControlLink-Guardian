@@ -1,4 +1,11 @@
 schema_version: 1
+rate_limits:
+  per_caller_per_second: 40
+  per_caller_burst: 40
+  global_per_second: 200
+  global_burst: 200
+  max_keys_per_method: 128
+  idle_ttl_ms: 30000
 configuration_role: runtime_someip_and_future_contracts
 # 默认 launch 仍为 ros2；只有显式 selector 与已安装 SOME/IP target 可启用入口。
 planning:
@@ -69,6 +76,8 @@ grpc:
   max_message_bytes: 4096
   pending_latest_capacity: 1
   readonly_inflight_limit: 4
+  client_async_capacity: 32
+  client_submit_inflight_limit: 4
   max_status_subscribers: 4
   subscriber_latest_capacity: 1
   # 三类 RPC 独立期限；keep/readonly 不延长控制 RPC 的绝对 deadline。

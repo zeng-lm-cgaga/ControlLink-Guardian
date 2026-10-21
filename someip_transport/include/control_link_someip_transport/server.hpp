@@ -19,6 +19,7 @@ class SomeipServer final {
 
   void start();
   void stop() noexcept;
+  ::control_link::network::RateLimitSnapshot rate_limits() const;
 
  private:
   struct Impl;

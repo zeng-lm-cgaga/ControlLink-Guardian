@@ -28,6 +28,8 @@ namespace control_link_adapters
 		explicit SocketCanAdapter(
 			const rclcpp::NodeOptions &options = rclcpp::NodeOptions());
 		~SocketCanAdapter() override;
+		// 仅供外部进程owner受控重建；不把进程存活当作业务健康。
+		[[nodiscard]] bool restart_requested() const;
 
 	private:
 		using ControlCommand = control_link_interfaces::msg::ControlCommand;
@@ -112,6 +114,8 @@ namespace control_link_adapters
 		bool can_link_healthy_{false};
 		bool can_state_timed_out_{false};
 		bool fatal_can_io_{false};
+		bool exit_on_fatal_can_io_{false};
+		bool awaiting_bootstrap_hold_{false};
 		std::optional<SocketCanIoError> last_can_io_error_;
 	};
 } // namespace control_link_adapters

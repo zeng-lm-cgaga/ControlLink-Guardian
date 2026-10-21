@@ -29,6 +29,7 @@ Nav2 / teleop / planning-control
 - adapter 本地看门狗和执行端结构化健康反馈，覆盖网关停发与平台反馈超时
 - 基于语义配置哈希的 Contract 身份追踪，以及 Lifecycle 事务式重配置、Graph 验证和失败回滚
 - 决策事件 JSONL 记录与离线确定性回放，复用生产 Validator、Arbiter 和 GatewayStateMachine
+- 可选故障前后有界快照与自有目录轮转预算；截断快照不冒充完整决策回放
 - 可由 ros2_control 加载的 mock `hardware_interface::SystemInterface`，支持执行链和故障传播验证
 
 ## 两种运行 Profile
@@ -107,6 +108,10 @@ ros2 run control_link_adapters socketcan_adapter_node --ros-args \
 
 ### 可选构建边界
 
+可选 `supervise_adapter:=true` 启用 bringup 的单 child owner，使用 `config/adas/adapter_supervisor.yaml` 的有限次数、steady退避/时间和停止预算。它只管理 SocketCAN adapter；fatal 时该 child 以非零退出，旧进程 reap 完成后才重建。正常 exit0 不循环重启，预算耗尽以 exit75 要求人工处理，stop 中断退避并等待 child。新实例先接受合法 HOLD，再走原唯一 GID/canonical role、有效反馈与 recovery gate；进程启动不等于恢复。默认仍为人工方式，不自动修接口、不重播旧目标、不代替下游 watchdog，也不是 HA 或实车安全方案。
+
+可选 `decision_trace_capture_config:=/绝对路径/config/common/fault_capture.yaml` 配合 `decision_trace_path:=/新的专属目录` 启用有界前后故障快照及连续分段日志。既有 DecisionTrace writer 独占该新目录，容量、窗口、冷却、分段与总预算只来自该 YAML；只轮转功能自己创建的文件，不清理其他 reports。截断、轮转、满队列和写失败有计数，字段缺失记录为 null；它不是完整 replay trace。空配置保留原完整 trace 文件接口；这份磁盘预算不覆盖目录外单独开启的完整 trace/timing 日志。停止/wait/flush 后再用 `tools/linux_depth/freeze_fault_capture.py` 绑定 PID/starttime 封存，不从仍运行的 writer 取最终 SHA。
+
 SOME/IP / gRPC 默认关闭，启用需真实依赖与对应 `CONTROL_LINK_ENABLE_*` 选项；配置/启动细节归下列外部集成附录。gRPC 实现强制 loopback-only，SOME/IP 当前验收也仅限开发 loopback，不能描述为跨机器部署。MQTT 暂缓，没有生产控制入口。
 
 Bazel 只对应另一个 worktree 已完成的 ROS-free codec/SDK/network 生成与示例范围的历史可选实验；不替换 ROS2/rosidl/ament/bringup，不自动同步本业务改动。当前 adapters 用 `add_subdirectory` 编译仓库内 ControlLink SDK，**设置 Bazel SDK 的 `CMAKE_PREFIX_PATH` 不会令现有 colcon 自动消费它**；可选第三方 EdgeRuntime 的 `find_package(EdgeRuntime)` 是另一边界。固定 Edge 依赖身份与网络安装责任不因本入口装配改变。
@@ -168,6 +173,10 @@ adapters 显式开启 `CONTROL_LINK_ENABLE_GRPC=ON` 提供 `grpc_planning_bridge
 新控制 RPC 的 Open 显式使用 GetCapabilities 返回的当前开立域；Keep/Close 和同 live RPC 的幂等重试冻结此域。绝对 stream deadline 保留，终止后必须重新取得新域、计算新目标，不把旧握手或旧目标自动套入新会话；旧域拒绝与有界回收复用同一公共入口规则。
 
 ### 默认关闭与构建边界
+
+gRPC 客户端提供 `open_async/keep_async/close_async/submit_async/get_status_async/get_capabilities_async` 的公开 future/callback 与取消句柄；同步 API 共用相同 CQ 操作状态。Submit/只读可并发，control 仍为单 owner、单 exchange。慢回调在独立有界分发线程运行，不能在其内 stop/析构 client；外部 stop 取消并排空 CQ 和已接纳回调后 join。`protocol_transports.yaml` 的 `grpc.client_async_capacity` 与 `client_submit_inflight_limit` 拥有容量，超额明确拒绝。示例 `grpc_async_planning_client CONFIG.yaml [SECONDS]` 默认10秒、可选1–120秒，按50ms生成新目标，SIGINT/SIGTERM由owner收束，规划主循环不等待RPC；receipt 不是 Gateway accepted/ACTIVE。
+
+gRPC/SOME/IP 入口共用 `protocol_transports.yaml` 的 `rate_limits` steady token-bucket 策略，按实际 peer/client 与方法分组，各方法/全局桶和闲置键容量有界，换键仍受全局预算；这些键不承担认证。Close/Keep/查询与普通 Submit 独立预算，cancel/stop 保留原清理路径；超额返回 RESOURCE_EXHAUSTED 或 SOME/IP E_NOT_OK+RATE_LIMITED 错误载荷并计数，不刷新业务时效。
 
 `CONTROL_LINK_ENABLE_SOMEIP`、`CONTROL_LINK_ENABLE_GRPC`、`CONTROL_LINK_ENABLE_MQTT` 默认关闭；关闭时原 ROS2/Edge 链不查找或链接这些网络依赖。SOME/IP 与 gRPC 开启选择各自真实协议 target，原公共 Gateway/Contract/Edge SDK 导出不引入网络依赖。MQTT 仅保留默认 OFF 的只读 telemetry 契约和依赖探测，没有生产服务、client 或车辆控制入口。独立 [依赖探测](tools/protocol_dependency_probe/CMakeLists.txt) 始终只做依赖检查；target 存在或配置成功不能证明网络通信或车辆控制闭环已通过验收。
 

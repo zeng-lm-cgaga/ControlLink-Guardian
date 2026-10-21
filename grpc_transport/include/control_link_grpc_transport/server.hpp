@@ -19,6 +19,7 @@ struct ServerRuntime {
   std::uint64_t unresolved_calls{0};
   bool cq_drained{false};
   bool processing_failed{false};
+  network::RateLimitSnapshot rate_limits{};
 };
 
 // CQ独占call/tag推进；ROS owner只操作同一个PlanningIngress。start/stop由装配owner串行调用。

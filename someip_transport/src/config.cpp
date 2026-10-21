@@ -287,7 +287,7 @@ Config load_config(const std::string &path) {
     std::size_t nodes = 0;
     check_duplicates(root, "root", 0, nodes);
     check_keys(root, "root", {"schema_version", "configuration_role", "planning", "safety_owners",
-                              "control_session_resources", "someip", "grpc", "mqtt"});
+                              "control_session_resources", "someip", "grpc", "mqtt", "rate_limits"});
     if (integer(root["schema_version"], "schema_version", UINT32_MAX) != 1) {
       invalid("schema_version", "only version 1 is supported");
     }
@@ -357,6 +357,7 @@ Config load_config(const std::string &path) {
     const auto groups = someip["eventgroups"];
     check_keys(groups, "someip.eventgroups", {"gateway_status", "vehicle_status"});
     Config config;
+    config.rate_limits = ::control_link::network::parse_rate_limit_policy(root["rate_limits"]);
     config.application_name = text(someip["application_name"], "someip.application_name");
     config.bind_address = text(someip["bind_address"], "someip.bind_address");
     config.sd_multicast_address = text(discovery["multicast_address"], "someip.service_discovery.multicast_address");
@@ -442,6 +443,7 @@ void validate_vsomeip_configuration(const Config &config, const std::string &pat
 }
 
 void validate_config(const Config &config) {
+  ::control_link::network::validate_rate_limit_policy(config.rate_limits);
   if (!identifier(config.application_name)) invalid("application_name", "expected bounded alphanumeric identifier");
   const auto unicast = ipv4(config.bind_address, "bind_address");
   if (unicast == 0 || unicast >= 0xe0000000U) invalid("bind_address", "must be a concrete unicast IPv4 address");

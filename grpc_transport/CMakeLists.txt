@@ -48,6 +48,8 @@ endif()
 
 add_executable(grpc_planning_client src/grpc_planning_client.cpp)
 target_link_libraries(grpc_planning_client PRIVATE control_link_grpc_transport)
+add_executable(grpc_async_planning_client examples/grpc_planning_consumer/async_main.cpp)
+target_link_libraries(grpc_async_planning_client PRIVATE control_link_grpc_transport)
 if(CONTROL_LINK_GRPC_BUILD_TESTS)
 	include(CTest)
 	if(BUILD_TESTING)
@@ -66,7 +68,7 @@ include(CMakePackageConfigHelpers)
 install(TARGETS control_link_grpc_transport EXPORT control_link_grpc_transport_targets
 	ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
 	RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} INCLUDES DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(TARGETS grpc_planning_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS grpc_planning_client grpc_async_planning_client RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY include/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES ${control_link_grpc_generated_header} DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT control_link_grpc_transport_targets FILE control_link_grpc_transportTargets.cmake

@@ -11,6 +11,7 @@
 #include <thread>
 
 #include "control_link_gateway/decision_trace.hpp"
+#include "control_link_gateway/fault_capture.hpp"
 
 namespace control_link_gateway
 {
@@ -24,6 +25,9 @@ namespace control_link_gateway
 		std::uint64_t accepted_event_count{0U};
 		std::uint64_t accepted_result_count{0U};
 		std::string error_message;
+		bool capture_mode{false};
+		std::uint64_t dropped_events{0};
+		FaultCaptureStatus capture;
 	};
 
 	// callback 只调用 try_enqueue()，文件的 open/write/close 全部由 writer thread 独占
@@ -33,7 +37,8 @@ namespace control_link_gateway
 		DecisionTraceRecorder(
 			std::filesystem::path output_path,
 			DecisionTraceHeader header,
-			std::size_t queue_capacity);
+			std::size_t queue_capacity,
+			FaultCapturePolicy capture_policy = {});
 
 		~DecisionTraceRecorder();
 
@@ -54,6 +59,7 @@ namespace control_link_gateway
 
 	private:
 		void writer_loop() noexcept;
+		void capture_loop() noexcept;
 		void mark_invalid_locked(
 			std::string_view message,
 			bool overflow,
@@ -65,7 +71,16 @@ namespace control_link_gateway
 		std::size_t queue_capacity_;
 		mutable std::mutex mutex_;
 		std::condition_variable condition_;
-		std::deque<DecisionTraceFrame> queue_;
+		struct QueuedFrame
+		{
+			DecisionTraceFrame frame;
+			std::uint64_t monotonic_ns;
+			std::uint32_t tid;
+		};
+		std::deque<QueuedFrame> queue_;
+		FaultCapturePolicy capture_policy_;
+		FaultCaptureStatus capture_status_;
+		std::uint64_t dropped_events_{0};
 		std::thread writer_thread_;
 		bool accepting_{true};
 		bool stop_requested_{false};

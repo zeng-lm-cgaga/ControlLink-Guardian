@@ -105,7 +105,7 @@ Config load_config(const std::string &path) {
     keys(resources, "control_session_resources", {"retired_open_capacity"});
     const auto grpc = root["grpc"];
     keys(grpc, "grpc", {"enabled", "listen_address", "service", "max_message_bytes",
-        "pending_latest_capacity", "readonly_inflight_limit", "max_status_subscribers",
+        "pending_latest_capacity", "readonly_inflight_limit", "client_async_capacity", "client_submit_inflight_limit", "max_status_subscribers",
         "subscriber_latest_capacity", "max_unary_deadline_ms", "control_open_timeout_ms",
         "max_control_stream_lifetime_ms", "max_readonly_stream_lifetime_ms",
         "shutdown_timeout_ms", "reconnect_initial_ms", "reconnect_max_ms"});
@@ -116,12 +116,15 @@ Config load_config(const std::string &path) {
       invalid("latest capacities", "control and subscriber latest must equal 1");
     }
     Config config;
+    config.rate_limits = network::parse_rate_limit_policy(root["rate_limits"]);
     config.listen_address = text(grpc["listen_address"], "grpc.listen_address");
     const auto read = [&grpc](const char *field) {
       return integer(grpc[field], std::string("grpc.") + field);
     };
     config.max_message_bytes = read("max_message_bytes");
     config.readonly_inflight_limit = read("readonly_inflight_limit");
+    config.client_async_capacity = read("client_async_capacity");
+    config.client_submit_inflight_limit = read("client_submit_inflight_limit");
     config.max_status_subscribers = read("max_status_subscribers");
     config.max_unary_deadline_ms = read("max_unary_deadline_ms");
     config.control_open_timeout_ms = read("control_open_timeout_ms");
@@ -148,6 +151,7 @@ Config load_config(const std::string &path) {
 }
 
 void validate_config(const Config &config) {
+  network::validate_rate_limit_policy(config.rate_limits);
   const auto separator = config.listen_address.rfind(':');
   if (separator == std::string::npos || separator == 0 || separator + 1 == config.listen_address.size()) {
     invalid("listen_address", "explicit loopback host:port required");
@@ -175,7 +179,9 @@ void validate_config(const Config &config) {
         std::to_string(minimum_size) + " bytes; actual Contract/RMW checked before admission");
   }
   if (!config.ingress.retired_open_capacity || config.ingress.idle_timeout_ms != 0 ||
-      !config.readonly_inflight_limit || !config.max_status_subscribers) {
+      !config.readonly_inflight_limit || !config.max_status_subscribers ||
+      !config.client_async_capacity || config.client_async_capacity > 1024 ||
+      !config.client_submit_inflight_limit || config.client_submit_inflight_limit > config.client_async_capacity) {
     invalid("resources", "positive bounded capacities required; gRPC has no SOME/IP idle budget");
   }
   const auto call_budget = std::uint64_t{4} * config.readonly_inflight_limit + config.max_status_subscribers + 5;

@@ -64,6 +64,7 @@ add_library(control_link_network_ingress STATIC
 	../someip_transport/src/config.cpp
 	../someip_transport/src/ingress.cpp
 	src/schema.cpp
+	src/rate_limiter.cpp
 	"${control_link_network_generated_source}"
 	"${control_link_network_generated_header}"
 )
@@ -96,6 +97,9 @@ if(CONTROL_LINK_NETWORK_INGRESS_BUILD_TESTS)
 			CONTROL_LINK_PROTOCOL_CONFIG_PATH="${CMAKE_CURRENT_SOURCE_DIR}/../config/adas/protocol_transports.yaml")
 		target_link_libraries(test_network_ingress PRIVATE control_link_network_ingress GTest::gtest_main)
 		add_test(NAME test_network_ingress COMMAND test_network_ingress)
+		add_executable(test_rate_limiter test/test_rate_limiter.cpp)
+		target_link_libraries(test_rate_limiter PRIVATE control_link_network_ingress GTest::gtest_main)
+		add_test(NAME test_rate_limiter COMMAND test_rate_limiter)
 	endif()
 endif()
 

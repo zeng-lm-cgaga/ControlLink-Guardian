@@ -9,10 +9,13 @@ namespace control_link::grpc_transport {
 
 // 数值只来自网络配置 owner；零初始化不另设生产默认值，也不依赖 SOME/IP parser。
 struct Config {
+  ::control_link::network::RateLimitPolicy rate_limits;
   std::string listen_address;
   ::control_link::network::IngressResources ingress;
   std::uint32_t max_message_bytes{0};
   std::uint32_t readonly_inflight_limit{0};
+  std::uint32_t client_async_capacity{0};
+  std::uint32_t client_submit_inflight_limit{0};
   std::uint32_t max_status_subscribers{0};
   std::uint32_t max_unary_deadline_ms{0};
   std::uint32_t control_open_timeout_ms{0};

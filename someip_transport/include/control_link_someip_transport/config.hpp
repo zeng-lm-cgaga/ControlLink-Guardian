@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include "control_link_network_ingress/rate_limiter.hpp"
 
 namespace control_link::network::v1 {
 class Capabilities;
@@ -12,6 +13,7 @@ namespace control_link::someip {
 
 // 数值只从 protocol_transports.yaml 读取；零初始化不是另一套生产默认配置。
 struct Config {
+  ::control_link::network::RateLimitPolicy rate_limits;
   std::string application_name;
   std::string bind_address;
   std::string sd_multicast_address;

@@ -66,6 +66,7 @@ if(BUILD_TESTING)
 endif()
 
 ament_python_install_package(${PROJECT_NAME})
+install(PROGRAMS tools/socketcan_supervisor DESTINATION lib/${PROJECT_NAME})
 
 add_executable(robot_readiness_gate
 	tools/robot_readiness_gate.cpp
@@ -289,6 +290,7 @@ install(
 
 if(BUILD_TESTING)
 	find_package(ament_cmake_pytest REQUIRED)
+	ament_add_pytest_test(test_adapter_supervisor test/test_adapter_supervisor.py)
 	ament_add_pytest_test(
 		test_replay_launch_config
 		test/test_replay_launch_config.py

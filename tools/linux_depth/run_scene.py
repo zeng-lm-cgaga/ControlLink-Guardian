@@ -17,6 +17,8 @@ sys.path[:0] = [str(ROOT / "tools/adas_ingress_evidence"), str(ROOT / "tools/som
 from run_performance import proc_sample
 from performance_stats import target
 from observer import open_can, read_can, runtime_qos
+from business_trace import TraceGate, publish
+from capture_target import snapshot
 
 
 @functools.lru_cache(maxsize=1024)
@@ -59,6 +61,9 @@ def identity(pid):
 
 
 def run(args):
+    control = getattr(args, 'bpf_control', None)
+    if control and (os.geteuid() == 0 or not args.timing):
+        raise ValueError('BPF business must run as an ordinary user with identical application timing enabled')
     import yaml
     import rclpy
     from rclpy.signals import SignalHandlerOptions
@@ -78,7 +83,7 @@ def run(args):
                    "idle_teleop": args.runtime / "build/control_link_adapters/twist_ingress_adapter_node",
                    "simulator": args.runtime / "build/peers/vcan_vehicle_simulator",
                    "activator": old / "build/control_link_bringup/gateway_lifecycle_activator"}
-    events = {"schema": 1, "driver_sha256": digest(str(Path(__file__).resolve())), "arguments": vars(args).copy(), "commands": {}, "identities": {}, "errors": [],
+    events = {"schema": 1, "uid": os.getuid(), "euid": os.geteuid(), "driver_sha256": digest(str(Path(__file__).resolve())), "arguments": vars(args).copy(), "commands": {}, "identities": {}, "errors": [],
               "environment": dict(os.environ), "kernel": list(os.uname()), "vcpus": os.cpu_count(),
               "meminfo": Path("/proc/meminfo").read_text(), "clk_tck": os.sysconf("SC_CLK_TCK"),
               "loadavg_start": Path("/proc/loadavg").read_text(), "vm_resource_samples": [],
@@ -89,11 +94,18 @@ def run(args):
                   config / "common/fastdds_default_profiles.xml", config / "adas/adas_profile.yaml",
                   config / "adas/can_signal_map.yaml")}}
     events["arguments"] = {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()}
+    if control:
+        keys = ('PATH', 'LD_LIBRARY_PATH', 'LD_PRELOAD', 'AMENT_PREFIX_PATH', 'PYTHONPATH', 'RMW_IMPLEMENTATION',
+                'RMW_FASTRTPS_USE_QOS_FROM_XML', 'FASTRTPS_DEFAULT_PROFILES_FILE', 'ROS_DOMAIN_ID', 'ROS_LOG_DIR',
+                'LANG', 'LC_ALL', 'HOME', 'USER', 'LOGNAME', 'ASAN_OPTIONS', 'UBSAN_OPTIONS')
+        events['environment'] = {key: os.environ[key] for key in keys if key in os.environ}
     streams = {kind: [] for kind in ("source", "canonical", "gateway", "status", "vehicle", "can", "resource")}
     children, logs, latest = {}, {}, {}
     node = None
     can_socket = None
     interrupted = False
+    trace_gate = TraceGate(control) if control else None
+    trace_targets = None
 
     def stop(number, frame):
         nonlocal interrupted
@@ -161,6 +173,9 @@ def run(args):
             events["commands"][role] = command
             logs[role] = (args.output / (role + ".log")).open("xb")
             children[role] = subprocess.Popen(command, stdout=logs[role], stderr=subprocess.STDOUT, start_new_session=True)
+        if trace_gate:
+            publish(control / 'owners.json', {role: {'pid': child.pid, 'starttime': sample(child.pid)['starttime']}
+                                             for role, child in children.items() if child.poll() is None})
         started = time.monotonic_ns()
         events["start_monotonic_ns"], events["start_wall_ns"] = started, time.time_ns()
         sequence, next_send, next_sample, missed = 0, started, started, 0
@@ -223,6 +238,8 @@ def run(args):
                     if child.poll() is None:
                         events["identities"][role] = identity(child.pid)
                 events["identities"]["fixture_observer"] = identity(os.getpid())
+                if trace_gate:
+                    trace_targets = {role: snapshot(children[role].pid) for role in ('gateway', 'can_adapter')}
                 identity_done = True
                 continue
             gateway, status, vehicle = (latest.get(key, {}) for key in ("gateway", "status", "vehicle"))
@@ -230,7 +247,10 @@ def run(args):
             healthy = healthy and gateway["message"]["state"] == 1 and gateway["message"]["active_source_id"] == "planning"
             healthy = healthy and status["message"]["accepted_count"] >= 5 and status["message"]["command_valid"] and status["message"]["lease_valid"]
             healthy = healthy and vehicle["message"]["state"] == 1 and vehicle["message"]["fault_code"] == 0
-            if window is None and healthy and identity_done:
+            trace_ready = not trace_gate or (identity_done and trace_gate.ready(trace_targets, healthy, now))
+            if window is None and healthy and identity_done and trace_ready:
+                if trace_gate:
+                    events['trace_gate'] = {'request': trace_gate.request, 'reply': trace_gate.reply}
                 anchor = time.monotonic_ns()
                 window = {"ready_ns": anchor, "warmup_s": args.warmup, "duration_s": args.seconds,
                           "start_ns": anchor + args.warmup * 1000000000,
@@ -270,6 +290,8 @@ def run(args):
         events["traceback"], events["result"] = traceback.format_exc(), 1
     finally:
         events["cutoff_ns"] = time.monotonic_ns()
+        if trace_gate:
+            publish(control / 'cutoff.json', {'cutoff_ns': events['cutoff_ns'], 'result': events.get('result')})
         events["exits"] = {}
         for role, child in children.items():
             requested = time.monotonic_ns()
@@ -316,4 +338,5 @@ if __name__ == "__main__":
     parser.add_argument("--cpu-load", action="store_true")
     parser.add_argument("--pause-source", action="store_true")
     parser.add_argument("--check-readonly", action="store_true")
+    parser.add_argument("--bpf-control", type=lambda path: Path(path).resolve())
     raise SystemExit(run(parser.parse_args()))

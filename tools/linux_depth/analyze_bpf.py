@@ -11,7 +11,7 @@ import re
 from analyze import distribution, encoded, timing
 
 
-def analyze_kernel(content, loader_log, app=None):
+def analyze_kernel(content, loader_log, app=None, include_intervals=False):
     lines = content.decode().splitlines()
     footers = [line for line in lines if line.startswith("# footer ")]
     exit_codes = re.findall(r"loader_exit=(\d+)", loader_log.decode())
@@ -28,27 +28,37 @@ def analyze_kernel(content, loader_log, app=None):
     stages = defaultdict(list)
     intervals = defaultdict(list)
     outgoing = {}
-    for row in sorted(rows, key=lambda row: row["at_ns"]):
+    evidence = []
+
+    def interval(row, index, begin, end, name):
+        intervals[(row['tgid'], row['tid'])].append((begin, end, name))
+        if include_intervals:
+            evidence.append({'pid': row['tgid'], 'tid': row['tid'],
+                             'task_start_boottime_ns': row['task_start_boottime_ns'],
+                             'begin_ns': begin, 'end_ns': end, 'kind': name,
+                             'kernel_event_index_zero_based': index})
+
+    for index, row in sorted(enumerate(rows), key=lambda item: item[1]["at_ns"]):
         key = (row["tgid"], row["tid"], row["task_start_boottime_ns"])
         at, kind = row["at_ns"], row["kind"]
         if kind == 2:
             outgoing[key] = row
             if row["duration_ns"]:
                 stages["on_cpu_observed_ms"].append(row["duration_ns"] / 1e6)
-                intervals[(row["tgid"], row["tid"])].append((at - row["duration_ns"], at, "on_cpu"))
+                interval(row, index, at - row['duration_ns'], at, 'on_cpu')
         elif kind == 3:
             if row["value"] == 1:
                 stages["successful_wakeup_to_on_cpu_ms"].append(row["duration_ns"] / 1e6)
-                intervals[(row["tgid"], row["tid"])].append((at - row["duration_ns"], at, "wakeup_wait"))
+                interval(row, index, at - row['duration_ns'], at, 'wakeup_wait')
             previous = outgoing.pop(key, None)
             if previous and row["auxiliary_ns"]:
                 name = "runnable_off_cpu" if previous["value"] == 0 or previous["auxiliary_ns"] else "blocked_off_cpu"
                 stages[name + "_ms"].append(row["auxiliary_ns"] / 1e6)
-                intervals[(row["tgid"], row["tid"])].append((at - row["auxiliary_ns"], at, name))
+                interval(row, index, at - row['auxiliary_ns'], at, name)
         elif kind == 5:
             name = "syscall_" + str(row["auxiliary_ns"])
             stages[name + "_ms"].append(row["duration_ns"] / 1e6)
-            intervals[(row["tgid"], row["tid"])].append((at - row["duration_ns"], at, name))
+            interval(row, index, at - row['duration_ns'], at, name)
     correlation = []
     eligible = {"source_receive", "source_result", "source_select", "canonical_publish", "mailbox_write",
                 "can_write", "feedback_validate", "gateway_feedback", "work_cpu", "work_sleep", "work_lock", "work_hold"}
@@ -67,7 +77,7 @@ def analyze_kernel(content, loader_log, app=None):
                                     "source_stamp_ns": row["source_stamp_ns"], "begin_ns": row["begin_ns"],
                                     "end_ns": row["end_ns"], "overlap_ns_by_kind": dict(overlap)})
     accounting = int(exit_codes[-1]) == 0 and footer["ring_full"] == footer["map_full"] == 0 and footer["emitted"] == footer["received"]
-    return {"schema": 2, "quality": footer, "accounting_complete": accounting,
+    result = {"schema": 2, "quality": footer, "accounting_complete": accounting,
             "population_complete": accounting and bool(rows), "coverage_status": "NOT_EVALUATED",
             "target_header": identity, "attached": int(attached[0][0]) if len(attached) == 1 else None,
             "event_kinds": dict(Counter(row["kind"] for row in rows)),
@@ -75,6 +85,9 @@ def analyze_kernel(content, loader_log, app=None):
             "event_count": len(rows), "metrics": {name: distribution(values) for name, values in sorted(stages.items())},
             "application_overlaps": correlation,
             "limits": "overlap is not exclusive attribution; blocked state is not proof of lock/I/O ownership; no business sequence in BPF; initial PID namespace required"}
+    if include_intervals:
+        result['kernel_intervals'] = evidence
+    return result
 
 
 def validate_controlled(result, app, target, quality, iterations=100):

@@ -6,5 +6,6 @@ if [[ $EUID != 0 ]]; then
   exit 2
 fi
 OUT=${1:?new absolute evidence directory required}
-exec timeout --signal=INT --kill-after=30s 360s unshare --net -- \
-  python3 "$ROOT/tools/linux_depth/run_business_bpf.py" --output "$OUT" --user zlm
+RUNTIME=${2:?explicit verified runtime directory required}
+exec timeout --signal=INT --kill-after=90s 360s unshare --net -- \
+  python3 "$ROOT/tools/linux_depth/run_business_bpf.py" --output "$OUT" --runtime "$RUNTIME" --user zlm

@@ -27,12 +27,14 @@ def load_policy(path):
 
 class AdapterSupervisor:
     """stop 可打断退避；旧child wait完成后才允许exec，重试预算从首次失败累计不清零。"""
-    def __init__(self, command, policy, emit=None):
+    def __init__(self, command, policy, emit=None, *, clock=None, wait=None):
         self.command = command
         self.policy = policy
         self.stopped = threading.Event()
         self.child = None
         self.emit = emit or (lambda row: print(json.dumps(row, sort_keys=True), flush=True))
+        self.clock = clock or time.monotonic
+        self.wait = wait or self.stopped.wait
 
     def record(self, state, **details):
         self.emit({'monotonic_ns': time.monotonic_ns(), 'state': state, **details})
@@ -69,10 +71,13 @@ class AdapterSupervisor:
 
     def run(self):
         restarts = 0
-        first_failure = None
+        restart_deadline = None
         backoff = self.policy['backoff_initial_ms'] / 1000
         try:
             while not self.stopped.is_set():
+                if restart_deadline is not None and self.clock() >= restart_deadline:
+                    self.record('EXHAUSTED_MANUAL_INTERVENTION_REQUIRED', restarts=restarts)
+                    return 75
                 try:
                     self.child = subprocess.Popen(self.command, close_fds=True, start_new_session=True)
                 except OSError as failure:
@@ -95,16 +100,19 @@ class AdapterSupervisor:
                     if code == 0:
                         self.record('NORMAL_EXIT_NO_RESTART')
                         return 0
-                now = time.monotonic()
-                if first_failure is None:
-                    first_failure = now
-                remaining = self.policy['restart_budget_ms'] / 1000 - (now - first_failure)
+                now = self.clock()
+                if restart_deadline is None:
+                    restart_deadline = now + self.policy['restart_budget_ms'] / 1000
+                remaining = restart_deadline - now
                 if restarts >= self.policy['max_restarts'] or remaining <= backoff:
                     self.record('EXHAUSTED_MANUAL_INTERVENTION_REQUIRED', restarts=restarts)
                     return 75
                 self.record('BACKOFF', seconds=backoff, restarts=restarts)
-                if self.stopped.wait(backoff):
+                if self.wait(backoff) or self.stopped.is_set():
                     return 0
+                if self.clock() >= restart_deadline:
+                    self.record('EXHAUSTED_MANUAL_INTERVENTION_REQUIRED', restarts=restarts)
+                    return 75
                 restarts += 1
                 backoff = min(backoff * 2, self.policy['backoff_max_ms'] / 1000)
             return 0

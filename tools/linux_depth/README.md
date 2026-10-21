@@ -4,16 +4,17 @@
 
 ## 分权的真实业务 BPF 入口
 
-`run_business_bpf.bash NEW_ABSOLUTE_REPORT` 只供已授权的宿主管理员在后续运行验证阶段执行；脚本不调用sudo、不收取凭据，不是默认bringup。它只创建私有network namespace，不创建PID/user/time namespace、不修改全局接口/挂载/sysctl，退出后该netns随进程释放。业务由broker使用`runuser -u zlm`先降权，所有ROS节点/源/观察器均为普通UID；root仅初始化该私有vcan并运行两个按真实TGID筛选的独立loader。不得把整个ROS链以root运行。
+`run_business_bpf.bash NEW_ABSOLUTE_REPORT VERIFIED_RUNTIME` 只供已授权的宿主管理员执行；显式runtime必须先按本次源码与ELF/依赖身份核实，不能依赖历史硬编码装配。脚本不调用sudo、不收取凭据，不是默认bringup。它只创建私有network namespace，不创建PID/user/time namespace、不修改全局接口/挂载/sysctl，退出后该netns随进程释放。业务由broker使用`runuser -u zlm`先降权，所有ROS节点/源/观察器均为普通UID；root仅初始化该私有vcan并运行两个按真实TGID筛选的独立loader。不得把整个ROS链以root运行。
 
 ```bash
 bash /home/zlm/ControlLink-Guardian/tools/linux_depth/run_business_bpf.bash \
-  /home/zlm/ControlLink-Guardian/reports/linux-business-bpf-RUN-UNIQUE
+  /home/zlm/ControlLink-Guardian/reports/linux-business-bpf-RUN-UNIQUE \
+  /absolute/path/to/verified/runtime
 ```
 
-入口串行执行一组BPF-off/on，业务ELF、依赖、配置、50ms输入和应用计时/后台日志均相同。复用`reports/linux-depth-20261021/remote/runtime`及已通过受控加载的`reports/linux-depth-review-fixes-20261021/build-bpf`；不会编译或改动它们。正常业务达到健康门槛后，普通用户runner原子发布目标快照；broker核对非root UID、TGID/starttime/ELF和namespace，on侧观察两个loader各5个BPF link fd后应答。loader的CSV是有界缓冲，不能靠未刷盘的header轮询READY；离线再核对实际attach header/结束footer确实包住测量窗。应答后再10s预热+20s固定窗，不从结果挑片段。off侧不启动loader，但走同一门控和应用打点。未获broker应答20s超时；业务READY仍用原60s上限，case总期限150s，外层360s+30s；超时或强杀标为incomplete。每case采集预算128MiB，磁盘至少保留4GiB。
+入口串行执行一组BPF-off/on，业务ELF、依赖、配置、50ms输入和应用计时/后台日志均相同。复用显式选定的runtime及已通过受控加载的`reports/linux-depth-review-fixes-20261021/build-bpf`；不会编译或改动它们。正常业务达到健康门槛后，普通用户runner原子发布目标快照；broker核对非root UID、TGID/starttime/ELF和namespace，on侧观察两个loader各5个BPF link fd后应答。loader的CSV是有界缓冲，不能靠未刷盘的header轮询READY；离线再核对实际attach header/结束footer确实包住测量窗。应答后再10s预热+20s固定窗，不从结果挑片段。off侧不启动loader，但走同一门控和应用打点。未获broker应答20s超时；业务READY仍用原60s上限，case总期限150s，外层360s+90s收束；超时或强杀标为incomplete。每case采集预算128MiB，磁盘至少保留4GiB。
 
-普通runner记录业务资源，broker每秒单独记录tracer/broker的PID/starttime、utime+stime和VmRSS。CPU按MONOTONIC区间增量计算，100%为一个逻辑CPU；RSS是resident KiB，不是系统峰值。额外轮询、订阅、缓冲及后台写盘均属于该观测装配。cutoff后按owner停止、wait、flush，再生成case冻结索引；失败原始日志同样保留，不能只用driver exit0判通过。
+普通runner记录业务资源，broker每秒单独记录tracer/broker的PID/starttime、utime+stime和VmRSS。CPU按MONOTONIC区间增量计算，100%为一个逻辑CPU；RSS是resident KiB，不是系统峰值。额外轮询、订阅、缓冲及后台写盘均属于该观测装配。runner逐次原子登记driver/child PID与starttime；cutoff后并行通知本轮child，共用15s INT、5s TERM、2s KILL预算，再逐个wait，某个失败不跳过其他owner。broker另外给driver 35s正常收束，并对残留registry实例使用pidfd有界停止；确认原实例退出/成为不再写入的zombie后才最终flush/hash。无法确认则`cleanup_closed=false`、`freeze-invalid.json`，不发布最终冻结索引/seal；强杀真实标记为forced。失败原始日志同样保留，不能只用driver exit0判通过。
 
 `analyze_business_bpf.py PAIR NEW_OUTPUT`验证冻结输入、两侧实际加载文件SHA和配置一致，分别输出`off-summary.json`、`on-summary.json`、`correlations.json`、`comparison.json`及本地`acceptance.json`。关联记录保留应用CSV和内核CSV的零起始事件行号、TGID/TID实例、source/GID/sequence/stamp/frame及MONOTONIC交集；每角色统计候选、匹配、缺样和唯一命令人口，保留ring/map loss及cold/unmatched边界。BPF本身没有业务序号，GID表示本次ROS publisher generation而非认证/session协议。跨线程的`mailbox_consume`停留不算worker独占CPU；反馈的frame_id/counter不能当每条控制命令ACK。调度、阻塞与syscall区间可重叠，交集不是独占根因。RAW计划时钟不与MONOTONIC相减。
 

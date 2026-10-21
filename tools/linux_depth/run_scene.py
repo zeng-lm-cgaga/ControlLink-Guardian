@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """短时独占真实链；窗口与采集上限预先固定，不实现第二套业务判断。"""
 import argparse
+import errno
 import functools
 import hashlib
 import json
@@ -19,6 +20,7 @@ from performance_stats import target
 from observer import open_can, read_can, runtime_qos
 from business_trace import TraceGate, publish
 from capture_target import snapshot
+from process_cleanup import process_instance, stop_children, write_owners
 
 
 @functools.lru_cache(maxsize=1024)
@@ -62,12 +64,18 @@ def identity(pid):
 
 def run(args):
     control = getattr(args, 'bpf_control', None)
+    owner_registry = {'driver': process_instance(os.getpid())}
+    if control:
+        write_owners(control / 'owners.json', owner_registry)
     supervisor_policy = getattr(args, 'supervisor_policy', None)
     capture_config = getattr(args, 'fault_capture_config', None)
     grpc_client = getattr(args, 'grpc_client', None)
     kill_adapter = getattr(args, 'kill_adapter', False)
-    if (control and (supervisor_policy or capture_config or grpc_client or kill_adapter)) or (kill_adapter and not supervisor_policy):
+    fatal_can = getattr(args, 'fatal_can', False)
+    if (control and (supervisor_policy or capture_config or grpc_client or kill_adapter or fatal_can)) or ((kill_adapter or fatal_can) and not supervisor_policy):
         raise ValueError('functional supervision scene is separate from the fixed BPF comparison')
+    if fatal_can and kill_adapter:
+        raise ValueError('fatal CAN I/O and process kill are distinct fault cases')
     if grpc_client and args.pause_source:
         raise ValueError('source pause applies only to the ROS fixture producer')
     if control and (os.geteuid() == 0 or not args.timing):
@@ -119,6 +127,7 @@ def run(args):
     interrupted = False
     trace_gate = TraceGate(control) if control else None
     trace_targets = None
+    feedback_operation = None
 
     def stop(number, frame):
         nonlocal interrupted
@@ -153,6 +162,14 @@ def run(args):
         events["loopback"] = loopback
         if "UP" not in loopback[0]["flags"]:
             raise RuntimeError("namespace loopback must be UP before ROS launch")
+        if fatal_can:
+            parent_net = os.environ.get('CONTROL_LINK_PARENT_NET_NS')
+            if not parent_net or parent_net == os.readlink('/proc/self/ns/net'):
+                raise RuntimeError('fatal injection requires this runner-owned private network namespace')
+            interface = json.loads(subprocess.check_output(['ip', '-details', '-json', 'link', 'show', 'vcan0'], text=True))[0]
+            if interface.get('linkinfo', {}).get('info_kind') != 'vcan':
+                raise RuntimeError('fatal injection is limited to verified vcan')
+            events['fatal_interface_before'] = interface
         can_socket = open_can("vcan0")
         rclpy.init(args=[], signal_handler_options=SignalHandlerOptions.NO)
         node = rclpy.create_node("linux_depth_source_observer")
@@ -206,9 +223,16 @@ def run(args):
             events["commands"][role] = command
             logs[role] = (args.output / (role + ".log")).open("xb")
             children[role] = subprocess.Popen(command, stdout=logs[role], stderr=subprocess.STDOUT, start_new_session=True)
+            if trace_gate:
+                try:
+                    owner_registry[role] = process_instance(children[role].pid)
+                except (FileNotFoundError, ProcessLookupError):
+                    if children[role].poll() is None:
+                        raise
+                write_owners(control / 'owners.json', owner_registry)
         if trace_gate:
-            publish(control / 'owners.json', {role: {'pid': child.pid, 'starttime': sample(child.pid)['starttime']}
-                                             for role, child in children.items() if child.poll() is None})
+            publish(control / 'owners-ready.json', {'registered_roles': sorted(owner_registry),
+                    'driver': owner_registry['driver'], 'monotonic_ns': time.monotonic_ns()})
         started = time.monotonic_ns()
         events["start_monotonic_ns"], events["start_wall_ns"] = started, time.time_ns()
         sequence, next_send, next_sample, missed = 0, started, started, 0
@@ -220,6 +244,9 @@ def run(args):
         while not interrupted:
             now = time.monotonic_ns()
             for role, child in children.items():
+                if (role == 'simulator' and fatal_can and 'fatal_can' in events
+                        and 'link_up_ns' not in events['fatal_can']):
+                    continue
                 if role != "activator" and child.poll() is not None:
                     raise RuntimeError(role + " exited: " + str(child.returncode))
             if grpc_client and 'grpc_client' not in children and now - started >= 2000000000:
@@ -228,6 +255,21 @@ def run(args):
                 logs['grpc_client'] = (args.output / 'grpc_client.log').open('xb')
                 children['grpc_client'] = subprocess.Popen(command, stdout=logs['grpc_client'], stderr=subprocess.STDOUT,
                                                            start_new_session=True)
+            if fatal_can and window and now >= window['start_ns'] + 5000000000 and 'fatal_can' not in events:
+                events['fatal_can'] = {'requested_ns': time.monotonic_ns(), 'method': 'owned vcan link down/up; no adapter signal'}
+                events['simulator_before_fault'] = identity(children['simulator'].pid)
+                events['simulator_fault_preparation_exit'] = stop_children({'simulator': children['simulator']})['simulator']
+                if not events['simulator_fault_preparation_exit']['exit_confirmed']:
+                    raise RuntimeError('simulator preparation did not close')
+                subprocess.run(['ip', 'link', 'set', 'dev', 'vcan0', 'down'], check=True, timeout=2)
+                events['fatal_can']['link_down_ns'] = time.monotonic_ns()
+            if fatal_can and 'fatal_can' in events and 'link_up_ns' not in events['fatal_can']:
+                if time.monotonic_ns() >= events['fatal_can']['link_down_ns'] + 200000000:
+                    subprocess.run(['ip', 'link', 'set', 'dev', 'vcan0', 'up'], check=True, timeout=2)
+                    events['fatal_can']['link_up_ns'] = time.monotonic_ns()
+                    children['simulator'] = subprocess.Popen(events['commands']['simulator'], stdout=logs['simulator'],
+                        stderr=subprocess.STDOUT, start_new_session=True)
+                    events['simulator_after_fault'] = identity(children['simulator'].pid)
             if supervisor_policy and now >= next_supervision:
                 next_supervision = now + 50000000
                 descendants = Path(f'/proc/{children["can_adapter"].pid}/task/{children["can_adapter"].pid}/children').read_text().split()
@@ -282,6 +324,11 @@ def run(args):
                     frame, wall, mono = read_can(can_socket)
                 except BlockingIOError:
                     break
+                except OSError as error:
+                    if fatal_can and 'fatal_can' in events and error.errno == errno.ENETDOWN:
+                        events.setdefault('can_observer_errors', []).append({'monotonic_ns': time.monotonic_ns(), 'errno': error.errno})
+                        break
+                    raise
                 append("can", {"monotonic_ns": mono, "wall_ns": wall, "frame": frame})
             if now >= next_sample:
                 if supervisor_policy:
@@ -318,6 +365,31 @@ def run(args):
             healthy = healthy and gateway["message"]["state"] == 1 and gateway["message"]["active_source_id"] == "planning"
             healthy = healthy and status["message"]["accepted_count"] >= 5 and status["message"]["command_valid"] and status["message"]["lease_valid"]
             healthy = healthy and vehicle["message"]["state"] == 1 and vehicle["message"]["fault_code"] == 0
+            if fatal_can and 'fatal_can' in events and 'link_up_ns' in events['fatal_can']:
+                if healthy and len(adapter_instances) >= 2 and 'recovered_ns' not in events['fatal_can']:
+                    events['fatal_can']['recovered_ns'] = time.monotonic_ns()
+                recovered = events['fatal_can'].get('recovered_ns')
+                if recovered and now >= recovered + 2000000000 and feedback_operation is None:
+                    client = node.create_client(SetParametersAtomically, '/vehicle_simulator/set_parameters_atomically')
+                    request = SetParametersAtomically.Request()
+                    request.parameters = [Parameter('drop_state', value=True).to_parameter_msg()]
+                    feedback_operation = {'client': client, 'future': client.call_async(request), 'drop': True,
+                                          'requested_ns': time.monotonic_ns()}
+                    events['feedback_loss'] = {'requested_ns': feedback_operation['requested_ns']}
+                if feedback_operation and feedback_operation['future'].done() and 'observed_ns' not in feedback_operation:
+                    response = feedback_operation['future'].result()
+                    if not response.result.successful:
+                        raise RuntimeError('simulator drop_state rejected: ' + response.result.reason)
+                    feedback_operation['observed_ns'] = time.monotonic_ns()
+                    events['feedback_loss']['drop_ack_ns' if feedback_operation['drop'] else 'restore_ack_ns'] = feedback_operation['observed_ns']
+                if (feedback_operation and feedback_operation['drop'] and 'observed_ns' in feedback_operation
+                        and now >= feedback_operation['observed_ns'] + 1000000000):
+                    request = SetParametersAtomically.Request()
+                    request.parameters = [Parameter('drop_state', value=False).to_parameter_msg()]
+                    feedback_operation = {'client': feedback_operation['client'],
+                        'future': feedback_operation['client'].call_async(request), 'drop': False,
+                        'requested_ns': time.monotonic_ns()}
+                    events['feedback_loss']['restore_requested_ns'] = feedback_operation['requested_ns']
             trace_ready = not trace_gate or (identity_done and trace_gate.ready(trace_targets, healthy, now))
             if window is None and healthy and identity_done and trace_ready:
                 if trace_gate:
@@ -363,19 +435,14 @@ def run(args):
     finally:
         events["cutoff_ns"] = time.monotonic_ns()
         if trace_gate:
-            publish(control / 'cutoff.json', {'cutoff_ns': events['cutoff_ns'], 'result': events.get('result')})
-        events["exits"] = {}
-        for role, child in children.items():
-            requested = time.monotonic_ns()
-            if child.poll() is None:
-                os.killpg(child.pid, signal.SIGINT)
             try:
-                code = child.wait(timeout=15)
-                events["exits"][role] = {"exit": code, "stop_requested_ns": requested, "wait_done_ns": time.monotonic_ns()}
-            except subprocess.TimeoutExpired:
-                os.killpg(child.pid, signal.SIGTERM)
-                events["exits"][role] = {"exit": child.wait(timeout=10), "timeout": True}
-                events["errors"].append(role + " stop timeout")
+                publish(control / 'cutoff.json', {'cutoff_ns': events['cutoff_ns'], 'result': events.get('result')})
+            except Exception as error:
+                events['errors'].append('cutoff marker: ' + str(error))
+        events["exits"] = stop_children(children)
+        for role, result in events['exits'].items():
+            if result.get('timeout') or not result.get('exit_confirmed'):
+                events['errors'].append(role + ' stop incomplete/forced; preserve original exit')
         if can_socket:
             can_socket.close()
         if node:
@@ -390,6 +457,8 @@ def run(args):
                     handle.write(json.dumps(row, sort_keys=True) + "\n")
                 handle.flush(); os.fsync(handle.fileno())
         events["counts"] = {kind: len(rows) for kind, rows in streams.items()}
+        if events['errors']:
+            events['result'] = 1
         events["flush_done_ns"] = time.monotonic_ns()
         events["loadavg_end"] = Path("/proc/loadavg").read_text()
         with (args.output / "events.json").open("x") as handle:
@@ -415,4 +484,5 @@ if __name__ == "__main__":
     parser.add_argument('--fault-capture-config', type=lambda path: Path(path).resolve())
     parser.add_argument('--grpc-client', type=lambda path: Path(path).resolve())
     parser.add_argument('--kill-adapter', action='store_true')
+    parser.add_argument('--fatal-can', action='store_true')
     raise SystemExit(run(parser.parse_args()))

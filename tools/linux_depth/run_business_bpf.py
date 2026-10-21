@@ -16,9 +16,9 @@ import traceback
 from analyze import encoded, freeze
 from business_trace import publish, resource_sample
 from capture_target import snapshot
+from process_cleanup import instance_status, require_quiescent, stop_children, stop_instances
 
 ROOT = Path(__file__).resolve().parents[2]
-RUNTIME = ROOT / 'reports/linux-depth-20261021/remote/runtime'
 BPF = ROOT / 'reports/linux-depth-review-fixes-20261021/build-bpf'
 ROLES = ('gateway', 'can_adapter')
 
@@ -33,17 +33,8 @@ def runtime_identity(pid):
 
 
 def stop(child):
-    result = {'pid': child.pid, 'requested_ns': time.monotonic_ns(), 'forced': False}
-    for number, seconds in ((signal.SIGINT, 25), (signal.SIGTERM, 10), (signal.SIGKILL, 5)):
-        if child.poll() is not None:
-            break
-        os.killpg(child.pid, number)
-        try:
-            child.wait(timeout=seconds)
-        except subprocess.TimeoutExpired:
-            result['forced'] = True
-    result.update(exit=child.wait(timeout=1), waited_ns=time.monotonic_ns())
-    return result
+    return stop_children({'child': child}, ((signal.SIGINT, 35), (signal.SIGTERM, 8),
+                                          (signal.SIGKILL, 3)))['child']
 
 
 def checked_target(expected, uid):
@@ -86,6 +77,11 @@ def thread_observation(target):
 
 
 def frozen_case(case):
+    for path in case.rglob('broker.json'):
+        if not json.loads(path.read_bytes()).get('cleanup_closed', False):
+            raise RuntimeError('broker cleanup incomplete; final freeze forbidden: ' + str(path))
+    for path in case.rglob('owners.json'):
+        require_quiescent(json.loads(path.read_bytes()))
     files = {}
     for path in sorted(case.rglob('*')):
         if path.is_file():
@@ -93,7 +89,7 @@ def frozen_case(case):
     publish(case / 'capture-freeze.json', {'schema': 1, 'files': files})
 
 
-def run_case(base, mode, user, domain):
+def run_case(base, mode, user, domain, runtime):
     case = base / mode
     case.mkdir()
     control = case / 'control'
@@ -104,8 +100,8 @@ def run_case(base, mode, user, domain):
     bpf.mkdir()
     env = dict(os.environ, HOME=user.pw_dir, USER=user.pw_name, LOGNAME=user.pw_name,
                ROS_DOMAIN_ID=str(domain), ROS_LOG_DIR=str(case / 'roslog'), PYTHONDONTWRITEBYTECODE='1')
-    script = 'source ' + shlex.quote(str(ROOT / 'tools/linux_depth/activate.bash')) + ' ' + shlex.quote(str(RUNTIME))
-    script += '; exec python3 ' + shlex.join([str(ROOT / 'tools/linux_depth/run_scene.py'), '--runtime', str(RUNTIME),
+    script = 'source ' + shlex.quote(str(ROOT / 'tools/linux_depth/activate.bash')) + ' ' + shlex.quote(str(runtime))
+    script += '; exec python3 ' + shlex.join([str(ROOT / 'tools/linux_depth/run_scene.py'), '--runtime', str(runtime),
               '--output', str(case / 'scene'), '--seconds', '20', '--warmup', '10', '--timing', '--bpf-control', str(control)])
     command = ['runuser', '-u', user.pw_name, '--', 'bash', '-e', '-c', script]
     record = {'mode': mode, 'business_uid': user.pw_uid, 'business_command': command,
@@ -177,28 +173,44 @@ def run_case(base, mode, user, domain):
         record['errors'].append(type(error).__name__ + ': ' + str(error))
         record['traceback'] = traceback.format_exc()
     finally:
-        for role, child in children.items():
-            if role not in record['exits']:
-                record['exits'][role] = stop(child)
+        record['exits'].update(stop_children({role: child for role, child in children.items()
+            if role not in record['exits']}, ((signal.SIGINT, 35), (signal.SIGTERM, 8), (signal.SIGKILL, 3))))
+        record['cleanup_closed'] = all(row.get('exit_confirmed', False) for row in record['exits'].values())
         owners = control / 'owners.json'
         if owners.exists():
-            for role, owner in json.loads(owners.read_bytes()).items():
+            try:
+                registry = json.loads(owners.read_bytes())
+                ready = control / 'owners-ready.json'
+                if not ready.exists() or json.loads(ready.read_bytes()).get('registered_roles') != sorted(registry):
+                    record['cleanup_closed'] = False
+                    record['errors'].append('startup owner registration incomplete; unknown spawn boundary cannot be frozen')
+                remaining = {role: owner for role, owner in registry.items()
+                             if not instance_status(owner)['exit_confirmed']}
+                if remaining:
+                    record['errors'].append('business owners survived driver wait: ' + ','.join(remaining))
+                record['owner_cleanup'] = stop_instances(registry)
+                require_quiescent(registry)
+            except Exception as error:
+                record['cleanup_closed'] = False
+                record['errors'].append('owner cleanup: ' + str(error))
+        elif 'business' in children:
+            record['cleanup_closed'] = False
+            record['errors'].append('missing business owner registry; cannot prove cleanup')
+        for handle in (resource, *logs):
+            try:
+                handle.flush()
+                os.fsync(handle.fileno())
+            except Exception as error:
+                record['errors'].append('flush: ' + str(error))
+            finally:
                 try:
-                    fields = Path('/proc', str(owner['pid']), 'stat').read_text().rsplit(')', 1)[1].split()
-                    if int(fields[19]) == owner['starttime'] and fields[0] != 'Z':
-                        record['errors'].append('business owner remained after wait: ' + role)
-                        os.kill(owner['pid'], signal.SIGTERM)
-                except (FileNotFoundError, ProcessLookupError):
-                    pass
-        resource.flush()
-        os.fsync(resource.fileno())
-        resource.close()
-        for log in logs:
-            log.flush()
-            os.fsync(log.fileno())
-            log.close()
-        record['flush_done_ns'] = time.monotonic_ns()
-    if (case / 'scene/events.json').exists():
+                    handle.close()
+                except Exception as error:
+                    record['errors'].append('close: ' + str(error))
+        record['broker_handles_closed_ns'] = time.monotonic_ns()
+        if record['cleanup_closed']:
+            record['flush_done_ns'] = time.monotonic_ns()
+    if record['cleanup_closed'] and (case / 'scene/events.json').exists():
         try:
             business = json.loads((case / 'scene/events.json').read_bytes())
             if business['errors'] or any(row['exit'] or row.get('timeout') for row in business['exits'].values()):
@@ -209,7 +221,8 @@ def run_case(base, mode, user, domain):
     else:
         record['errors'].append('missing completed business events')
     publish(case / 'broker.json', record)
-    frozen_case(case)
+    if record['cleanup_closed']:
+        frozen_case(case)
     return not record['errors'] and all(row['exit'] == 0 and not row['forced'] for row in record['exits'].values())
 
 
@@ -217,6 +230,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', required=True, type=lambda value: Path(value).resolve())
     parser.add_argument('--user', default='zlm')
+    parser.add_argument('--runtime', required=True, type=lambda value: Path(value).resolve(strict=True))
     args = parser.parse_args()
     user = pwd.getpwnam(args.user)
     if os.geteuid() != 0 or user.pw_uid == 0:
@@ -236,10 +250,11 @@ def main():
             for path in sorted((ROOT / 'tools/linux_depth').glob('*')) if path.is_file()},
         'bpf_sha256': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (BPF / 'trace_loader', BPF / 'scheduler.bpf.o')},
         'build_origin': 'reuse previously reviewed ELF from baseline plus source patch; no rebuild for current commit metadata',
+        'selected_runtime': str(args.runtime),
         'references': {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in (
-            ROOT / 'reports/linux-depth-20261021/remote/delivery/build-identity.json',
-            ROOT / 'reports/linux-depth-20261021/remote/delivery/source-before-commit.json',
-            ROOT / 'reports/linux-depth-20261021/remote/delivery/runtime-assembly.json')}})
+            ROOT / 'reports/functional-runtime-20261021T145000Z-e5d0430/build-identity.json',
+            ROOT / 'reports/functional-runtime-20261021T145000Z-e5d0430/source-identity.json',
+            ROOT / 'reports/functional-runtime-20261021T145000Z-e5d0430/runtime-identity.json')}})
     def cancelled(number, frame):
         raise InterruptedError('broker signal ' + str(number))
     for number in (signal.SIGINT, signal.SIGTERM):
@@ -250,14 +265,19 @@ def main():
                     '--output', str(args.output / 'preflight.json')], check=True)
     result = 1
     try:
-        if all(run_case(args.output, mode, user, 87) for mode in ('off', 'on')):
+        if all(run_case(args.output, mode, user, 87, args.runtime) for mode in ('off', 'on')):
             result = subprocess.run(['python3', str(ROOT / 'tools/linux_depth/analyze_business_bpf.py'),
                                      str(args.output), str(args.output / 'analysis')]).returncode
         publish(args.output / 'pair-result.json', {'exit': result, 'closed_monotonic_ns': time.monotonic_ns()})
     finally:
-        frozen_case(args.output)
-        publish(args.output / 'seal.json', {'capture_freeze_sha256': hashlib.sha256((args.output / 'capture-freeze.json').read_bytes()).hexdigest(),
-                                          'scope': 'VM short observation only; not independent acceptance'})
+        try:
+            frozen_case(args.output)
+        except Exception as error:
+            publish(args.output / 'freeze-invalid.json', {'reason': str(error), 'final_inputs_valid': False})
+            result = 1
+        else:
+            publish(args.output / 'seal.json', {'capture_freeze_sha256': hashlib.sha256((args.output / 'capture-freeze.json').read_bytes()).hexdigest(),
+                                              'scope': 'VM short observation only; not independent acceptance'})
     return result
 
 

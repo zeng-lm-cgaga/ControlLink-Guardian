@@ -2,6 +2,7 @@ import importlib.util
 from pathlib import Path
 import threading
 import unittest
+from unittest.mock import patch
 
 SOURCE = Path(__file__).parents[1] / 'control_link_bringup/adapter_supervisor.py'
 SPEC = importlib.util.spec_from_file_location('adapter_supervisor', SOURCE)
@@ -57,6 +58,38 @@ class SupervisorTests(unittest.TestCase):
             self.assertIsNone(owner.child)
         finally:
             timer.join()
+
+    def test_backoff_oversleep_does_not_exec_replacement(self):
+        rows, now = [], [10.0]
+        def oversleep(seconds):
+            now[0] += 2
+            return False
+        owner = MODULE.AdapterSupervisor(['/missing'], self.policy(), rows.append,
+                                         clock=lambda: now[0], wait=oversleep)
+        with patch.object(MODULE.subprocess, 'Popen', side_effect=OSError('fixture')) as launch:
+            self.assertEqual(owner.run(), 75)
+        self.assertEqual(launch.call_count, 1)
+        self.assertEqual(rows[-2]['state'], 'EXHAUSTED_MANUAL_INTERVENTION_REQUIRED')
+
+    def test_stop_has_priority_when_backoff_crosses_deadline(self):
+        now = [10.0]
+        def oversleep_and_stop(seconds):
+            now[0] += 2
+            owner.request_stop()
+            return False
+        owner = MODULE.AdapterSupervisor(['/missing'], self.policy(), lambda row: None,
+                                         clock=lambda: now[0], wait=oversleep_and_stop)
+        with patch.object(MODULE.subprocess, 'Popen', side_effect=OSError('fixture')) as launch:
+            self.assertEqual(owner.run(), 0)
+        self.assertEqual(launch.call_count, 1)
+
+    def test_deadline_rechecked_immediately_before_replacement(self):
+        readings = iter((10.0, 10.1, 12.0))
+        owner = MODULE.AdapterSupervisor(['/missing'], self.policy(), lambda row: None,
+                                         clock=lambda: next(readings), wait=lambda seconds: False)
+        with patch.object(MODULE.subprocess, 'Popen', side_effect=OSError('fixture')) as launch:
+            self.assertEqual(owner.run(), 75)
+        self.assertEqual(launch.call_count, 1)
 
 
 if __name__ == '__main__':

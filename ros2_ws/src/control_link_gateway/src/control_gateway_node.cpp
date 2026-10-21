@@ -1,4 +1,5 @@
 #include "control_link_gateway/control_gateway_node.hpp"
+#include "control_link_timing/command_event.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -27,6 +28,8 @@
 #include "rclcpp/subscription_options.hpp"
 #include "rclcpp/time.hpp"
 #include "rmw/rmw.h"
+#include "rcl/timer.h"
+#include "rcutils/time.h"
 
 namespace control_link_gateway
 {
@@ -322,6 +325,10 @@ namespace control_link_gateway
 		declare_parameter<std::string>(kConfigRootParameter, "");
 		declare_parameter<std::string>(kDecisionTracePathParameter, "");
 		declare_parameter<std::int64_t>(kDecisionTraceQueueCapacityParameter, 4096);
+		rcl_interfaces::msg::ParameterDescriptor timing_descriptor;
+		timing_descriptor.read_only = true;
+		declare_parameter<std::string>("runtime_timing_path", "", timing_descriptor);
+		runtime_timing_ = control_link_timing::open_optional(get_parameter("runtime_timing_path").as_string());
 		// Executor add_node() 前固定调度拓扑，Lifecycle 只增删组内的 endpoint 和 timer
 		data_plane_group_ = create_callback_group(
 			rclcpp::CallbackGroupType::MutuallyExclusive);
@@ -1031,6 +1038,10 @@ namespace control_link_gateway
 
 	void ControlGatewayNode::run_output_tick() noexcept
 	{
+		const auto timing_tick = runtime_timing_ ? control_link_timing::monotonic_ns() : 0;
+		rcutils_time_point_value_t timing_ros_steady = 0;
+		const auto timing_clock_result = runtime_timing_ ? rcutils_steady_time_now(&timing_ros_steady) : RCUTILS_RET_OK;
+		const auto timing_clock_span = runtime_timing_ ? control_link_timing::monotonic_ns() - timing_tick : 0;
 		ControlCommand canonical_message;
 		control_link_interfaces::msg::GatewayState gateway_state_message;
 		std::vector<control_link_interfaces::msg::SourceStatus>
@@ -1038,6 +1049,7 @@ namespace control_link_gateway
 		decltype(canonical_output_publisher_) canonical_publisher;
 		decltype(gateway_state_publisher_) gateway_state_publisher;
 		decltype(source_status_publisher_) source_status_publisher;
+		control_link_timing::Identity timing_identity;
 		bool request_error = false;
 
 		try
@@ -1080,10 +1092,51 @@ namespace control_link_gateway
 				last_decision_ = decision;
 
 				canonical_message = decision.canonical_command;
+				if (runtime_timing_)
+				{
+					std::int64_t next_call = 0;
+					control_link_timing::Event timer_event;
+					timer_event.phase = control_link_timing::Phase::PeriodicTick;
+					timer_event.begin_ns = timing_tick;
+					timer_event.result = rcl_timer_get_next_call_time(output_timer_->get_timer_handle().get(), &next_call);
+					timer_event.schedule_clock = 2;
+					timer_event.schedule_now_ns = timing_clock_result == RCUTILS_RET_OK ? timing_ros_steady : 0;
+					timer_event.value = timing_clock_span;
+					const auto period = checked_output_period(contract_bundle_->gateway_contract->gateway.output_rate_hz).count();
+					if (timer_event.result == RCL_RET_OK && timing_clock_result == RCUTILS_RET_OK && next_call >= period)
+					{
+						// rcl 已推进 timer；deadline 与入口 sample 同属 RCL_STEADY_TIME，不跨钟相减。
+						timer_event.scheduled_ns = static_cast<std::uint64_t>(next_call - period);
+					}
+					runtime_timing_->record(timer_event);
+					timing_identity = control_link_timing::command_identity(canonical_message);
+					const auto selected = decision_engine_->source_slots().find(canonical_message.source_id);
+					if (selected != decision_engine_->source_slots().end() && selected->second.latest_valid_snapshot)
+					{
+						timing_identity.publisher_gid = selected->second.latest_valid_snapshot->publisher_generation.publisher_gid;
+					}
+					control_link_timing::observe(runtime_timing_, control_link_timing::Phase::SourceSelect,
+						timing_identity, control_link_timing::monotonic_ns(), canonical_message.mode, 0, timing_tick);
+				}
 				gateway_state_message = make_gateway_state(decision, now_ros_ns);
 				source_status_messages.reserve(decision.sources.size());
 				for (const auto &source_result : decision.sources)
 				{
+					if (runtime_timing_)
+					{
+						control_link_timing::Identity snapshot_identity;
+						snapshot_identity.set_source(source_result.source_id);
+						const auto &slot = decision_engine_->source_slots().at(source_result.source_id);
+						if (slot.latest_valid_snapshot)
+						{
+							snapshot_identity.sequence = slot.latest_valid_snapshot->sequence;
+							snapshot_identity.source_stamp_ns = slot.latest_valid_snapshot->source_stamp_ns;
+							snapshot_identity.publisher_gid = slot.latest_valid_snapshot->publisher_generation.publisher_gid;
+						}
+						control_link_timing::observe(runtime_timing_, control_link_timing::Phase::SourceSnapshot,
+							snapshot_identity, timing_tick, (source_result.command_valid ? 1 : 0) |
+							(source_result.lease_valid ? 2 : 0), source_result.command_age_ns, timing_tick);
+					}
 					const auto &source =
 						contract_bundle_->source_policy->sources.at(source_result.source_id);
 
@@ -1154,7 +1207,16 @@ namespace control_link_gateway
 					return;
 				}
 
+				const auto publish_begin = runtime_timing_ ? control_link_timing::monotonic_ns() : 0;
 				canonical_publisher->publish(canonical_message);
+				if (runtime_timing_)
+				{
+					// 同一 tick ID 桥接上游 generation 和 canonical publisher，不能假设两侧 GID 相等。
+					timing_identity.publisher_gid = control_link_timing::command_identity(
+						canonical_message, canonical_publisher->get_gid().data).publisher_gid;
+				}
+				control_link_timing::observe(runtime_timing_, control_link_timing::Phase::CanonicalPublish,
+					timing_identity, publish_begin, canonical_message.mode, 0, timing_tick);
 				gateway_state_publisher->publish(gateway_state_message);
 				for (const auto &status : source_status_messages)
 				{
@@ -1558,12 +1620,27 @@ namespace control_link_gateway
 		const VehicleState &state,
 		const rclcpp::MessageInfo &message_info) noexcept
 	{
+		const auto timing_begin = runtime_timing_ ? control_link_timing::monotonic_ns() : 0;
+		control_link_timing::Identity timing_identity;
+		if (runtime_timing_)
+		{
+			timing_identity.set_source("vehicle_state");
+			timing_identity.sequence = state.rolling_counter;
+			timing_identity.source_stamp_ns = static_cast<std::int64_t>(state.observed_at.sec) * 1000000000LL + state.observed_at.nanosec;
+			std::copy_n(message_info.get_rmw_message_info().publisher_gid.data,
+				timing_identity.publisher_gid.size(), timing_identity.publisher_gid.begin());
+		}
+		const auto record_feedback = [&](std::int64_t verdict, std::int64_t reason) {
+			control_link_timing::observe(runtime_timing_, control_link_timing::Phase::GatewayFeedback,
+				timing_identity, timing_begin, verdict, reason);
+		};
 		try
 		{
 			std::scoped_lock lock(runtime_mutex_);
 			// VehicleState 是 activation gate 的输入，所以 INACTIVE 期间也必须接收
 			if (!health_plane_configured_)
 			{
+				record_feedback(-1, 0);
 				return;
 			}
 
@@ -1587,6 +1664,7 @@ namespace control_link_gateway
 					.matching_role_endpoints.size() == 1U;
 			if (!stable_role_available)
 			{
+				record_feedback(0, static_cast<std::int64_t>(VehicleStateRejectReason::kPublisherGenerationUnstable));
 				commit_vehicle_state_validation_result(
 					vehicle_state_runtime_,
 					VehicleStateValidationResult{
@@ -1604,6 +1682,7 @@ namespace control_link_gateway
 					rmw_implementation_);
 			if (!(actual_generation == stable_generation))
 			{
+				record_feedback(0, static_cast<std::int64_t>(VehicleStateRejectReason::kPublisherGenerationUnstable));
 				commit_vehicle_state_validation_result(
 					vehicle_state_runtime_,
 					VehicleStateValidationResult{
@@ -1628,6 +1707,7 @@ namespace control_link_gateway
 				health_snapshot_.ros_clock_healthy,
 				received_at};
 			const auto result = vehicle_state_validator_->validate(state, context);
+			record_feedback(result.accepted() ? 1 : 0, static_cast<std::int64_t>(result.reason));
 			commit_vehicle_state_validation_result(vehicle_state_runtime_, result);
 			refresh_vehicle_state_health_locked(received_at);
 			submit_health_snapshot_locked(received_at);
@@ -1660,6 +1740,13 @@ namespace control_link_gateway
 		const ControlCommand &command,
 		const rclcpp::MessageInfo &message_info) noexcept
 	{
+		const auto timing_begin = runtime_timing_ ? control_link_timing::monotonic_ns() : 0;
+		control_link_timing::Identity timing_identity;
+		if (runtime_timing_)
+		{
+			timing_identity = control_link_timing::command_identity(command, message_info.get_rmw_message_info().publisher_gid.data);
+			control_link_timing::observe(runtime_timing_, control_link_timing::Phase::SourceReceive, timing_identity, timing_begin);
+		}
 		try
 		{
 			std::scoped_lock lock(runtime_mutex_);
@@ -1680,6 +1767,7 @@ namespace control_link_gateway
 					expected_source_id);
 			}
 			const auto received_at = std::chrono::steady_clock::now();
+			const auto previous_count = decision_engine_->source_slots().at(expected_source_id).accepted_count;
 			(void)submit_decision_event_locked(
 				DecisionSourceSampleEvent{
 					expected_source_id,
@@ -1687,6 +1775,13 @@ namespace control_link_gateway
 					command,
 					get_clock()->now().nanoseconds(),
 					decision_steady_offset_locked(received_at)});
+			if (runtime_timing_)
+			{
+				const auto &slot = decision_engine_->source_slots().at(expected_source_id);
+				control_link_timing::observe(runtime_timing_, control_link_timing::Phase::SourceResult,
+					timing_identity, timing_begin, slot.accepted_count > previous_count ? 1 : 0,
+					static_cast<std::int64_t>(slot.last_reject_reason));
+			}
 		}
 		catch (const std::exception &exception)
 		{

@@ -45,6 +45,7 @@ find_package(rmw REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(Threads REQUIRED)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime_timing ${CMAKE_CURRENT_BINARY_DIR}/runtime_timing)
 
 if(CONTROL_LINK_ENABLE_EDGE_RUNTIME OR CONTROL_LINK_ENABLE_SOMEIP OR CONTROL_LINK_ENABLE_GRPC)
 	if(CONTROL_LINK_ENABLE_EDGE_RUNTIME)
@@ -203,7 +204,7 @@ ament_target_dependencies(${PROJECT_NAME}
 		tf2_ros
 )
 target_compile_options(${PROJECT_NAME} PRIVATE -Wall -Wextra -Wpedantic)
-target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads)
+target_link_libraries(${PROJECT_NAME} PRIVATE Threads::Threads control_link_runtime_timing)
 
 if(CONTROL_LINK_ENABLE_FUZZ_TARGETS)
 	target_compile_options(${PROJECT_NAME} PRIVATE

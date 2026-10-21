@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.16)
+project(control_link_linux_depth LANGUAGES CXX)
+enable_testing()
+find_package(GTest REQUIRED)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+get_filename_component(CONTROL_LINK_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/../.. ABSOLUTE)
+set(CONTROL_LINK_TRANSPORT_SOURCE_ROOT "${CONTROL_LINK_ROOT}" CACHE PATH "Isolated baseline source for comparison")
+add_subdirectory(${CONTROL_LINK_ROOT}/runtime_timing runtime_timing)
+add_executable(test_transport
+  test_transport.cpp
+  ${CONTROL_LINK_TRANSPORT_SOURCE_ROOT}/ros2_ws/src/control_link_adapters/src/socketcan_transport.cpp
+  ${CONTROL_LINK_TRANSPORT_SOURCE_ROOT}/ros2_ws/src/control_link_adapters/test/test_socketcan_transport.cpp)
+target_include_directories(test_transport PRIVATE
+  ${CONTROL_LINK_TRANSPORT_SOURCE_ROOT}/ros2_ws/src/control_link_adapters/include
+  ${CONTROL_LINK_ROOT}/ros2_ws/src/control_link_contract/include)
+if(NOT CONTROL_LINK_TRANSPORT_SOURCE_ROOT STREQUAL CONTROL_LINK_ROOT)
+  target_compile_definitions(test_transport PRIVATE CONTROL_LINK_BASELINE_TRANSPORT=1)
+endif()
+target_link_libraries(test_transport PRIVATE control_link_runtime_timing GTest::gtest_main Threads::Threads)
+target_link_options(test_transport PRIVATE -Wl,--wrap=write)
+target_compile_options(test_transport PRIVATE -Wall -Wextra -Wpedantic)
+add_test(NAME socketcan_focused COMMAND test_transport)
+set_tests_properties(socketcan_focused PROPERTIES TIMEOUT 40)
+add_test(NAME offline_analysis COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR} -p test_analyze*.py)
+set_tests_properties(offline_analysis PROPERTIES ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1" TIMEOUT 30)
+add_executable(controlled_workload workload.cpp)
+target_link_libraries(controlled_workload PRIVATE control_link_runtime_timing Threads::Threads)
+target_compile_options(controlled_workload PRIVATE -Wall -Wextra -Wpedantic)

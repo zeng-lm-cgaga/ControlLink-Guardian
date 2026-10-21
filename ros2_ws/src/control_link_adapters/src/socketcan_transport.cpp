@@ -1,4 +1,5 @@
 #include "control_link_adapters/socketcan_transport.hpp"
+#include "control_link_timing/recorder.hpp"
 
 #include <algorithm>
 #include <cerrno>
@@ -17,6 +18,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 
 namespace control_link_adapters
@@ -36,6 +38,10 @@ namespace control_link_adapters
 
 		void validate_config(const SocketCanTransportConfig &config)
 		{
+			if (config.receive_frame_budget == 0 || config.receive_time_budget.count() <= 0)
+			{
+				throw std::invalid_argument("SocketCAN receive budgets must be positive");
+			}
 			if (config.interface.empty() || config.interface.size() >= IFNAMSIZ)
 			{
 				throw std::invalid_argument(
@@ -233,9 +239,12 @@ namespace control_link_adapters
 		try
 		{
 			event_fd_ = open_eventfd();
+			timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+			if (timer_fd_ < 0) { throw std::system_error(errno, std::generic_category(), "timerfd_create failed"); }
 		}
 		catch (...)
 		{
+			close_descriptor(event_fd_);
 			close_descriptor(can_fd_);
 			can_fd_ = -1;
 			throw;
@@ -251,7 +260,8 @@ namespace control_link_adapters
 		ReceiveHandler receive_handler,
 		ErrorHandler error_handler,
 		TransmitHandler transmit_handler,
-		TransmitSuccessHandler transmit_success_handler)
+		TransmitSuccessHandler transmit_success_handler,
+		TraceHandler trace_handler)
 	{
 		if (!receive_handler)
 		{
@@ -270,6 +280,7 @@ namespace control_link_adapters
 		error_handler_ = std::move(error_handler);
 		transmit_handler_ = std::move(transmit_handler);
 		transmit_success_handler_ = std::move(transmit_success_handler);
+		trace_handler_ = std::move(trace_handler);
 		stop_requested_.store(false, std::memory_order_release);
 		try
 		{
@@ -311,6 +322,8 @@ namespace control_link_adapters
 			{
 				return;
 			}
+			// 请求边界先打点，再发布 stop 并唤醒；不能在 worker 退出后补记请求时间。
+			trace({SocketCanTracePhase::kStop, control_link_timing::monotonic_ns(), 0, 0, 0, 0});
 			stop_requested_.store(true, std::memory_order_release);
 			wake_worker_locked();
 		}
@@ -324,10 +337,13 @@ namespace control_link_adapters
 			}
 			worker_.join();
 		}
+		trace({SocketCanTracePhase::kJoined, control_link_timing::monotonic_ns(), 0, 0, 0, 0});
 
 		std::lock_guard<std::mutex> lock{lifecycle_mutex_};
 		close_descriptors_locked();
 		stopped_ = true;
+		trace({SocketCanTracePhase::kClosed, control_link_timing::monotonic_ns(), 0, 0,
+			static_cast<std::int64_t>(missed_transmit_periods_.load()), static_cast<std::int64_t>(receive_budget_yields_.load())});
 	}
 
 	bool SocketCanTransport::running() const noexcept
@@ -345,28 +361,55 @@ namespace control_link_adapters
 			read_errors_.load(std::memory_order_relaxed),
 			write_errors_.load(std::memory_order_relaxed),
 			wake_errors_.load(std::memory_order_relaxed),
-			receive_handler_errors_.load(std::memory_order_relaxed)};
+			receive_handler_errors_.load(std::memory_order_relaxed),
+			receive_budget_yields_.load(std::memory_order_relaxed),
+			missed_transmit_periods_.load(std::memory_order_relaxed)};
 	}
 
 	void SocketCanTransport::run() noexcept
 	{
 		running_.store(true, std::memory_order_release);
-		std::optional<CanFrame> retry_frame;
 		auto next_transmit = std::chrono::steady_clock::now() +
 			config_.transmit_period;
+		const auto first_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(next_transmit.time_since_epoch()).count();
+		const auto period_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(config_.transmit_period).count();
+		itimerspec timer{};
+		timer.it_value = {first_ns / 1000000000LL, first_ns % 1000000000LL};
+		timer.it_interval = {period_ns / 1000000000LL, period_ns % 1000000000LL};
+		if (::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &timer, nullptr) != 0)
+		{
+			report_error({SocketCanIoErrorKind::kTimerRead, errno, true, "timerfd_settime failed"});
+			stop_requested_.store(true, std::memory_order_release);
+		}
+		const auto consume_expirations = [this]() noexcept -> std::uint64_t {
+			std::uint64_t count = 0;
+			for (int attempt = 0; attempt < 4; ++attempt)
+			{
+				const auto read = ::read(timer_fd_, &count, sizeof(count));
+				if (read == static_cast<ssize_t>(sizeof(count))) { return count; }
+				if (read < 0 && errno == EINTR) { continue; }
+				if (read < 0 && errno == EAGAIN) { return 0; }
+				report_error({SocketCanIoErrorKind::kTimerRead, read < 0 ? errno : 0, true, "timerfd read failed"});
+				stop_requested_.store(true, std::memory_order_release);
+				return 0;
+			}
+			return 0;
+		};
 
 		while (!stop_requested_.load(std::memory_order_acquire))
 		{
-			pollfd descriptors[2]{};
+			pollfd descriptors[3]{};
 			descriptors[0].fd = can_fd_;
 			descriptors[0].events = POLLIN;
 			descriptors[1].fd = event_fd_;
 			descriptors[1].events = POLLIN;
+			descriptors[2].fd = timer_fd_;
+			descriptors[2].events = POLLIN;
 
 			const auto before_poll = std::chrono::steady_clock::now();
 			const int result = ::poll(
 				descriptors,
-				2,
+				3,
 				poll_timeout_until(
 					before_poll,
 					next_transmit,
@@ -398,7 +441,7 @@ namespace control_link_adapters
 			}
 			if ((descriptors[0].revents & POLLIN) != 0)
 			{
-				if (!receive_available_frames())
+				if (!receive_available_frames(next_transmit))
 				{
 					break;
 				}
@@ -423,17 +466,34 @@ namespace control_link_adapters
 					"eventfd pollfd reported error, hangup, or invalid descriptor"});
 				break;
 			}
+			if ((descriptors[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+			{
+				report_error({SocketCanIoErrorKind::kTimerRead, 0, true, "timerfd poll error"});
+				break;
+			}
 
-			auto now = std::chrono::steady_clock::now();
+			if (stop_requested_.load(std::memory_order_acquire)) { break; }
+			const auto now = std::chrono::steady_clock::now();
 			const bool immediate = immediate_transmit_requested_.exchange(
 				false,
 				std::memory_order_acq_rel);
-			if (immediate && transmit_handler_)
+			const auto expirations = (now >= next_transmit || (descriptors[2].revents & POLLIN)) ? consume_expirations() : 0;
+			const bool periodic = expirations != 0;
+			if (stop_requested_.load(std::memory_order_acquire)) { break; }
+			if (immediate || periodic)
 			{
-				std::optional<CanFrame> immediate_frame;
+				const auto scheduled = next_transmit;
+				if (periodic && trace_handler_)
+				{
+					trace({SocketCanTracePhase::kTick, control_link_timing::monotonic_ns(), 0,
+						static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(scheduled.time_since_epoch()).count()), 0,
+						static_cast<std::int64_t>(expirations - 1)});
+				}
+				std::optional<CanFrame> frame;
 				try
 				{
-					immediate_frame = transmit_handler_(now);
+					// 每次尝试重新评估 mailbox/watchdog；EAGAIN 后不缓存旧运动帧。
+					if (transmit_handler_) { frame = transmit_handler_(now); }
 				}
 				catch (...)
 				{
@@ -444,77 +504,40 @@ namespace control_link_adapters
 						exception_detail(std::current_exception())});
 					break;
 				}
-				if (immediate_frame.has_value())
+				if (frame.has_value() && !stop_requested_.load(std::memory_order_acquire))
 				{
-					// 安全请求覆盖尚未发送的普通 retry frame
-					retry_frame = immediate_frame;
-					const auto transmit_result = transmit_frame(retry_frame.value());
+					const auto transmit_result = transmit_frame(frame.value());
 					if (transmit_result == TransmitResult::kFatal)
 					{
 						break;
 					}
-					if (transmit_result == TransmitResult::kSent)
-					{
-						retry_frame.reset();
-					}
 				}
-				now = std::chrono::steady_clock::now();
-				next_transmit = now + config_.transmit_period;
-			}
-			else if (now >= next_transmit)
-			{
-				std::optional<CanFrame> periodic_frame = retry_frame;
-				if (!periodic_frame.has_value() && transmit_handler_)
+				if (periodic)
 				{
-					try
-					{
-						periodic_frame = transmit_handler_(now);
-					}
-					catch (...)
-					{
-						report_error(SocketCanIoError{
-							SocketCanIoErrorKind::kTransmitHandler,
-							0,
-							true,
-							exception_detail(std::current_exception())});
-						break;
-					}
+					// timerfd 保留绝对相位。长 handler 期间到期的 tick 一并跳过，禁止补发旧周期。
+					const auto during_handler = consume_expirations();
+					missed_transmit_periods_.fetch_add(expirations - 1 + during_handler, std::memory_order_relaxed);
+					next_transmit = scheduled + (expirations + during_handler) * config_.transmit_period;
 				}
-				if (periodic_frame.has_value())
-				{
-					const auto transmit_result = transmit_frame(periodic_frame.value());
-					if (transmit_result == TransmitResult::kFatal)
-					{
-						break;
-					}
-					if (transmit_result == TransmitResult::kRetry)
-					{
-						retry_frame = periodic_frame;
-					}
-					else
-					{
-						retry_frame.reset();
-					}
-				}
-				now = std::chrono::steady_clock::now();
-				next_transmit = now + config_.transmit_period;
 			}
 		}
 
 		// 无论是正常 stop 还是致命 I/O 错误，worker 退出后都不再接受新帧
 		stop_requested_.store(true, std::memory_order_release);
 		running_.store(false, std::memory_order_release);
+		trace({SocketCanTracePhase::kExit, control_link_timing::monotonic_ns(), 0, 0, 0, 0});
 	}
 
 	bool SocketCanTransport::drain_eventfd() noexcept
 	{
 		std::uint64_t value = 0U;
-		while (true)
+		for (int attempt = 0; attempt < 4 && !stop_requested_.load(std::memory_order_acquire); ++attempt)
 		{
 			const auto result = ::read(event_fd_, &value, sizeof(value));
 			if (result == static_cast<ssize_t>(sizeof(value)))
 			{
-				continue;
+				// 非 semaphore eventfd 一次读取已清空累计值；新 wake 保持 level-ready。
+				return true;
 			}
 			if (result == -1 && errno == EINTR)
 			{
@@ -533,17 +556,33 @@ namespace control_link_adapters
 				result == -1 ? std::string{} : "short eventfd read"});
 			return false;
 		}
+		return true;
 	}
 
-	bool SocketCanTransport::receive_available_frames() noexcept
+	bool SocketCanTransport::receive_available_frames(std::chrono::steady_clock::time_point deadline) noexcept
 	{
-		while (true)
+		const auto started = std::chrono::steady_clock::now();
+		std::size_t frames = 0;
+		while (!stop_requested_.load(std::memory_order_acquire))
 		{
+			const auto now = std::chrono::steady_clock::now();
+			if (frames >= config_.receive_frame_budget || now - started >= config_.receive_time_budget || now >= deadline)
+			{
+				receive_budget_yields_.fetch_add(1, std::memory_order_relaxed);
+				return true;
+			}
 			can_frame frame{};
 			const auto result = ::read(can_fd_, &frame, sizeof(frame));
 			if (result == static_cast<ssize_t>(sizeof(frame)))
 			{
 				received_frames_.fetch_add(1U, std::memory_order_relaxed);
+				++frames;
+				if (trace_handler_)
+				{
+					// Transport 不解释平台信号偏移；counter 由 adapter 的 codec 校验事件提供。
+					trace({SocketCanTracePhase::kReceive, control_link_timing::monotonic_ns(), 0, 0, frame.can_dlc,
+						frame.can_id, received_frames_.load(std::memory_order_relaxed)});
+				}
 				try
 				{
 					receive_handler_(
@@ -582,6 +621,7 @@ namespace control_link_adapters
 				result == -1 ? std::string{} : "short CAN frame read"});
 			return false;
 		}
+		return true;
 	}
 
 	SocketCanTransport::TransmitResult SocketCanTransport::transmit_frame(
@@ -598,9 +638,16 @@ namespace control_link_adapters
 			return TransmitResult::kFatal;
 		}
 		const auto linux_frame = to_linux_frame(frame);
-		while (true)
+		for (int attempt = 0; attempt < 4 && !stop_requested_.load(std::memory_order_acquire); ++attempt)
 		{
+			const auto started = trace_handler_ ? control_link_timing::monotonic_ns() : 0;
 			const auto result = ::write(can_fd_, &linux_frame, sizeof(linux_frame));
+			const int write_errno = result < 0 ? errno : 0;
+			if (trace_handler_)
+			{
+				trace({SocketCanTracePhase::kWrite, started, control_link_timing::monotonic_ns(), 0,
+					result < 0 ? -write_errno : result, frame.can_id});
+			}
 			if (result == static_cast<ssize_t>(sizeof(linux_frame)))
 			{
 				transmitted_frames_.fetch_add(1U, std::memory_order_relaxed);
@@ -622,17 +669,17 @@ namespace control_link_adapters
 				}
 				return TransmitResult::kSent;
 			}
-			if (result == -1 && errno == EINTR)
+			if (result == -1 && write_errno == EINTR)
 			{
 				continue;
 			}
 			if (result == -1 &&
-				(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS))
+				(write_errno == EAGAIN || write_errno == EWOULDBLOCK || write_errno == ENOBUFS))
 			{
 				transmit_would_block_.fetch_add(1U, std::memory_order_relaxed);
 				report_error(SocketCanIoError{
 					SocketCanIoErrorKind::kCanWrite,
-					errno,
+					write_errno,
 					false});
 				return TransmitResult::kRetry;
 			}
@@ -641,11 +688,17 @@ namespace control_link_adapters
 			report_error(SocketCanIoError{
 				result == -1 ? SocketCanIoErrorKind::kCanWrite :
 					SocketCanIoErrorKind::kShortCanWrite,
-				result == -1 ? errno : 0,
+				result == -1 ? write_errno : 0,
 				true,
 				result == -1 ? std::string{} : "short CAN frame write"});
 			return TransmitResult::kFatal;
 		}
+		return TransmitResult::kRetry;
+	}
+
+	void SocketCanTransport::trace(SocketCanTrace event) noexcept
+	{
+		if (trace_handler_) { try { trace_handler_(event); } catch (...) { /* 观测失败不改变控制决策。 */ } }
 	}
 
 	void SocketCanTransport::report_error(SocketCanIoError error) noexcept
@@ -672,7 +725,7 @@ namespace control_link_adapters
 		}
 
 		const std::uint64_t increment = 1U;
-		while (true)
+		for (int attempt = 0; attempt < 4; ++attempt)
 		{
 			const auto result = ::write(
 				event_fd_,
@@ -695,12 +748,16 @@ namespace control_link_adapters
 			wake_errors_.fetch_add(1U, std::memory_order_relaxed);
 			return;
 		}
+		// 持续 EINTR 时由有限 poll timeout 兜底，owner 不能无限卡在 wake。
+		wake_errors_.fetch_add(1U, std::memory_order_relaxed);
 	}
 
 	void SocketCanTransport::close_descriptors_locked() noexcept
 	{
 		close_descriptor(event_fd_);
 		event_fd_ = -1;
+		close_descriptor(timer_fd_);
+		timer_fd_ = -1;
 		close_descriptor(can_fd_);
 		can_fd_ = -1;
 	}

@@ -19,6 +19,9 @@ namespace control_link_adapters
 		std::uint32_t receive_can_id;
 		std::chrono::milliseconds poll_timeout;
 		std::chrono::milliseconds transmit_period;
+		// 这是 I/O 公平性预算，不改变命令时效或 Contract 恢复阈值。
+		std::size_t receive_frame_budget{64};
+		std::chrono::microseconds receive_time_budget{2000};
 	};
 
 	enum class SocketCanIoErrorKind : std::uint8_t
@@ -32,6 +35,7 @@ namespace control_link_adapters
 		kReceiveHandler,
 		kTransmitHandler,
 		kTransmitSuccessHandler,
+		kTimerRead,
 	};
 
 	struct SocketCanIoError final
@@ -54,6 +58,20 @@ namespace control_link_adapters
 		std::uint64_t write_errors;
 		std::uint64_t wake_errors;
 		std::uint64_t receive_handler_errors;
+		std::uint64_t receive_budget_yields;
+		std::uint64_t missed_transmit_periods;
+	};
+
+	enum class SocketCanTracePhase : std::uint8_t
+	{
+		kTick, kWrite, kReceive, kStop, kExit, kJoined, kClosed
+	};
+	struct SocketCanTrace final
+	{
+		SocketCanTracePhase phase;
+		std::uint64_t begin_ns, end_ns, scheduled_ns;
+		std::int64_t result, value;
+		std::uint64_t frame_id{0};
 	};
 
 	// SocketCAN fd、eventfd 与 I/O thread 的唯一 owner
@@ -68,6 +86,7 @@ namespace control_link_adapters
 		using TransmitHandler = std::function<std::optional<CanFrame>(
 			std::chrono::steady_clock::time_point)>;
 		using TransmitSuccessHandler = std::function<void(const CanFrame &)>;
+		using TraceHandler = std::function<void(const SocketCanTrace &)>;
 
 		explicit SocketCanTransport(SocketCanTransportConfig config);
 		~SocketCanTransport();
@@ -84,7 +103,8 @@ namespace control_link_adapters
 			ReceiveHandler receive_handler,
 			ErrorHandler error_handler,
 			TransmitHandler transmit_handler = {},
-			TransmitSuccessHandler transmit_success_handler = {});
+			TransmitSuccessHandler transmit_success_handler = {},
+			TraceHandler trace_handler = {});
 
 		// 只唤醒 poll，普通 command 仍在下一个固定 TX 周期由 handler 生成
 		void notify() noexcept;
@@ -107,7 +127,8 @@ namespace control_link_adapters
 
 		void run() noexcept;
 		[[nodiscard]] bool drain_eventfd() noexcept;
-		[[nodiscard]] bool receive_available_frames() noexcept;
+		[[nodiscard]] bool receive_available_frames(std::chrono::steady_clock::time_point deadline) noexcept;
+		void trace(SocketCanTrace event) noexcept;
 		[[nodiscard]] TransmitResult transmit_frame(
 			const CanFrame &frame) noexcept;
 		void report_error(SocketCanIoError error) noexcept;
@@ -117,11 +138,13 @@ namespace control_link_adapters
 		SocketCanTransportConfig config_;
 		int can_fd_{-1};
 		int event_fd_{-1};
+		int timer_fd_{-1};
 		std::thread worker_;
 		ReceiveHandler receive_handler_;
 		ErrorHandler error_handler_;
 		TransmitHandler transmit_handler_;
 		TransmitSuccessHandler transmit_success_handler_;
+		TraceHandler trace_handler_;
 
 		mutable std::mutex lifecycle_mutex_;
 		std::mutex stop_mutex_;
@@ -140,5 +163,7 @@ namespace control_link_adapters
 		std::atomic<std::uint64_t> write_errors_{0U};
 		std::atomic<std::uint64_t> wake_errors_{0U};
 		std::atomic<std::uint64_t> receive_handler_errors_{0U};
+		std::atomic<std::uint64_t> receive_budget_yields_{0U};
+		std::atomic<std::uint64_t> missed_transmit_periods_{0U};
 	};
 } // namespace control_link_adapters

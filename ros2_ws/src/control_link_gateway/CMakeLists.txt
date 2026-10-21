@@ -23,6 +23,7 @@ find_package(nlohmann_json REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(rmw REQUIRED)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/../../../runtime_timing ${CMAKE_CURRENT_BINARY_DIR}/runtime_timing)
 
 execute_process(
 	COMMAND git rev-parse --verify HEAD
@@ -73,7 +74,7 @@ add_library(${PROJECT_NAME} SHARED
 	src/vehicle_state_validator.cpp
 	src/vehicle_state_runtime.cpp
 )
-target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json)
+target_link_libraries(${PROJECT_NAME} PRIVATE nlohmann_json::nlohmann_json control_link_runtime_timing)
 
 add_executable(${PROJECT_NAME}_node
 	src/control_gateway_main.cpp

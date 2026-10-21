@@ -35,6 +35,8 @@
 #include "rclcpp/callback_group.hpp"
 #include "rclcpp_lifecycle/lifecycle_publisher.hpp"
 
+namespace control_link_timing { class Recorder; }
+
 namespace control_link_gateway
 {
 	// Lifecycle 只管理配置与 ROS 资源，运行期控制状态由 GatewayStateMachine 独立管理
@@ -105,6 +107,8 @@ namespace control_link_gateway
 
 		// 所有组件共享同一份不可变 Contract 快照，cleanup 按依赖的逆序释放
 		control_link_contract::ContractBundlePtr contract_bundle_;
+		// 生命周期结束且 executor 回调收束后，最后一个 owner 排空后台采样。
+		std::shared_ptr<control_link_timing::Recorder> runtime_timing_;
 		std::unique_ptr<control_link_contract::QosFactory> qos_factory_;
 		// DecisionEngine 是 live 与 offline replay 共用的唯一确定性决策 owner
 		std::unique_ptr<DecisionEngine> decision_engine_;

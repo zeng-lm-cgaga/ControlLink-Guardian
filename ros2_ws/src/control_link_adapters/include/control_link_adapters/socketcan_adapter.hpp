@@ -76,6 +76,8 @@ namespace control_link_adapters
 		std::unique_ptr<CanonicalInputGuard> canonical_guard_;
 		std::unique_ptr<LocalWatchdog> local_watchdog_;
 		std::unique_ptr<CanonicalEndpointTracker> canonical_endpoint_tracker_;
+		struct TimingState;
+		std::unique_ptr<TimingState> timing_;
 		std::unique_ptr<SocketCanTransport> transport_;
 
 		rclcpp::Subscription<ControlCommand>::SharedPtr canonical_subscription_;

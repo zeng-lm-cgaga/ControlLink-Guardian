@@ -260,6 +260,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 				**common_parameters,
 				"command_channel": command_channel,
 				"feedback_channel": feedback_channel,
+				"wait_mode": LaunchConfiguration("edge_wait_mode"),
 				"source_id": "planning",
 			}],
 		)
@@ -272,6 +273,7 @@ def _launch_adas_vcan(context, *args, **kwargs):
 				edge_supervisor_path,
 				"--command-channel", command_channel,
 				"--feedback-channel", feedback_channel,
+				"--wait-mode", LaunchConfiguration("edge_wait_mode"),
 				"--client", edge_client_path,
 				"--linear-velocity-mps",
 				str(edge_linear_velocity_mps),
@@ -426,6 +428,10 @@ def generate_launch_description():
 			"edge_command_channel",
 			default_value="control_link_planning_command",
 			description="EdgeRuntime command channel name for planning transport",
+		),
+		DeclareLaunchArgument(
+			"edge_wait_mode", default_value="futex", choices=["futex", "eventfd"],
+			description="Edge SPSC waiting mode for both command and feedback; eventfd requires SDK capability",
 		),
 		DeclareLaunchArgument(
 			"edge_feedback_channel",

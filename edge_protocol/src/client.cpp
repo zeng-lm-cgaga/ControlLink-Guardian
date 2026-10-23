@@ -129,6 +129,7 @@ namespace control_link_edge_client
 			: options_(std::move(options)),
 				command_producer_(std::move(command_producer)),
 				feedback_consumer_(std::move(feedback_consumer))
+				, feedback_wait_(options_.wait_mode)
 		{
 			status_state_ = ClientState::kWaitingForSession;
 		}
@@ -142,6 +143,7 @@ namespace control_link_edge_client
 					edge_runtime::ErrorCode::kStaleHandle,
 					"Client::read_feedback", "client closed");
 			}
+			const auto read_deadline = std::chrono::steady_clock::now() + nonnegative_timeout(timeout);
 
 			if (!feedback_consumer_)
 			{
@@ -167,9 +169,8 @@ namespace control_link_edge_client
 				}
 			}
 
-			auto result = timeout.count() > 0
-				? feedback_consumer_->wait_latest(nonnegative_timeout(timeout))
-				: feedback_consumer_->try_read_latest();
+			auto result = feedback_wait_.read(*feedback_consumer_, nonnegative_timeout(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(read_deadline - std::chrono::steady_clock::now())));
 			if (!result)
 			{
 				if (should_reconnect(result.error().code))
@@ -178,7 +179,8 @@ namespace control_link_edge_client
 					if (now >= next_reconnect_)
 					{
 						next_reconnect_ = now + options_.reconnect_period;
-					feedback_consumer_.reset();
+						feedback_wait_.reset();
+						feedback_consumer_.reset();
 					auto reopened = reopen_feedback_consumer();
 					if (!reopened) return reopened.error();
 						status_state_ = ClientState::kTransportLost;
@@ -193,7 +195,8 @@ namespace control_link_edge_client
 					}
 				}
 				else if (result.error().code != edge_runtime::ErrorCode::kTimeout &&
-					result.error().code != edge_runtime::ErrorCode::kNoNewSample)
+					result.error().code != edge_runtime::ErrorCode::kNoNewSample &&
+					result.error().code != edge_runtime::ErrorCode::kDataStale)
 				{
 					status_state_ = ClientState::kProtocolError;
 				}
@@ -236,11 +239,12 @@ namespace control_link_edge_client
 				now_boot_ns, freshness_limit);
 			session_.feedback_fresh = latest_feedback_->fresh;
 			session_.ready =
-				(sample.value.validity_flags & control_link_edge_protocol::kSessionReady) != 0U;
-			session_.transport_allowed = transport_allows_commands(sample.value);
-			status_state_ = !session_.ready || !session_.transport_allowed
+				(sample.value.validity_flags & control_link_edge_protocol::kSessionReady) != 0U &&
+				command_notification_errno_ == 0;
+			session_.transport_allowed = transport_allows_commands(sample.value) && command_notification_errno_ == 0;
+			status_state_ = command_notification_errno_ != 0 ? ClientState::kTransportLost : (!session_.ready || !session_.transport_allowed
 				? ClientState::kWaitingForSession
-				: (latest_feedback_->fresh ? ClientState::kReady : ClientState::kFeedbackStale);
+				: (latest_feedback_->fresh ? ClientState::kReady : ClientState::kFeedbackStale));
 			return latest_feedback_.value();
 		}
 
@@ -252,6 +256,10 @@ namespace control_link_edge_client
 					edge_runtime::ErrorCode::kStaleHandle,
 					"Client::submit", "client closed");
 			}
+			// 已提交样本不重发；通知服务故障须由 owner close/open，反馈不能解除锁存。
+			if (command_notification_errno_ != 0)
+				return client_error(edge_runtime::ErrorCode::kTransportFailed,
+					"Client::submit", "notification failure latched; close/open required");
 			if (target.session != session_.id)
 			{
 				return client_error(
@@ -325,6 +333,12 @@ namespace control_link_edge_client
 				return published.error();
 			}
 			last_submitted_sequence_ = target.command_sequence;
+			command_notification_errno_ = notification_error(*command_producer_, options_.wait_mode);
+			if (command_notification_errno_ != 0)
+			{
+				invalidate_session();
+				status_state_ = ClientState::kTransportLost;
+			}
 			return SubmissionReceipt{target.command_sequence, published.value()};
 		}
 
@@ -352,6 +366,9 @@ namespace control_link_edge_client
 			result.state = status_state_;
 			result.session = session_;
 			result.feedback_seen = feedback_seen_;
+			result.notification_registrations = feedback_wait_.registrations();
+			result.notification_registration_failures = feedback_wait_.registration_failures();
+			result.command_notification_errno = command_notification_errno_;
 			result.last_feedback_sequence = last_feedback_sequence_;
 			result.last_feedback_publish_boot_ns = last_feedback_publish_boot_ns_;
 			result.last_feedback_receive_boot_ns = last_feedback_receive_boot_ns_;
@@ -412,6 +429,7 @@ namespace control_link_edge_client
 		edge_runtime::Result<void> close() noexcept
 		{
 			if (status_state_ == ClientState::kClosed) return edge_runtime::Result<void>::ok();
+			feedback_wait_.reset();
 			feedback_consumer_.reset();
 			edge_runtime::Result<void> removed = edge_runtime::Result<void>::ok();
 			if (command_producer_)
@@ -428,6 +446,7 @@ namespace control_link_edge_client
 		{
 			// 先释放旧映射再按名称重开，避免把同一进程的旧 consumer owner
 			// 传给 EdgeRuntime::Consumer::reconnect；新 producer 可能已经替换实例。
+			feedback_wait_.reset();
 			feedback_consumer_.reset();
 			auto reopened = FeedbackConsumer::open(
 				feedback_channel_options(), edge_runtime::feedback_schema());
@@ -471,11 +490,7 @@ namespace control_link_edge_client
 
 		edge_runtime::ChannelOptions feedback_channel_options() const
 		{
-			edge_runtime::ChannelOptions options;
-			options.name = options_.feedback_channel;
-			options.stale_timeout = 500ms;
-			options.reconnect_timeout = 500ms;
-			return options;
+			return channel_options(options_.feedback_channel);
 		}
 
 		void invalidate_session() noexcept
@@ -517,6 +532,8 @@ namespace control_link_edge_client
 		ClientOptions options_;
 		std::unique_ptr<CommandProducer> command_producer_;
 		std::unique_ptr<FeedbackConsumer> feedback_consumer_;
+		ChannelWait<FeedbackFrame> feedback_wait_;
+		int command_notification_errno_{0};
 		SessionSnapshot session_{};
 		std::optional<FeedbackSnapshot> latest_feedback_;
 		ClientState status_state_{ClientState::kOpening};
@@ -539,20 +556,18 @@ namespace control_link_edge_client
 				edge_runtime::ErrorCode::kInvalidOptions,
 				"Client::open", "invalid channel or timeout options");
 		}
+		if (!wait_mode_supported(options.wait_mode))
+			return client_error(edge_runtime::ErrorCode::kUnsupportedPlatform, "Client::open", "eventfd unsupported by selected SDK");
 
-		edge_runtime::ChannelOptions command_options;
-		command_options.name = options.command_channel;
-		command_options.stale_timeout = 500ms;
-		command_options.reconnect_timeout = 500ms;
+		auto command_options = channel_options(options.command_channel);
 		command_options.heartbeat_interval = 100ms;
 		auto producer = CommandProducer::create(
 			command_options, edge_runtime::command_schema());
 		if (!producer) return producer.error();
+		auto enabled = enable_notifications(producer.value(), options.wait_mode);
+		if (!enabled) { (void)producer.value().remove_if_owner(); return enabled.error(); }
 
-		edge_runtime::ChannelOptions feedback_options;
-		feedback_options.name = options.feedback_channel;
-		feedback_options.stale_timeout = 500ms;
-		feedback_options.reconnect_timeout = 500ms;
+		auto feedback_options = channel_options(options.feedback_channel);
 		const auto deadline = std::chrono::steady_clock::now() + options.feedback_open_timeout;
 		while (true)
 		{

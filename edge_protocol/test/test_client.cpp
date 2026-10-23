@@ -90,15 +90,19 @@ namespace
 	}
 }
 
-int main()
+int main(int argc, char **argv)
 {
+	control_link_edge_client::WaitMode mode = control_link_edge_client::WaitMode::kFutex;
+	if (argc > 1 && !control_link_edge_client::parse_wait_mode(argv[1], mode)) return 2;
 	const auto suffix = std::to_string(static_cast<unsigned long long>(::getpid()));
 	const std::string command_name = "control_link_a5_client_command_" + suffix;
 	const std::string feedback_name = "control_link_a5_client_feedback_" + suffix;
 
 	edge_runtime::ChannelOptions feedback_options;
 	feedback_options.name = feedback_name;
+#if !CONTROL_LINK_EDGE_DEFAULT_STALE_ONLY
 	feedback_options.stale_timeout = std::chrono::milliseconds(500);
+#endif
 	auto feedback_created = FeedbackProducer::create(
 		feedback_options, edge_runtime::feedback_schema());
 	if (!feedback_created)
@@ -111,6 +115,7 @@ int main()
 	}
 	auto feedback_producer = std::make_unique<FeedbackProducer>(
 		std::move(feedback_created.value()));
+	if (!check(static_cast<bool>(control_link_edge_client::enable_notifications(*feedback_producer, mode)), "feedback enable failed")) return 1;
 
 	ClientOptions options;
 	options.command_channel = command_name;
@@ -118,6 +123,7 @@ int main()
 	options.feedback_open_timeout = std::chrono::seconds(2);
 	options.reconnect_period = std::chrono::milliseconds(20);
 	options.feedback_freshness = std::chrono::milliseconds(100);
+	options.wait_mode = mode;
 	auto opened = Client::open(options);
 	if (!check(static_cast<bool>(opened), "client open failed"))
 	{
@@ -128,7 +134,9 @@ int main()
 
 	edge_runtime::ChannelOptions command_options;
 	command_options.name = command_name;
+#if !CONTROL_LINK_EDGE_DEFAULT_STALE_ONLY
 	command_options.stale_timeout = std::chrono::milliseconds(500);
+#endif
 	auto command_opened = CommandConsumer::open(
 		command_options, edge_runtime::command_schema());
 	if (!check(static_cast<bool>(command_opened), "command consumer open failed"))
@@ -406,6 +414,7 @@ int main()
 	}
 	feedback_producer = std::make_unique<FeedbackProducer>(
 		std::move(replacement_created.value()));
+	if (!check(static_cast<bool>(control_link_edge_client::enable_notifications(*feedback_producer, mode)), "replacement feedback enable failed")) return 1;
 	const auto third_token = make_token(0x91U);
 	const auto third_boot_ns = control_link_edge_protocol::boottime_now_ns();
 	if (!check(static_cast<bool>(feedback_producer->publish(

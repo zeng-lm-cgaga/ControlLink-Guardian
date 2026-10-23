@@ -16,6 +16,9 @@
 #include <utility>
 #include <variant>
 #include <vector>
+#include <sys/eventfd.h>
+#include <unistd.h>
+#include "control_link_edge_protocol/channel_wait.hpp"
 
 #include "builtin_interfaces/msg/time.hpp"
 #include "control_link_adapters/edge_command_wait_policy.hpp"
@@ -45,6 +48,28 @@ namespace
 	using GatewayState = control_link_interfaces::msg::GatewayState;
 	using SourceStatus = control_link_interfaces::msg::SourceStatus;
 	using VehicleState = control_link_interfaces::msg::VehicleState;
+	using control_link_edge_client::WaitMode;
+
+	// 此 FD 只由 ControlLink 唤醒本地 worker；与 SDK 的共享状态通知分别持有。
+	class WorkerWake final
+	{
+	public:
+		WorkerWake() : fd_(::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK))
+		{
+			if (fd_ < 0) throw std::runtime_error("cannot create Edge worker stop eventfd");
+		}
+		~WorkerWake() { ::close(fd_); }
+		WorkerWake(const WorkerWake &) = delete;
+		WorkerWake &operator=(const WorkerWake &) = delete;
+		int get() const noexcept { return fd_; }
+		void wake() noexcept
+		{
+			const std::uint64_t value = 1;
+			while (::write(fd_, &value, sizeof(value)) < 0 && errno == EINTR) {}
+		}
+	private:
+		int fd_;
+	};
 
 	struct TransportIdentity
 	{
@@ -162,12 +187,17 @@ namespace
 			declare_parameter<std::string>("command_channel", "control_link_planning_command");
 			declare_parameter<std::string>("feedback_channel", "control_link_planning_feedback");
 			declare_parameter<std::string>("source_id", "planning");
+			declare_parameter<std::string>("wait_mode", "futex");
 			declare_parameter<std::int64_t>("graph_admission_timeout_ms", 30'000);
 			declare_parameter<std::int64_t>("graph_admission_quiet_ms", 250);
 			declare_parameter<std::int64_t>("graph_admission_poll_ms", 50);
 			declare_parameter<std::int64_t>("gateway_readiness_timeout_ms", 1'000);
 
 			load_configuration();
+			if (!control_link_edge_client::parse_wait_mode(get_parameter("wait_mode").as_string(), wait_mode_) ||
+				!control_link_edge_client::wait_mode_supported(wait_mode_))
+				throw std::runtime_error("Edge wait_mode must be futex or a supported eventfd mode");
+			command_wait_ = control_link_edge_client::ChannelWait<CommandFrame>(wait_mode_);
 			if (!control_link_edge_protocol::generate_session_token(&session_token_))
 			{
 				throw std::runtime_error(
@@ -214,6 +244,7 @@ namespace
 			}
 			publish_timer_.reset();
 			stop_condition_.notify_all();
+			stop_wake_.wake();
 			if (worker_.joinable()) worker_.join();
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
@@ -410,19 +441,14 @@ namespace
 
 		edge_runtime::ChannelOptions command_channel_options() const
 		{
-			edge_runtime::ChannelOptions options;
-			options.name = command_channel_;
-			options.stale_timeout = 500ms;
-			options.reconnect_timeout = 500ms;
+			auto options = control_link_edge_client::channel_options(command_channel_);
+			options.reconnect_timeout = 20ms;
 			return options;
 		}
 
 		edge_runtime::ChannelOptions feedback_channel_options() const
 		{
-			edge_runtime::ChannelOptions options;
-			options.name = feedback_channel_;
-			options.stale_timeout = 500ms;
-			options.reconnect_timeout = 500ms;
+			auto options = control_link_edge_client::channel_options(feedback_channel_);
 			options.heartbeat_interval = 100ms;
 			return options;
 		}
@@ -756,6 +782,14 @@ namespace
 			}
 			feedback_producer_ = std::make_unique<FeedbackProducer>(
 				std::move(created.value()));
+			auto enabled = control_link_edge_client::enable_notifications(*feedback_producer_, wait_mode_);
+			if (!enabled)
+			{
+				log_edge_error("feedback notification enable", enabled.error());
+				(void)feedback_producer_->remove_if_owner();
+				feedback_producer_.reset();
+				return;
+			}
 			RCLCPP_INFO(get_logger(), "Edge feedback producer is ready");
 		}
 
@@ -783,23 +817,10 @@ namespace
 		bool reconnect_command_consumer()
 		{
 			if (command_consumer_ == nullptr) return false;
-			auto reconnected = command_consumer_->reconnect();
-			if (!reconnected)
-			{
-				log_edge_error("command consumer reconnect", reconnected.error());
-				return false;
-			}
-			{
-				std::lock_guard<std::mutex> lock(mutex_);
-				reset_transport_identity_locked();
-				if (!begin_new_session_locked(control_link_edge_protocol::boottime_now_ns()))
-				{
-					RCLCPP_ERROR(get_logger(), "new Edge session token generation failed");
-				}
-			}
-		RCLCPP_INFO(
-			get_logger(), "Edge command consumer reconnected; old session is invalid");
-			return true;
+			// poll 的 watch 集每轮重建；此处不再持有旧 FD，再释放 notification 和 consumer。
+			command_wait_.reset();
+			command_consumer_.reset();
+			return try_open_command_consumer();
 		}
 
 		bool handle_command_error(const edge_runtime::Error &error)
@@ -1116,6 +1137,15 @@ namespace
 				pending_command_.reset();
 				forwarding_ = false;
 			}
+			const int diagnostic = control_link_edge_client::notification_error(*feedback_producer_, wait_mode_);
+			if (diagnostic != 0)
+			{
+				RCLCPP_ERROR(get_logger(), "Edge feedback committed but notification failed: errno=%d; no retry of this sample", diagnostic);
+				std::lock_guard<std::mutex> lock(mutex_);
+				fatal_error_ = true;
+				pending_command_.reset();
+				forwarding_ = false;
+			}
 		}
 
 		void edge_worker_loop()
@@ -1126,6 +1156,8 @@ namespace
 			auto next_command_open = next_feedback;
 			auto command_open_backoff = 20ms;
 			auto command_reconnect_backoff = 100ms;
+			auto next_notification_retry = next_feedback;
+			RCLCPP_INFO(get_logger(), "Edge wait_mode=%s registration_budget_ms=20", wait_mode_ == WaitMode::kEventFd ? "eventfd" : "futex");
 			while (!stopping())
 			{
 				try_create_feedback_producer();
@@ -1147,7 +1179,7 @@ namespace
 					}
 				}
 				const auto before_command_wait = std::chrono::steady_clock::now();
-				if (command_consumer_ != nullptr)
+				if (command_consumer_ != nullptr && wait_mode_ == WaitMode::kFutex)
 				{
 					control_link_adapters::poll_edge_command_consumer(
 						*command_consumer_, before_command_wait,
@@ -1167,6 +1199,48 @@ namespace
 					auto heartbeat = feedback_producer_->heartbeat();
 					if (!heartbeat) log_edge_error("feedback heartbeat", heartbeat.error());
 					next_heartbeat = now + 100ms;
+				}
+				if (wait_mode_ == WaitMode::kEventFd)
+				{
+					if (!feedback_producer_)
+					{
+						(void)control_link_edge_client::wait_edge_fds(-1, stop_wake_.get(), now + 100ms);
+						continue;
+					}
+					if (command_consumer_ && now >= next_notification_retry && !stopping())
+					{
+						const auto deadline = std::min(next_feedback, next_heartbeat);
+						const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
+						auto registered = command_wait_.ensure(*command_consumer_, budget);
+						if (!registered)
+						{
+							log_edge_error("command notification register", registered.error());
+							auto last = command_wait_.read(*command_consumer_, 0ns);
+							if (last) process_sample(last.value());
+							if (!control_link_adapters::is_command_wait_without_new_sample(registered.error().code))
+								(void)handle_command_error(registered.error());
+							next_notification_retry = std::chrono::steady_clock::now() + 100ms;
+						}
+						else
+						{
+							auto sample = command_wait_.read(*command_consumer_, 0ns);
+							if (sample) process_sample(sample.value());
+							else if (!control_link_adapters::is_command_wait_without_new_sample(sample.error().code))
+							{
+								(void)handle_command_error(sample.error());
+								next_notification_retry = std::chrono::steady_clock::now() + 100ms;
+							}
+						}
+					}
+					const auto after_read = std::chrono::steady_clock::now();
+					auto wake_at = std::min(next_feedback, next_heartbeat);
+					if (!command_consumer_) wake_at = std::min(wake_at, next_command_open);
+					else if (next_notification_retry > after_read) wake_at = std::min(wake_at, next_notification_retry);
+					const int notification = command_consumer_ && after_read >= next_notification_retry ? command_wait_.native_handle() : -1;
+					auto waited = control_link_edge_client::wait_edge_fds(notification, stop_wake_.get(), wake_at);
+					if (!waited) { log_edge_error("command notification poll", waited.error()); command_wait_.reset(); next_notification_retry = after_read + 100ms; }
+					else if (waited.value()) break;
+					continue;
 				}
 				if (feedback_producer_ == nullptr)
 				{
@@ -1188,6 +1262,8 @@ namespace
 					log_edge_error("feedback producer cleanup", removed.error());
 				}
 			}
+			RCLCPP_INFO(get_logger(), "Edge notification registrations=%lu failures=%lu; worker stopped", command_wait_.registrations(), command_wait_.registration_failures());
+			command_wait_.reset();
 			command_consumer_.reset();
 			feedback_producer_.reset();
 		}
@@ -1219,6 +1295,9 @@ namespace
 
 		std::unique_ptr<CommandConsumer> command_consumer_;
 		std::unique_ptr<FeedbackProducer> feedback_producer_;
+		WaitMode wait_mode_{WaitMode::kFutex};
+		control_link_edge_client::ChannelWait<CommandFrame> command_wait_;
+		WorkerWake stop_wake_;
 		std::thread worker_;
 		std::mutex mutex_;
 		std::condition_variable stop_condition_;

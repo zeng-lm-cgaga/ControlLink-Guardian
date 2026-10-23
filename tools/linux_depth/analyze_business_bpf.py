@@ -140,6 +140,7 @@ def read_case(case):
 
 def compare_cases(cases):
     before, after = cases['off'], cases['on']
+    business_roles = ('gateway', 'can_adapter', 'planning_ingress', 'simulator', 'idle_teleop', 'fixture_observer')
     for key in ('config_sha256', 'driver_sha256', 'clk_tck', 'vcpus', 'kernel'):
         if before['events'][key] != after['events'][key]:
             raise ValueError('off/on environment/configuration mismatch: ' + key)
@@ -149,7 +150,7 @@ def compare_cases(cases):
     for key in ('ROS_DOMAIN_ID', 'RMW_IMPLEMENTATION', 'RMW_FASTRTPS_USE_QOS_FROM_XML', 'FASTRTPS_DEFAULT_PROFILES_FILE'):
         if before['events']['environment'].get(key) != after['events']['environment'].get(key):
             raise ValueError('off/on ROS/RMW configuration mismatch: ' + key)
-    for role in ('gateway', 'can_adapter', 'planning_ingress', 'simulator', 'idle_teleop', 'fixture_observer'):
+    for role in business_roles:
         if before['events']['identities'][role]['mapped_sha256'] != after['events']['identities'][role]['mapped_sha256']:
             raise ValueError('off/on actually loaded code mismatch: ' + role)
     for case in cases.values():
@@ -158,10 +159,12 @@ def compare_cases(cases):
         if case['events']['arguments']['cpu_load'] or case['events']['arguments']['pause_source']:
             raise ValueError('not the normal fixed workload')
     delta = {}
-    for role in before['summary']['resource']:
-        original, traced = before['summary']['resource'][role], after['summary']['resource'][role]
-        if original['cpu_mean_one_core_pct'] is None or traced['cpu_mean_one_core_pct'] is None:
-            raise ValueError('insufficient process resource intervals')
+    for role in business_roles:
+        original = before['summary']['resource'].get(role)
+        traced = after['summary']['resource'].get(role)
+        if (not original or not traced or original['samples'] < 2 or traced['samples'] < 2 or
+                original['cpu_mean_one_core_pct'] is None or traced['cpu_mean_one_core_pct'] is None):
+            raise ValueError('insufficient process resource intervals: ' + role)
         delta[role] = {'cpu_percentage_point_delta': traced['cpu_mean_one_core_pct'] - original['cpu_mean_one_core_pct'],
                        'rss_mean_kib_delta': traced['rss_kib']['mean'] - original['rss_kib']['mean']}
     phase_deltas = {}
@@ -171,7 +174,12 @@ def compare_cases(cases):
             phase_deltas[phase] = {'off_samples': original['samples'], 'on_samples': traced['samples'],
                                   'mean_ms_delta': traced['mean'] - original['mean'],
                                   'p99_ms_delta': traced['p99'] - original['p99'] if min(original['samples'], traced['samples']) >= 100 else None}
+    excluded = {role: {'off_samples': before['summary']['resource'].get(role, {}).get('samples', 0),
+                       'on_samples': after['summary']['resource'].get(role, {}).get('samples', 0),
+                       'reason': 'not a fixed-window business/observer role'}
+                for role in sorted((set(before['summary']['resource']) | set(after['summary']['resource'])) - set(business_roles))}
     return {'business_process_deltas': delta, 'latency_observation_deltas': phase_deltas,
+            'excluded_resource_roles': excluded,
             'off_tracer': 'not started; zero BPF loader processes',
             'limits': 'one nonrandomized short VM pair; no stable improvement/overhead percentage claim; '
             'CPU delta(utime+stime)/CLK_TCK/monotonic, 100% is one logical CPU; RSS sampled resident KiB, not system peak; '

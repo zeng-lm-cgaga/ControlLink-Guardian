@@ -102,7 +102,8 @@ class BusinessImplementationTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'instance'):
             resource_metrics(rows, 0, 4000000000, 100)
 
-    def test_pair_checks_loaded_bytes_not_ldd_aslr_addresses(self):
+    @staticmethod
+    def pair():
         roles = ('gateway', 'can_adapter', 'planning_ingress', 'simulator', 'idle_teleop', 'fixture_observer')
         events = {key: {} for key in ('config_sha256', 'kernel', 'environment')}
         events.update(driver_sha256='same', clk_tck=100, vcpus=8,
@@ -111,13 +112,38 @@ class BusinessImplementationTest(unittest.TestCase):
                       arguments={'timing': True, 'cpu_load': False, 'pause_source': False},
                       window={'duration_s': 20, 'warmup_s': 10})
         case = {'events': events, 'summary': {'latencies_ms': {}, 'resource': {
-            'gateway': {'cpu_mean_one_core_pct': 2, 'rss_kib': {'mean': 100}}}}}
-        cases = {'off': case, 'on': copy.deepcopy(case)}
+            role: {'samples': 2, 'cpu_mean_one_core_pct': 2, 'rss_kib': {'mean': 100}} for role in roles}}}
+        return {'off': case, 'on': copy.deepcopy(case)}
+
+    def test_pair_checks_loaded_bytes_not_ldd_aslr_addresses(self):
+        cases = self.pair()
         cases['on']['events']['preflight']['gateway']['ldd_r'] = 'address2'
         self.assertEqual(compare_cases(cases)['business_process_deltas']['gateway']['cpu_percentage_point_delta'], 0)
         cases['on']['events']['identities']['gateway']['mapped_sha256']['/lib/example.so'] = 'changed'
         with self.assertRaisesRegex(ValueError, 'loaded code'):
             compare_cases(cases)
+
+    def test_pair_excludes_startup_only_activator(self):
+        cases = self.pair()
+        for case in cases.values():
+            case['summary']['resource']['activator'] = {'samples': 0, 'cpu_mean_one_core_pct': None}
+        result = compare_cases(cases)
+        self.assertNotIn('activator', result['business_process_deltas'])
+        self.assertEqual(result['excluded_resource_roles']['activator']['off_samples'], 0)
+
+    def test_pair_requires_all_business_resource_intervals(self):
+        for change in ('missing', 'one_sample', 'no_cpu'):
+            with self.subTest(change=change):
+                cases = self.pair()
+                rows = cases['on']['summary']['resource']
+                if change == 'missing':
+                    del rows['gateway']
+                elif change == 'one_sample':
+                    rows['gateway']['samples'] = 1
+                else:
+                    rows['gateway']['cpu_mean_one_core_pct'] = None
+                with self.assertRaisesRegex(ValueError, 'insufficient.*gateway'):
+                    compare_cases(cases)
 
 
 if __name__ == '__main__':

@@ -31,6 +31,7 @@ namespace
 	{
 		std::string command_channel;
 		std::string feedback_channel;
+		control_link_edge_client::WaitMode wait_mode{control_link_edge_client::WaitMode::kFutex};
 		double linear_velocity_mps{0.25};
 		double angular_velocity_radps{0.10};
 		std::uint64_t period_ms{50U};
@@ -43,7 +44,7 @@ namespace
 			<< " --command-channel NAME --feedback-channel NAME"
 			<< " [--linear-velocity-mps VALUE]"
 			<< " [--angular-velocity-radps VALUE]"
-			<< " [--period-ms VALUE] [--duration-ms VALUE]\n";
+			<< " [--period-ms VALUE] [--duration-ms VALUE] [--wait-mode futex|eventfd]\n";
 	}
 
 	bool parse_unsigned(const char *text, std::uint64_t *value)
@@ -97,6 +98,10 @@ namespace
 			else if (argument == "--angular-velocity-radps")
 			{
 				if (!parse_double(value, &options->angular_velocity_radps)) return false;
+			}
+			else if (argument == "--wait-mode")
+			{
+				if (!control_link_edge_client::parse_wait_mode(value, options->wait_mode)) return false;
 			}
 			else if (argument == "--period-ms")
 			{
@@ -187,6 +192,7 @@ int main(int argc, char **argv)
 	client_options.feedback_open_timeout = std::chrono::seconds(30);
 	client_options.reconnect_period = std::chrono::milliseconds(100);
 	client_options.feedback_freshness = std::chrono::milliseconds(500);
+	client_options.wait_mode = options.wait_mode;
 		auto opened = Client::open(client_options);
 	if (!opened)
 	{

@@ -14,6 +14,8 @@ import time
 import traceback
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / 'tools/edge_notification_evidence'))
+from scene_actions import EdgeActions
 sys.path[:0] = [str(ROOT / "tools/adas_ingress_evidence"), str(ROOT / "tools/someip_evidence")]
 from run_performance import proc_sample
 from performance_stats import target
@@ -72,6 +74,9 @@ def run(args):
     grpc_client = getattr(args, 'grpc_client', None)
     kill_adapter = getattr(args, 'kill_adapter', False)
     fatal_can = getattr(args, 'fatal_can', False)
+    edge_client = getattr(args, 'edge_client', None)
+    if edge_client and (grpc_client or control or supervisor_policy or fatal_can or args.pause_source):
+        raise ValueError('Edge notification acceptance is a separate fixed scenario, not the BPF/fatal matrix')
     if (control and (supervisor_policy or capture_config or grpc_client or kill_adapter or fatal_can)) or ((kill_adapter or fatal_can) and not supervisor_policy):
         raise ValueError('functional supervision scene is separate from the fixed BPF comparison')
     if fatal_can and kill_adapter:
@@ -91,6 +96,7 @@ def run(args):
     from rclpy.parameter import Parameter
 
     args.output.mkdir(parents=True, exist_ok=False)
+    edge = EdgeActions(args.output, args.edge_mode, args.edge_faults) if edge_client else None
     old = ROOT / "reports/valgrind-focused-20261013T142907Z-3199f9"
     config = ROOT / "config"
     contract = yaml.safe_load((config / "common/gateway_contract.yaml").read_bytes())
@@ -104,6 +110,9 @@ def run(args):
     if grpc_client:
         executables['planning_ingress'] = args.runtime / 'build/control_link_adapters/grpc_planning_bridge_node'
         executables['grpc_client'] = grpc_client
+    if edge:
+        executables['planning_ingress'] = args.runtime / 'build/control_link_adapters/edge_planning_bridge_node'
+        executables['edge_client'] = edge_client
     events = {"schema": 1, "uid": os.getuid(), "euid": os.geteuid(), "driver_sha256": digest(str(Path(__file__).resolve())), "arguments": vars(args).copy(), "commands": {}, "identities": {}, "errors": [],
               "environment": dict(os.environ), "kernel": list(os.uname()), "vcpus": os.cpu_count(),
               "meminfo": Path("/proc/meminfo").read_text(), "clk_tck": os.sysconf("SC_CLK_TCK"),
@@ -178,10 +187,10 @@ def run(args):
             return runtime_qos({"qos_profiles": contract["qos_profiles"], "state_topics": {
                 key: {"qos_profile": name} for key in ("gateway_state", "source_status", "vehicle_state")}})
 
-        publisher = None if grpc_client else node.create_publisher(ControlCommand, "/planning/control_cmd", qos(contract["input"]["qos_profile"]))
+        publisher = None if grpc_client or edge else node.create_publisher(ControlCommand, "/planning/control_cmd", qos(contract["input"]["qos_profile"]))
         subscriptions = [node.create_subscription(ControlCommand, contract["output"]["topic"],
             lambda message: callback("canonical", message), qos(contract["output"]["qos_profile"]))]
-        if grpc_client:
+        if grpc_client or edge:
             streams['ingress_observation'] = []
             subscriptions.append(node.create_subscription(ControlCommand, '/control_link/input/planning',
                 lambda message: callback('ingress_observation', message), qos(contract['input']['qos_profile'])))
@@ -209,6 +218,8 @@ def run(args):
                     command += ['-p', 'network_config_path:=' + str(config / 'adas/protocol_transports.yaml')]
                 else:
                     command += ["-p", "source_id:=" + ("planning" if role == "planning_ingress" else "teleop")]
+                if role == 'planning_ingress' and edge:
+                    command += edge.bridge_arguments()
             if args.timing and role in ("gateway", "can_adapter"):
                 command += ["-p", "runtime_timing_path:=" + str(args.output / (role + "-timing.csv"))]
             if capture_config and role == 'gateway':
@@ -230,6 +241,13 @@ def run(args):
                     if children[role].poll() is None:
                         raise
                 write_owners(control / 'owners.json', owner_registry)
+        if edge:
+            command = edge.client_command(edge_client)
+            events['commands']['edge_client'] = command
+            events['edge_mode'] = args.edge_mode
+            logs['edge_client'] = (args.output / 'edge_client.jsonl').open('xb')
+            children['edge_client'] = subprocess.Popen(command, stdout=logs['edge_client'], stderr=subprocess.STDOUT,
+                                                       start_new_session=True)
         if trace_gate:
             publish(control / 'owners-ready.json', {'registered_roles': sorted(owner_registry),
                     'driver': owner_registry['driver'], 'monotonic_ns': time.monotonic_ns()})
@@ -243,6 +261,8 @@ def run(args):
         next_supervision = started
         while not interrupted:
             now = time.monotonic_ns()
+            if edge:
+                edge.tick(window, events, children, logs, identity, stop_children)
             for role, child in children.items():
                 if (role == 'simulator' and fatal_can and 'fatal_can' in events
                         and 'link_up_ns' not in events['fatal_can']):
@@ -331,10 +351,13 @@ def run(args):
                     raise
                 append("can", {"monotonic_ns": mono, "wall_ns": wall, "frame": frame})
             if now >= next_sample:
-                if supervisor_policy:
+                if supervisor_policy or edge:
                     graph = {}
-                    for topic, query in (('/control_link/vehicle_state', node.get_publishers_info_by_topic),
-                                         ('/control_link/output/control_cmd', node.get_subscriptions_info_by_topic)):
+                    queries = [('/control_link/vehicle_state', node.get_publishers_info_by_topic),
+                               ('/control_link/output/control_cmd', node.get_subscriptions_info_by_topic)]
+                    if edge:
+                        queries.append(('/control_link/input/planning', node.get_publishers_info_by_topic))
+                    for topic, query in queries:
                         before = time.monotonic_ns()
                         endpoints = query(topic)
                         graph[topic] = {'begin_ns': before, 'end_ns': time.monotonic_ns(), 'endpoints': [
@@ -485,4 +508,7 @@ if __name__ == "__main__":
     parser.add_argument('--grpc-client', type=lambda path: Path(path).resolve())
     parser.add_argument('--kill-adapter', action='store_true')
     parser.add_argument('--fatal-can', action='store_true')
+    parser.add_argument('--edge-client', type=lambda path: Path(path).resolve())
+    parser.add_argument('--edge-mode', choices=('futex', 'eventfd'), default='futex')
+    parser.add_argument('--edge-faults', action='store_true')
     raise SystemExit(run(parser.parse_args()))

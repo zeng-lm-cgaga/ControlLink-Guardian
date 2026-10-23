@@ -136,6 +136,24 @@ ADAS Profile 可选使用 EdgeRuntime、SOME/IP 或 gRPC 将外部规划或轨�
 
 SDK 默认单 owner。每个目标必须绑定当前 session、由调用者提供 SYSTEM 时间戳和该 session 内递增的业务 sequence；session 变化时旧目标拒绝且不会自动重发或重新盖章。输入值是固定车体坐标中的 `linear_velocity_mps` 与 `angular_velocity_radps`，`NORMAL/HOLD` 映射沿用现有 Contract。它不实现规划算法、轨迹跟踪、Ackermann steering angle/acceleration 转换，也不宣称 Autoware 或 Apollo 接入。
 
+可选等待方式由 launch 的唯一参数 `edge_wait_mode:=futex|eventfd` 同时传给 bridge 与 bundled client，默认 `futex`。独立程序通过 `ClientOptions::wait_mode` 选择，CLI 对应 `--wait-mode`；例如：
+
+```cpp
+control_link_edge_client::ClientOptions options;
+options.command_channel = "control_link_planning_command";
+options.feedback_channel = "control_link_planning_feedback";
+options.wait_mode = control_link_edge_client::WaitMode::kEventFd;
+auto opened = control_link_edge_client::Client::open(options);
+```
+
+两端须使用同一等待配置及匹配 SDK。显式 `eventfd` 要求 CMake 对实际头文件与库的通知 API 链接探测成功，不支持时明确拒绝，不静默降级。命令由 Client Producer 启用通知、bridge Consumer 注册并读取；反馈反向使用同样机制。首次有正等待预算的 `wait_feedback()` 在 owner 慢路径惰性注册反馈通知；`try_feedback()` 保持非阻塞读取，不额外做注册 I/O。SDK `EventNotification::native_handle()` 是聚合 epoll FD，不是裸 eventfd；通知可合并，`drain()` 后仍按 latest-value 读取，不是命令计数或执行 ACK。Client 不创建 ControlLink 后台线程；SDK Producer 通知服务拥有自己的线程。
+
+SelfIPCs v0.5 的 `ChannelOptions::stale_timeout` 已弃用且仅接受默认 100ms，不能再传旧的 500ms。能力/版本适配保留旧 SDK 默认 futex 路径的原 transport 设置；**应用 `ClientOptions::feedback_freshness` 仍默认 500ms**，由样本 `publish_boot_ns` 判断，不用 heartbeat 续期。Contract 输入 100ms、QoS、lease 和恢复数均不因此改变。CMake 继续使用 `find_package(EdgeRuntime)` / `EdgeRuntime::edge_runtime`，显式绑定匹配 prefix；不要把新头与旧库混装。
+
+通知注册是 worker/Client owner 慢路径，单次 exchange 最多申请 20ms 并受剩余 steady 绝对期限约束；bridge 每轮有界处理命令，服务反馈/heartbeat 后 `ppoll` 等待通知、自己的 stop FD 与下一期限。普通空读不重连、不换 session。重连先移除本轮 poll 引用、释放旧 notification，再换 Consumer 并重新注册；offline/stale drain 先检查最后提交样本，仍执行原 token/sequence/时效校验。publish 已成功时不因通知诊断重复发布；Client 锁存该通知故障并拒绝后续提交，普通新反馈不能解除，须 owner 显式 close/open。关闭顺序为请求停止、唤醒、join、关闭资源。SocketCAN 的内部 eventfd 只负责 CAN worker 唤醒/退出，与新增 SHM 状态通知不同。
+
+停止有公开 SDK 边界：v0.5 的 create/open/enable/remove 等控制慢路径内部仍有无 deadline/cancellation 的 `flock(LOCK_EX)`。上述 20ms 不是整个 SDK 生命周期的硬上限，外部长期持锁时不能保证即时停止；ControlLink 不访问私有锁或强行释放 SDK 内存。该等待方式不预设比 futex 快，也不改变软件 HOLD、VM/vcan 与非硬实时边界。
+
 ### SOME/IP 网络接入
 
 ```text

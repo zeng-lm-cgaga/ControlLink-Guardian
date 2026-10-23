@@ -9,6 +9,7 @@
 #include <string>
 
 #include "control_link_edge_protocol/protocol.hpp"
+#include "control_link_edge_protocol/channel_wait.hpp"
 #include "edge_runtime/channel/sample.hpp"
 #include "edge_runtime/common/result.hpp"
 
@@ -27,6 +28,7 @@ namespace control_link_edge_client
 		std::chrono::milliseconds feedback_open_timeout{30'000};
 		std::chrono::milliseconds reconnect_period{100};
 		std::chrono::milliseconds feedback_freshness{500};
+		WaitMode wait_mode{WaitMode::kFutex};
 	};
 
 	enum class ClientState : std::uint8_t
@@ -134,6 +136,9 @@ namespace control_link_edge_client
 		std::uint64_t last_feedback_receive_boot_ns{0U};
 		std::uint64_t last_submitted_sequence{0U};
 		std::optional<FeedbackSnapshot> latest_feedback{};
+		std::uint64_t notification_registrations{0U};
+		std::uint64_t notification_registration_failures{0U};
+		int command_notification_errno{0};
 	};
 
 	// Client 只有一个 owner；同一实例的 open/read/submit/heartbeat/close 不能并发调用。

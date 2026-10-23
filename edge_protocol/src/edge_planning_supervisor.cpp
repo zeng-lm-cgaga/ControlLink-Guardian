@@ -16,6 +16,7 @@ namespace
 		std::string command_channel;
 		std::string feedback_channel;
 		std::string client_path;
+		std::string wait_mode{"futex"};
 		std::string linear_velocity_mps{"0.25"};
 		std::string angular_velocity_radps{"0.10"};
 		std::uint32_t max_restarts{3U};
@@ -27,7 +28,7 @@ namespace
 		std::cerr << "usage: " << program
 			<< " --command-channel NAME --feedback-channel NAME --client PATH"
 			<< " [--linear-velocity-mps VALUE] [--angular-velocity-radps VALUE]"
-			<< " [--max-restarts COUNT] [--create-timeout-ms VALUE]\n";
+			<< " [--wait-mode futex|eventfd] [--max-restarts COUNT] [--create-timeout-ms VALUE]\n";
 	}
 
 	bool parse_unsigned(const char *text, std::uint64_t *value)
@@ -65,6 +66,11 @@ namespace
 			if (argument == "--command-channel") options->command_channel = value;
 			else if (argument == "--feedback-channel") options->feedback_channel = value;
 			else if (argument == "--client") options->client_path = value;
+			else if (argument == "--wait-mode")
+			{
+				options->wait_mode = value;
+				if (options->wait_mode != "futex" && options->wait_mode != "eventfd") return false;
+			}
 			else if (argument == "--linear-velocity-mps") options->linear_velocity_mps = value;
 			else if (argument == "--angular-velocity-radps") options->angular_velocity_radps = value;
 			else if (argument == "--max-restarts")
@@ -137,6 +143,7 @@ int main(int argc, char **argv)
 		options.client_path,
 		"--command-channel", options.command_channel,
 		"--feedback-channel", options.feedback_channel,
+		"--wait-mode", options.wait_mode,
 		"--linear-velocity-mps", options.linear_velocity_mps,
 		"--angular-velocity-radps", options.angular_velocity_radps,
 	};

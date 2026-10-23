@@ -152,7 +152,23 @@ SelfIPCs v0.5 的 `ChannelOptions::stale_timeout` 已弃用且仅接受默认 10
 
 通知注册是 worker/Client owner 慢路径，单次 exchange 最多申请 20ms 并受剩余 steady 绝对期限约束；bridge 每轮有界处理命令，服务反馈/heartbeat 后 `ppoll` 等待通知、自己的 stop FD 与下一期限。普通空读不重连、不换 session。重连先移除本轮 poll 引用、释放旧 notification，再换 Consumer 并重新注册；offline/stale drain 先检查最后提交样本，仍执行原 token/sequence/时效校验。publish 已成功时不因通知诊断重复发布；Client 锁存该通知故障并拒绝后续提交，普通新反馈不能解除，须 owner 显式 close/open。关闭顺序为请求停止、唤醒、join、关闭资源。SocketCAN 的内部 eventfd 只负责 CAN worker 唤醒/退出，与新增 SHM 状态通知不同。
 
-停止有公开 SDK 边界：v0.5 的 create/open/enable/remove 等控制慢路径内部仍有无 deadline/cancellation 的 `flock(LOCK_EX)`。上述 20ms 不是整个 SDK 生命周期的硬上限，外部长期持锁时不能保证即时停止；ControlLink 不访问私有锁或强行释放 SDK 内存。该等待方式不预设比 futex 快，也不改变软件 HOLD、VM/vcan 与非硬实时边界。
+需要合作式控制期限/取消时，配置 `-DCONTROL_LINK_EDGE_REQUIRE_CONTROL_CONTEXT=ON`，并将 `EdgeRuntime_DIR` 与 `SelfIPCs_DIR` 显式绑定同一匹配 prefix。此模式要求 `find_package(SelfIPCs 0.5.1 CONFIG REQUIRED COMPONENTS control_context)`，同时编译/链接探测 `kControlContextFeatureVersion=1` 和库符号；缺少能力直接报错，不降级。它兼容默认 futex 与显式 eventfd。关闭该选项继续兼容旧 SDK，但旧 v0.5 无期限的控制锁不具有下述保证。
+
+单 owner 程序可用 `Client::prepare(options)` 创建不接触 SDK 的清理 owner，再调用 `connect(ControlContext)`。一次 context 使用 `CLOCK_MONOTONIC` 绝对总期限及可选 `CancellationSource::token()`，覆盖 create/通知启用/open及其重试；失败的 Client 仍须保留。`Client::open` 保留原兼容入口，不提供合作式总预算承诺。操作期限不替代样本 BOOTTIME 新鲜度或业务 SYSTEM stamp。
+
+```cpp
+auto prepared = control_link_edge_client::Client::prepare(options);
+if (!prepared) return 1;
+auto client = std::move(prepared.value());
+auto ready = client.connect(control_link_edge_client::control_budget(std::chrono::milliseconds{500}));
+// ready失败仍须由同一owner执行下面的收束；这里不重发旧目标。
+auto closed = client.close(control_link_edge_client::control_budget(std::chrono::milliseconds{100}));
+// closed错误或Pending时，保有client，用fresh context继续close，直至Closed再析构。
+```
+
+受控 Client 和 bridge 保留 receipt/handle 的唯一清理责任，区分 uncommitted、committed 与 cleanup pending。已提交不因通知/清理失败重复发布；关闭按 request_stop、移除旧通知引用、必要 remove_if_owner、finalize、释放映射顺序进行；receipt pending先显式收束，禁止将pending当closed。`ClientStatus.cleanup_pending` 与 `kClosing` 暴露未收束状态。取消请求只在普通线程发起，信号处理器仅转交停止标记。bridge先取消/唤醒并join使用者，再用fresh无取消token的context收束SDK资源。命令行入口遇pending会保留owner并显式重试，不将重试中的进程描述为已退出；controlled Client析构前若一次100ms收束仍失败则fail-fast，调用者必须先完成显式close。
+
+SDK期限/取消是合作式的，不能强制打断任意 `fdatasync`、文件系统/驱动同步阻塞、线程调度或join；因此没有整体硬停止上界。ControlLink不访问生产私有锁、不异线程强制free、不创建detached清理线程。该等待方式不预设比 futex 快，也不改变软件 HOLD、VM/vcan 与非硬实时边界。
 
 ### SOME/IP 网络接入
 

@@ -197,7 +197,7 @@ namespace
 			if (!control_link_edge_client::parse_wait_mode(get_parameter("wait_mode").as_string(), wait_mode_) ||
 				!control_link_edge_client::wait_mode_supported(wait_mode_))
 				throw std::runtime_error("Edge wait_mode must be futex or a supported eventfd mode");
-			command_wait_ = control_link_edge_client::ChannelWait<CommandFrame>(wait_mode_);
+			command_wait_ = std::make_unique<control_link_edge_client::ChannelWait<CommandFrame>>(wait_mode_);
 			if (!control_link_edge_protocol::generate_session_token(&session_token_))
 			{
 				throw std::runtime_error(
@@ -234,18 +234,56 @@ namespace
 
 		~EdgePlanningBridge() override
 		{
+			stop_worker();
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (feedback_producer_ || command_consumer_ || control_.pending())
+			{
+				RCLCPP_FATAL(get_logger(), "SDK cleanup pending: node owner must finalize before destruction");
+				std::terminate();
+			}
+#endif
+		}
+
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		// executor/worker使用者先join；pending时node继续存活，新的期限不沿用已取消token。
+		edge_runtime::Result<control_link_edge_client::CloseStatus> stop_and_finalize(
+			const control_link_edge_client::ControlContext &context)
+		{
+			stop_worker();
+			if (command_consumer_) command_consumer_->request_stop();
+			if (feedback_producer_) feedback_producer_->request_stop();
+			auto command = retire_command(context);
+			if (!command) return command.error();
+			auto feedback = retire_feedback(context);
+			if (!feedback) return feedback.error();
+			return control_link_edge_client::CloseStatus::kClosed;
+		}
+#endif
+
+	private:
+		void stop_worker()
+		{
+			bool first_stop = false;
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
+				first_stop = !stop_requested_;
 				stop_requested_ = true;
 				graph_admission_pending_ = false;
 				graph_admission_verify_own_publisher_ = false;
 				publisher_rebuild_requested_ = false;
 				gateway_source_ready_ = false;
 			}
+			if (first_stop) RCLCPP_INFO(get_logger(), "SDK stop_requested monotonic_ns=%lld", static_cast<long long>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
 			publish_timer_.reset();
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			(void)control_stop_.request_cancel();
+#endif
 			stop_condition_.notify_all();
 			stop_wake_.wake();
 			if (worker_.joinable()) worker_.join();
+			if (first_stop) RCLCPP_INFO(get_logger(), "SDK worker_joined monotonic_ns=%lld", static_cast<long long>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				publisher_.reset();
@@ -253,7 +291,6 @@ namespace
 			}
 		}
 
-	private:
 		void load_configuration()
 		{
 			const auto profile_path = std::filesystem::path{
@@ -772,9 +809,23 @@ namespace
 
 		void try_create_feedback_producer()
 		{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			const auto context = control_link_edge_client::control_budget(20ms, control_stop_.token());
+			if (feedback_retiring_)
+			{
+				auto closed = retire_feedback(context);
+				if (!closed) { log_edge_error("feedback cleanup pending", closed.error()); return; }
+			}
+#endif
 			if (feedback_producer_ != nullptr) return;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			auto ready = control_.begin(context);
+			if (!ready) { log_edge_error("feedback create receipt pending", ready.error()); return; }
+			auto created = FeedbackProducer::create(feedback_channel_options(), edge_runtime::feedback_schema(), context, control_.receipt());
+#else
 			auto created = FeedbackProducer::create(
 				feedback_channel_options(), edge_runtime::feedback_schema());
+#endif
 			if (!created)
 			{
 				log_edge_error("feedback producer create", created.error());
@@ -782,22 +833,45 @@ namespace
 			}
 			feedback_producer_ = std::make_unique<FeedbackProducer>(
 				std::move(created.value()));
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			auto enabled = control_.begin(context);
+			if (enabled && wait_mode_ == WaitMode::kEventFd)
+				enabled = feedback_producer_->enable_event_notifications(context, control_.receipt());
+#else
 			auto enabled = control_link_edge_client::enable_notifications(*feedback_producer_, wait_mode_);
+#endif
 			if (!enabled)
 			{
 				log_edge_error("feedback notification enable", enabled.error());
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+				feedback_retiring_ = true;
+				(void)retire_feedback(context);
+#else
 				(void)feedback_producer_->remove_if_owner();
 				feedback_producer_.reset();
+#endif
 				return;
 			}
 			RCLCPP_INFO(get_logger(), "Edge feedback producer is ready");
 		}
 
-		bool try_open_command_consumer()
+		bool try_open_command_consumer(
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			const control_link_edge_client::ControlContext *supplied_context = nullptr
+#endif
+		)
 		{
 			if (command_consumer_ != nullptr || feedback_producer_ == nullptr) return false;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (feedback_retiring_) return false;
+			const auto context = supplied_context ? *supplied_context : control_link_edge_client::control_budget(20ms, control_stop_.token());
+			auto ready = control_.begin(context);
+			if (!ready) { log_edge_error("command open receipt pending", ready.error()); return false; }
+			auto opened = CommandConsumer::open(command_channel_options(), edge_runtime::command_schema(), context, control_.receipt());
+#else
 			auto opened = CommandConsumer::open(
 				command_channel_options(), edge_runtime::command_schema());
+#endif
 			if (!opened)
 			{
 				log_edge_error("command consumer open", opened.error());
@@ -817,11 +891,68 @@ namespace
 		bool reconnect_command_consumer()
 		{
 			if (command_consumer_ == nullptr) return false;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			const auto context = control_link_edge_client::control_budget(20ms, control_stop_.token());
+			auto closed = retire_command(context);
+			if (!closed) { log_edge_error("command cleanup pending", closed.error()); return false; }
+#else
 			// poll 的 watch 集每轮重建；此处不再持有旧 FD，再释放 notification 和 consumer。
-			command_wait_.reset();
+			command_wait_->reset();
 			command_consumer_.reset();
-			return try_open_command_consumer();
+#endif
+			return try_open_command_consumer(
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+				&context
+#endif
+			);
 		}
+
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		edge_runtime::Result<void> retire_command(const control_link_edge_client::ControlContext &context)
+		{
+			if (command_consumer_) command_consumer_->request_stop();
+			auto settled = command_wait_->finalize(context);
+			if (!settled) return settled;
+			settled = control_.settle(context);
+			if (!settled) return settled;
+			if (command_consumer_)
+			{
+				auto ready = control_.begin(context);
+				if (!ready) return ready;
+				auto closed = command_consumer_->finalize(context, control_.receipt());
+				if (!closed) return closed.error();
+				if (closed.value() != control_link_edge_client::CloseStatus::kClosed)
+					return edge_runtime::make_error(edge_runtime::ErrorCode::kRecoveryBlocked, "bridge command finalize", "handle pending");
+				command_consumer_.reset();
+			}
+			return edge_runtime::Result<void>::ok();
+		}
+		edge_runtime::Result<void> retire_feedback(const control_link_edge_client::ControlContext &context)
+		{
+			if (feedback_producer_) feedback_producer_->request_stop();
+			auto ready = control_.begin(context);
+			if (!ready) return ready;
+			if (feedback_producer_)
+			{
+				if (!feedback_removed_)
+				{
+					auto removed = feedback_producer_->remove_if_owner(context, control_.receipt());
+					if (!removed) return removed;
+					feedback_removed_ = true;
+				}
+				ready = control_.begin(context);
+				if (!ready) return ready;
+				auto closed = feedback_producer_->finalize(context, control_.receipt());
+				if (!closed) return closed.error();
+				if (closed.value() != control_link_edge_client::CloseStatus::kClosed)
+					return edge_runtime::make_error(edge_runtime::ErrorCode::kRecoveryBlocked, "bridge feedback finalize", "handle pending");
+				feedback_producer_.reset();
+			}
+			feedback_removed_ = false;
+			feedback_retiring_ = false;
+			return edge_runtime::Result<void>::ok();
+		}
+#endif
 
 		bool handle_command_error(const edge_runtime::Error &error)
 		{
@@ -837,6 +968,9 @@ namespace
 			case edge_runtime::ErrorCode::kProducerOffline:
 			case edge_runtime::ErrorCode::kTransportFailed:
 			case edge_runtime::ErrorCode::kRecoveryBlocked:
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			case edge_runtime::ErrorCode::kClosed:
+#endif
 				return reconnect_command_consumer();
 			case edge_runtime::ErrorCode::kPayloadCorrupt:
 			case edge_runtime::ErrorCode::kPayloadDecodeFailed:
@@ -1127,6 +1261,9 @@ namespace
 		void publish_feedback()
 		{
 			if (feedback_producer_ == nullptr) return;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (feedback_retiring_) return;
+#endif
 			const auto frame = make_feedback_frame();
 			auto published = feedback_producer_->publish(frame);
 			if (!published)
@@ -1196,8 +1333,15 @@ namespace
 				}
 				if (feedback_producer_ != nullptr && now >= next_heartbeat)
 				{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+					if (!feedback_retiring_)
+					{
+#endif
 					auto heartbeat = feedback_producer_->heartbeat();
 					if (!heartbeat) log_edge_error("feedback heartbeat", heartbeat.error());
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+					}
+#endif
 					next_heartbeat = now + 100ms;
 				}
 				if (wait_mode_ == WaitMode::kEventFd)
@@ -1211,11 +1355,16 @@ namespace
 					{
 						const auto deadline = std::min(next_feedback, next_heartbeat);
 						const auto budget = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now());
-						auto registered = command_wait_.ensure(*command_consumer_, budget);
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+						auto registered = command_wait_->ensure(*command_consumer_, control_link_edge_client::control_budget(
+							std::min(budget, 20ms), control_stop_.token()));
+#else
+						auto registered = command_wait_->ensure(*command_consumer_, budget);
+#endif
 						if (!registered)
 						{
 							log_edge_error("command notification register", registered.error());
-							auto last = command_wait_.read(*command_consumer_, 0ns);
+							auto last = command_wait_->read(*command_consumer_, 0ns);
 							if (last) process_sample(last.value());
 							if (!control_link_adapters::is_command_wait_without_new_sample(registered.error().code))
 								(void)handle_command_error(registered.error());
@@ -1223,7 +1372,7 @@ namespace
 						}
 						else
 						{
-							auto sample = command_wait_.read(*command_consumer_, 0ns);
+							auto sample = command_wait_->read(*command_consumer_, 0ns);
 							if (sample) process_sample(sample.value());
 							else if (!control_link_adapters::is_command_wait_without_new_sample(sample.error().code))
 							{
@@ -1236,9 +1385,9 @@ namespace
 					auto wake_at = std::min(next_feedback, next_heartbeat);
 					if (!command_consumer_) wake_at = std::min(wake_at, next_command_open);
 					else if (next_notification_retry > after_read) wake_at = std::min(wake_at, next_notification_retry);
-					const int notification = command_consumer_ && after_read >= next_notification_retry ? command_wait_.native_handle() : -1;
+					const int notification = command_consumer_ && after_read >= next_notification_retry ? command_wait_->native_handle() : -1;
 					auto waited = control_link_edge_client::wait_edge_fds(notification, stop_wake_.get(), wake_at);
-					if (!waited) { log_edge_error("command notification poll", waited.error()); command_wait_.reset(); next_notification_retry = after_read + 100ms; }
+					if (!waited) { log_edge_error("command notification poll", waited.error()); command_wait_->reset(); next_notification_retry = after_read + 100ms; }
 					else if (waited.value()) break;
 					continue;
 				}
@@ -1254,6 +1403,9 @@ namespace
 					if (wake_at > now) wait_for_stop_until(wake_at);
 				}
 			}
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			RCLCPP_INFO(get_logger(), "Edge worker stopped; explicit SDK finalize remains with node owner");
+#else
 			if (feedback_producer_ != nullptr)
 			{
 				const auto removed = feedback_producer_->remove_if_owner();
@@ -1262,10 +1414,11 @@ namespace
 					log_edge_error("feedback producer cleanup", removed.error());
 				}
 			}
-			RCLCPP_INFO(get_logger(), "Edge notification registrations=%lu failures=%lu; worker stopped", command_wait_.registrations(), command_wait_.registration_failures());
-			command_wait_.reset();
+			RCLCPP_INFO(get_logger(), "Edge notification registrations=%lu failures=%lu; worker stopped", command_wait_->registrations(), command_wait_->registration_failures());
+			command_wait_->reset();
 			command_consumer_.reset();
 			feedback_producer_.reset();
+#endif
 		}
 
 		control_link_contract::ContractBundlePtr bundle_;
@@ -1296,7 +1449,13 @@ namespace
 		std::unique_ptr<CommandConsumer> command_consumer_;
 		std::unique_ptr<FeedbackProducer> feedback_producer_;
 		WaitMode wait_mode_{WaitMode::kFutex};
-		control_link_edge_client::ChannelWait<CommandFrame> command_wait_;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		control_link_edge_client::ControlOperation control_;
+		edge_runtime::CancellationSource control_stop_;
+		bool feedback_removed_{false};
+		bool feedback_retiring_{false};
+#endif
+		std::unique_ptr<control_link_edge_client::ChannelWait<CommandFrame>> command_wait_;
 		WorkerWake stop_wake_;
 		std::thread worker_;
 		std::mutex mutex_;
@@ -1347,9 +1506,11 @@ namespace
 int main(int argc, char **argv)
 {
 	rclcpp::init(argc, argv);
+	std::shared_ptr<EdgePlanningBridge> node;
+	int result = 0;
 	try
 	{
-		auto node = std::make_shared<EdgePlanningBridge>();
+		node = std::make_shared<EdgePlanningBridge>();
 		rclcpp::executors::MultiThreadedExecutor executor(
 			rclcpp::ExecutorOptions(), 2U);
 		executor.add_node(node);
@@ -1361,9 +1522,23 @@ int main(int argc, char **argv)
 		RCLCPP_FATAL(
 			rclcpp::get_logger("edge_planning_bridge"),
 			"Edge planning bridge failed: %s", exception.what());
-		rclcpp::shutdown();
-		return 1;
+		result = 1;
 	}
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	while (node)
+	{
+		auto closed = node->stop_and_finalize(control_link_edge_client::control_budget(std::chrono::milliseconds{100}));
+		if (closed && closed.value() == control_link_edge_client::CloseStatus::kClosed)
+		{
+			RCLCPP_INFO(rclcpp::get_logger("edge_planning_bridge"), "SDK resources_closed monotonic_ns=%lld", static_cast<long long>(
+				std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()));
+			break;
+		}
+		RCLCPP_ERROR(rclcpp::get_logger("edge_planning_bridge"), "SDK cleanup pending; retaining node owner, retrying with fresh context (not closed)");
+		std::this_thread::sleep_for(std::chrono::milliseconds{100});
+	}
+#endif
+	node.reset();
 	rclcpp::shutdown();
-	return 0;
+	return result;
 }

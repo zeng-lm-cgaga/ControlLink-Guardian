@@ -20,6 +20,43 @@ void error(const char *event, const edge_runtime::Error &failure)
 	std::cout << "{\"event\":\"" << event << "\",\"monotonic_ns\":" << monotonic_ns()
 		<< ",\"code\":\"" << edge_runtime::to_string(failure.code) << "\",\"errno\":" << failure.errno_value << "}\n" << std::flush;
 }
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+bool close_retained(Client &client)
+{
+	while (true)
+	{
+		auto closed = client.close(control_budget(100ms));
+		if (closed && closed.value() == CloseStatus::kClosed) return true;
+		if (!closed) error("cleanup_pending", closed.error());
+		std::this_thread::sleep_for(100ms);
+	}
+}
+edge_runtime::Result<Client> open_owned(const ClientOptions &options)
+{
+	auto prepared = Client::prepare(options);
+	if (!prepared) return prepared.error();
+	auto client = std::move(prepared.value());
+	const auto deadline = std::chrono::steady_clock::now() + options.feedback_open_timeout;
+	while (!stopped && std::chrono::steady_clock::now() < deadline)
+	{
+		auto ready = client.connect(control_budget(std::min(
+			std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - std::chrono::steady_clock::now()), std::chrono::nanoseconds{20'000'000})));
+		if (ready) return client;
+		if (ready.error().code != edge_runtime::ErrorCode::kTimeout && ready.error().code != edge_runtime::ErrorCode::kNotFound &&
+			ready.error().code != edge_runtime::ErrorCode::kProducerOffline)
+		{
+			const auto failure = ready.error();
+			close_retained(client);
+			return failure;
+		}
+	}
+	close_retained(client);
+	return edge_runtime::make_error(edge_runtime::ErrorCode::kTimeout, "driver connect", "operation stopped or expired");
+}
+#else
+bool close_retained(Client &client) { return static_cast<bool>(client.close()); }
+edge_runtime::Result<Client> open_owned(const ClientOptions &options) { return Client::open(options); }
+#endif
 }
 
 int main(int argc, char **argv)
@@ -33,7 +70,7 @@ int main(int argc, char **argv)
 	const std::string control_path = argv[4];
 	std::signal(SIGINT, signal_stop);
 	std::signal(SIGTERM, signal_stop);
-	auto opened = Client::open(options);
+	auto opened = open_owned(options);
 	if (!opened) { error("open_failed", opened.error()); return 1; }
 	auto client = std::move(opened.value());
 	std::string previous;
@@ -58,9 +95,8 @@ int main(int argc, char **argv)
 				target.command_sequence = sequence + 1;
 				target.source_stamp_ns = system_time_now_ns();
 				old_target = target;
-				auto closed = client.close();
-				if (!closed) error("close_failed", closed.error());
-				auto replacement = Client::open(options);
+				if (!close_retained(client)) return 1;
+				auto replacement = open_owned(options);
 				if (!replacement) { error("reopen_failed", replacement.error()); return 1; }
 				client = std::move(replacement.value());
 				sequence = 0;
@@ -93,7 +129,7 @@ int main(int argc, char **argv)
 			if (old_target && current.id.token != old_target->session.token && current.ready)
 			{
 				auto rejected = client.submit(*old_target);
-				if (rejected) return 3;
+				if (rejected) { (void)close_retained(client); return 3; }
 				error("old_target_rejected", rejected.error());
 				old_target.reset();
 			}
@@ -129,8 +165,7 @@ int main(int argc, char **argv)
 		std::this_thread::sleep_for(1ms);
 	}
 	const auto status = client.status();
-	auto closed = client.close();
-	if (!closed) { error("close_failed", closed.error()); return 1; }
+	if (!close_retained(client)) return 1;
 	std::cout << "{\"event\":\"closed\",\"monotonic_ns\":" << monotonic_ns()
 		<< ",\"submitted\":" << submitted << ",\"registrations\":" << status.notification_registrations
 		<< ",\"registration_failures\":" << status.notification_registration_failures

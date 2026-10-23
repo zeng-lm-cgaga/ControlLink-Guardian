@@ -4,6 +4,8 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <exception>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -29,6 +31,9 @@ namespace control_link_edge_client
 		bool should_reconnect(edge_runtime::ErrorCode code) noexcept
 		{
 			return code == edge_runtime::ErrorCode::kStaleHandle ||
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+				code == edge_runtime::ErrorCode::kClosed ||
+#endif
 				code == edge_runtime::ErrorCode::kProducerOffline ||
 				code == edge_runtime::ErrorCode::kTransportFailed ||
 				code == edge_runtime::ErrorCode::kRecoveryBlocked;
@@ -134,16 +139,119 @@ namespace control_link_edge_client
 			status_state_ = ClientState::kWaitingForSession;
 		}
 
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		explicit Impl(ClientOptions options)
+			: options_(std::move(options)), feedback_wait_(options_.wait_mode), controlled_(true)
+		{
+		}
+
+		edge_runtime::Result<void> connect(const ControlContext &context)
+		{
+			if (!controlled_ || closing_ || status_state_ == ClientState::kClosed)
+				return client_error(edge_runtime::ErrorCode::kClosed, "Client::connect", "owner stopped or legacy client");
+			auto checked = context.check();
+			if (!checked) return checked;
+			if (!command_producer_)
+			{
+				auto ready = control_.begin(context);
+				if (!ready) return ready;
+				auto options = channel_options(options_.command_channel);
+				options.heartbeat_interval = 100ms;
+				auto created = CommandProducer::create(options, edge_runtime::command_schema(), context, control_.receipt());
+				if (!created) return created.error();
+				command_producer_ = std::make_unique<CommandProducer>(std::move(created.value()));
+			}
+			if (!command_notifications_enabled_ && options_.wait_mode == WaitMode::kEventFd)
+			{
+				auto ready = control_.begin(context);
+				if (!ready) return ready;
+				auto enabled = command_producer_->enable_event_notifications(context, control_.receipt());
+				if (!enabled) return enabled;
+				command_notifications_enabled_ = true;
+			}
+			while (!feedback_consumer_)
+			{
+				auto checked = context.check();
+				if (!checked) return checked;
+				auto opened = reopen_feedback_consumer(&context);
+				if (opened) break;
+				if (control_.pending()) return opened;
+				if (opened.error().code != edge_runtime::ErrorCode::kNotFound &&
+					opened.error().code != edge_runtime::ErrorCode::kProducerOffline) return opened;
+				auto heartbeat = command_producer_->heartbeat();
+				if (!heartbeat) return heartbeat;
+				std::this_thread::sleep_for(1ms);
+			}
+			if (!feedback_seen_) status_state_ = ClientState::kWaitingForSession;
+			return edge_runtime::Result<void>::ok();
+		}
+
+		edge_runtime::Result<CloseStatus> close(const ControlContext &context) noexcept
+		{
+			if (!controlled_) return client_error(edge_runtime::ErrorCode::kInvalidOptions, "Client::close", "legacy client requires legacy close");
+			if (status_state_ == ClientState::kClosed) return CloseStatus::kClosed;
+			closing_ = true;
+			status_state_ = ClientState::kClosing;
+			session_.ready = false;
+			if (command_producer_) command_producer_->request_stop();
+			if (feedback_consumer_) feedback_consumer_->request_stop();
+			auto settled = feedback_wait_.finalize(context);
+			if (!settled) return settled.error();
+			settled = control_.settle(context);
+			if (!settled) return settled.error();
+			if (feedback_consumer_)
+			{
+				auto ready = control_.begin(context);
+				if (!ready) return ready.error();
+				auto closed = feedback_consumer_->finalize(context, control_.receipt());
+				if (!closed || closed.value() != CloseStatus::kClosed) return closed;
+				feedback_consumer_.reset();
+			}
+			if (command_producer_)
+			{
+				if (!command_removed_)
+				{
+					auto ready = control_.begin(context);
+					if (!ready) return ready.error();
+					auto removed = command_producer_->remove_if_owner(context, control_.receipt());
+					if (!removed) return removed.error();
+					command_removed_ = true;
+				}
+				auto ready = control_.begin(context);
+				if (!ready) return ready.error();
+				auto closed = command_producer_->finalize(context, control_.receipt());
+				if (!closed || closed.value() != CloseStatus::kClosed) return closed;
+				command_producer_.reset();
+			}
+			status_state_ = ClientState::kClosed;
+			return CloseStatus::kClosed;
+		}
+#endif
+
+		bool strict_cleanup() const noexcept
+		{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			return controlled_;
+#else
+			return false;
+#endif
+		}
+
 		edge_runtime::Result<FeedbackSnapshot> read_feedback(
 			std::chrono::nanoseconds timeout)
 		{
-			if (status_state_ == ClientState::kClosed)
+			if (status_state_ == ClientState::kClosed || status_state_ == ClientState::kClosing)
 			{
 				return client_error(
 					edge_runtime::ErrorCode::kStaleHandle,
 					"Client::read_feedback", "client closed");
 			}
 			const auto read_deadline = std::chrono::steady_clock::now() + nonnegative_timeout(timeout);
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			const auto context = control_budget(nonnegative_timeout(timeout));
+			if (controlled_ && !feedback_consumer_ && timeout.count() <= 0)
+				return client_error(edge_runtime::ErrorCode::kProducerOffline, "Client::try_feedback", "reconnect requires positive operation budget");
+#endif
 
 			if (!feedback_consumer_)
 			{
@@ -162,27 +270,47 @@ namespace control_link_edge_client
 						"Client::read_feedback", "feedback producer unavailable");
 				}
 				next_reconnect_ = now + options_.reconnect_period;
-				auto reopened = reopen_feedback_consumer();
+				auto reopened = reopen_feedback_consumer(
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+					controlled_ ? &context : nullptr
+#endif
+				);
 				if (!reopened)
 				{
 					return reopened.error();
 				}
 			}
 
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (controlled_ && timeout.count() > 0)
+			{
+				auto registered = feedback_wait_.ensure(*feedback_consumer_, context);
+				if (!registered) return registered.error();
+			}
+#endif
 			auto result = feedback_wait_.read(*feedback_consumer_, nonnegative_timeout(
 				std::chrono::duration_cast<std::chrono::nanoseconds>(read_deadline - std::chrono::steady_clock::now())));
 			if (!result)
 			{
 				if (should_reconnect(result.error().code))
 				{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+					if (controlled_)
+					{
+						invalidate_session();
+						if (timeout.count() <= 0) return result.error();
+					}
+#endif
 					const auto now = std::chrono::steady_clock::now();
 					if (now >= next_reconnect_)
 					{
 						next_reconnect_ = now + options_.reconnect_period;
-						feedback_wait_.reset();
-						feedback_consumer_.reset();
-					auto reopened = reopen_feedback_consumer();
-					if (!reopened) return reopened.error();
+						auto reopened = reopen_feedback_consumer(
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+						controlled_ ? &context : nullptr
+#endif
+						);
+						if (!reopened) return reopened.error();
 						status_state_ = ClientState::kTransportLost;
 					}
 				}
@@ -250,7 +378,7 @@ namespace control_link_edge_client
 
 		edge_runtime::Result<SubmissionReceipt> submit(const CommandTarget &target)
 		{
-			if (status_state_ == ClientState::kClosed || !command_producer_)
+			if (status_state_ == ClientState::kClosed || status_state_ == ClientState::kClosing || !command_producer_)
 			{
 				return client_error(
 					edge_runtime::ErrorCode::kStaleHandle,
@@ -344,7 +472,7 @@ namespace control_link_edge_client
 
 		edge_runtime::Result<void> heartbeat() noexcept
 		{
-			if (status_state_ == ClientState::kClosed || !command_producer_)
+			if (status_state_ == ClientState::kClosed || status_state_ == ClientState::kClosing || !command_producer_)
 			{
 				return client_error(
 					edge_runtime::ErrorCode::kStaleHandle,
@@ -364,6 +492,11 @@ namespace control_link_edge_client
 		{
 			ClientStatus result;
 			result.state = status_state_;
+			result.cleanup_pending = status_state_ == ClientState::kClosing;
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			result.cleanup_pending = result.cleanup_pending || control_.pending() || feedback_wait_.cleanup_pending();
+			result.last_control_committed = controlled_ && control_.committed();
+#endif
 			result.session = session_;
 			result.feedback_seen = feedback_seen_;
 			result.notification_registrations = feedback_wait_.registrations();
@@ -428,6 +561,16 @@ namespace control_link_edge_client
 
 		edge_runtime::Result<void> close() noexcept
 		{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (controlled_)
+			{
+				auto result = close(control_budget(100ms));
+				if (!result) return result.error();
+				if (result.value() == CloseStatus::kPending)
+					return client_error(edge_runtime::ErrorCode::kRecoveryBlocked, "Client::close", "cleanup pending; retain owner and retry with fresh context");
+				return edge_runtime::Result<void>::ok();
+			}
+#endif
 			if (status_state_ == ClientState::kClosed) return edge_runtime::Result<void>::ok();
 			feedback_wait_.reset();
 			feedback_consumer_.reset();
@@ -442,8 +585,38 @@ namespace control_link_edge_client
 		}
 
 	private:
-		edge_runtime::Result<void> reopen_feedback_consumer()
+		edge_runtime::Result<void> reopen_feedback_consumer(
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			const ControlContext *supplied_context = nullptr
+#endif
+		)
 		{
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+			if (controlled_)
+			{
+				const auto context = supplied_context ? *supplied_context : control_budget(20ms);
+				auto settled = feedback_wait_.finalize(context);
+				if (!settled) return settled;
+				if (feedback_consumer_)
+				{
+					feedback_consumer_->request_stop();
+					auto ready = control_.begin(context);
+					if (!ready) return ready;
+					auto closed = feedback_consumer_->finalize(context, control_.receipt());
+					if (!closed) return closed.error();
+					if (closed.value() != CloseStatus::kClosed)
+						return client_error(edge_runtime::ErrorCode::kRecoveryBlocked, "Client::reopen", "old consumer cleanup pending");
+					feedback_consumer_.reset();
+				}
+				auto ready = control_.begin(context);
+				if (!ready) return ready;
+				auto opened = FeedbackConsumer::open(feedback_channel_options(), edge_runtime::feedback_schema(), context, control_.receipt());
+				if (!opened) return opened.error();
+				feedback_consumer_ = std::make_unique<FeedbackConsumer>(std::move(opened.value()));
+				invalidate_session();
+				return edge_runtime::Result<void>::ok();
+			}
+#endif
 			// 先释放旧映射再按名称重开，避免把同一进程的旧 consumer owner
 			// 传给 EdgeRuntime::Consumer::reconnect；新 producer 可能已经替换实例。
 			feedback_wait_.reset();
@@ -544,7 +717,33 @@ namespace control_link_edge_client
 		std::uint64_t last_feedback_receive_boot_ns_{0U};
 		std::uint64_t last_submitted_sequence_{0U};
 		std::chrono::steady_clock::time_point next_reconnect_{};
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		ControlOperation control_;
+		bool controlled_{false};
+		bool closing_{false};
+		bool command_removed_{false};
+		bool command_notifications_enabled_{false};
+#endif
 	};
+
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	edge_runtime::Result<Client> Client::prepare(const ClientOptions &options)
+	{
+		if (options.command_channel.empty() || options.feedback_channel.empty() ||
+			options.feedback_freshness.count() <= 0 || options.feedback_open_timeout.count() <= 0 || options.reconnect_period.count() <= 0 ||
+			!wait_mode_supported(options.wait_mode))
+			return client_error(edge_runtime::ErrorCode::kInvalidOptions, "Client::prepare", "invalid channel, freshness or wait mode");
+		return Client(std::make_unique<Impl>(options));
+	}
+	edge_runtime::Result<void> Client::connect(const ControlContext &context)
+	{
+		return impl_ ? impl_->connect(context) : client_error(edge_runtime::ErrorCode::kClosed, "Client::connect", "moved client");
+	}
+	edge_runtime::Result<CloseStatus> Client::close(const ControlContext &context) noexcept
+	{
+		return impl_ ? impl_->close(context) : edge_runtime::Result<CloseStatus>(CloseStatus::kClosed);
+	}
+#endif
 
 	edge_runtime::Result<Client> Client::open(const ClientOptions &options)
 	{
@@ -608,14 +807,22 @@ namespace control_link_edge_client
 	Client &Client::operator=(Client &&other) noexcept
 	{
 		if (this == &other) return *this;
-		if (impl_ != nullptr) (void)impl_->close();
+		if (impl_ != nullptr && !impl_->close() && impl_->strict_cleanup())
+		{
+			std::fputs("ControlLink Client move requires closed owner; cleanup remains pending\n", stderr);
+			std::terminate();
+		}
 		impl_ = std::move(other.impl_);
 		return *this;
 	}
 
 	Client::~Client()
 	{
-		if (impl_ != nullptr) (void)impl_->close();
+		if (impl_ != nullptr && !impl_->close() && impl_->strict_cleanup())
+		{
+			std::fputs("ControlLink Client requires explicit close/finalize before destruction; retain pending owner\n", stderr);
+			std::terminate();
+		}
 	}
 
 	edge_runtime::Result<FeedbackSnapshot> Client::wait_feedback(

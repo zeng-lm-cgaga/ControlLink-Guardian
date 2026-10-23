@@ -102,7 +102,7 @@ def analyze(scene):
                 'CAN has no full business sequence/session: segment-level proof only',
                 'status/Gateway/canonical are independent observations, not an atomic snapshot',
                 'heartbeat-only producer loop is evidenced by fixture source; feedback samples are recorded',
-                'existing SDK control flock has no deadline/cancellation; normal measured cleanup is not a hard bound']}
+                'cooperative SDK control guarantees require explicit context capability; normal measured cleanup is not an arbitrary kernel-blocking hard bound']}
 
 
 if __name__ == '__main__':

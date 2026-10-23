@@ -40,6 +40,7 @@ namespace control_link_edge_client
 		kTransportLost = 4U,
 		kProtocolError = 5U,
 		kClosed = 6U,
+		kClosing = 7U,
 	};
 
 	// SessionId 同时携带 token 和本地观察代次；重连即使暂时看到旧 token，也会使旧目标失效。
@@ -139,6 +140,8 @@ namespace control_link_edge_client
 		std::uint64_t notification_registrations{0U};
 		std::uint64_t notification_registration_failures{0U};
 		int command_notification_errno{0};
+		bool cleanup_pending{false};
+		bool last_control_committed{false};
 	};
 
 	// Client 只有一个 owner；同一实例的 open/read/submit/heartbeat/close 不能并发调用。
@@ -146,6 +149,13 @@ namespace control_link_edge_client
 	{
 	public:
 		static edge_runtime::Result<Client> open(const ClientOptions &options);
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+		// prepare不接触SDK资源；connect失败时本对象仍持有receipt/handle，须fresh-context close。
+		// pending时必须保有Client并显式重试；不满足析构前置条件会fail-fast，不隐式无限等待。
+		static edge_runtime::Result<Client> prepare(const ClientOptions &options);
+		edge_runtime::Result<void> connect(const ControlContext &context);
+		edge_runtime::Result<CloseStatus> close(const ControlContext &context) noexcept;
+#endif
 
 		Client(const Client &) = delete;
 		Client &operator=(const Client &) = delete;

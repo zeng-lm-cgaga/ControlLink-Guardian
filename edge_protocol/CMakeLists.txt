@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 
 set(CONTROL_LINK_EDGE_PROTOCOL_VERSION 0.1.0)
+option(CONTROL_LINK_EDGE_REQUIRE_CONTROL_CONTEXT
+	"Require the SelfIPCs cooperative control deadline/cancellation API" OFF)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
 	project(control_link_edge_protocol LANGUAGES CXX)
@@ -50,6 +52,19 @@ target_compile_options(control_link_edge_protocol PRIVATE -Wall -Wextra -Wpedant
 
 if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_SDK)
 	include(CheckCXXSourceCompiles)
+	if(CONTROL_LINK_EDGE_REQUIRE_CONTROL_CONTEXT)
+		find_package(SelfIPCs 0.5.1 CONFIG REQUIRED COMPONENTS control_context)
+		set(CMAKE_REQUIRED_LIBRARIES EdgeRuntime::edge_runtime)
+		unset(CONTROL_LINK_EDGE_CONTROL_CONTEXT_LINKABLE CACHE)
+		check_cxx_source_compiles("#include <self_ipcs/channel/control_context.hpp>
+static_assert(edge_runtime::kControlContextFeatureVersion == 1);
+int main() { return edge_runtime::control_context_feature_version() == 1 ? 0 : 1; }"
+			CONTROL_LINK_EDGE_CONTROL_CONTEXT_LINKABLE)
+		unset(CMAKE_REQUIRED_LIBRARIES)
+		if(NOT CONTROL_LINK_EDGE_CONTROL_CONTEXT_LINKABLE)
+			message(FATAL_ERROR "Selected SDK package/header/library lack linked control_context v1; no fallback")
+		endif()
+	endif()
 	set(CMAKE_REQUIRED_LIBRARIES EdgeRuntime::edge_runtime)
 	unset(CONTROL_LINK_EDGE_NOTIFICATION_LINKABLE CACHE)
 	check_cxx_source_compiles("#include <chrono>
@@ -71,6 +86,7 @@ int main(int argc, char **argv) {
 		set(CONTROL_LINK_EDGE_DEFAULT_STALE_ONLY 1)
 	endif()
 	target_compile_definitions(control_link_edge_protocol PUBLIC
+		CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT=$<BOOL:${CONTROL_LINK_EDGE_REQUIRE_CONTROL_CONTEXT}>
 		CONTROL_LINK_EDGE_HAS_NOTIFICATION=$<BOOL:${CONTROL_LINK_EDGE_NOTIFICATION_LINKABLE}>
 		CONTROL_LINK_EDGE_DEFAULT_STALE_ONLY=${CONTROL_LINK_EDGE_DEFAULT_STALE_ONLY})
 	add_library(control_link_edge_client STATIC
@@ -137,6 +153,23 @@ if(CONTROL_LINK_EDGE_PROTOCOL_BUILD_TESTS)
 			endif()
 			find_package(GTest QUIET)
 			if(GTest_FOUND)
+				if(CONTROL_LINK_EDGE_REQUIRE_CONTROL_CONTEXT)
+					add_executable(test_control_context test/test_control_context.cpp)
+					target_link_libraries(test_control_context PRIVATE control_link_edge_client GTest::gtest_main)
+					target_link_options(test_control_context PRIVATE -Wl,--wrap=fdatasync -Wl,--wrap=shm_unlink)
+					target_compile_options(test_control_context PRIVATE -Wall -Wextra -Wpedantic)
+					set(CONTROL_LINK_EDGE_SDK_FIXTURE_SOURCE "" CACHE PATH "Read-only matching SDK source for its official lock helper")
+					if(CONTROL_LINK_EDGE_SDK_FIXTURE_SOURCE)
+						add_executable(control_lock_peer "${CONTROL_LINK_EDGE_SDK_FIXTURE_SOURCE}/test/integration/helpers/control_lock_peer.cpp")
+						target_link_libraries(control_lock_peer PRIVATE EdgeRuntime::edge_runtime)
+						target_include_directories(control_lock_peer PRIVATE "${CONTROL_LINK_EDGE_SDK_FIXTURE_SOURCE}/test/fixtures")
+						target_include_directories(test_control_context PRIVATE "${CONTROL_LINK_EDGE_SDK_FIXTURE_SOURCE}/src")
+						target_compile_definitions(test_control_context PRIVATE CONTROL_LOCK_PEER="$<TARGET_FILE:control_lock_peer>")
+						add_dependencies(test_control_context control_lock_peer)
+					endif()
+					add_test(NAME test_control_context COMMAND test_control_context)
+					set_tests_properties(test_control_context PROPERTIES TIMEOUT 45)
+				endif()
 				add_executable(test_channel_wait test/test_channel_wait.cpp)
 				target_link_libraries(test_channel_wait PRIVATE control_link_edge_client GTest::gtest_main)
 				target_compile_options(test_channel_wait PRIVATE -Wall -Wextra -Wpedantic)

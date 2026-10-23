@@ -9,6 +9,7 @@
 
 #include "edge_runtime/channel/consumer.hpp"
 #include "edge_runtime/channel/producer.hpp"
+#include "control_link_edge_protocol/control_operation.hpp"
 
 namespace control_link_edge_client
 {
@@ -112,6 +113,28 @@ public:
 	}
 	std::uint64_t registrations() const noexcept { return registrations_; }
 	std::uint64_t registration_failures() const noexcept { return registration_failures_; }
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	bool cleanup_pending() const noexcept { return registration_.pending(); }
+	edge_runtime::Result<void> finalize(const ControlContext &context) noexcept
+	{
+		auto settled = registration_.settle(context);
+		if (settled) reset();
+		return settled;
+	}
+	edge_runtime::Result<void> ensure(edge_runtime::Consumer<Value> &consumer,
+		const ControlContext &context)
+	{
+		if (mode_ == WaitMode::kFutex) return edge_runtime::Result<void>::ok();
+		if (notification_ || terminal_) return edge_runtime::Result<void>::ok();
+		auto ready = registration_.begin(context);
+		if (!ready) return ready;
+		++registrations_;
+		auto result = consumer.event_notification(context, registration_.receipt());
+		if (!result) { ++registration_failures_; return result.error(); }
+		notification_.emplace(std::move(result.value()));
+		return edge_runtime::Result<void>::ok();
+	}
+#endif
 	edge_runtime::Result<void> ensure(
 		edge_runtime::Consumer<Value> &consumer, std::chrono::milliseconds budget)
 	{
@@ -186,5 +209,8 @@ private:
 	WaitMode mode_;
 	std::uint64_t registrations_{0};
 	std::uint64_t registration_failures_{0};
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	ControlOperation registration_;
+#endif
 };
 }

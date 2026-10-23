@@ -153,6 +153,7 @@ namespace
 		switch (state)
 		{
 		case ClientState::kOpening: return "opening";
+		case ClientState::kClosing: return "closing_pending";
 		case ClientState::kWaitingForSession: return "waiting_for_session";
 		case ClientState::kReady: return "ready";
 		case ClientState::kFeedbackStale: return "feedback_stale";
@@ -193,13 +194,32 @@ int main(int argc, char **argv)
 	client_options.reconnect_period = std::chrono::milliseconds(100);
 	client_options.feedback_freshness = std::chrono::milliseconds(500);
 	client_options.wait_mode = options.wait_mode;
-		auto opened = Client::open(client_options);
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	auto opened = Client::prepare(client_options);
+#else
+	auto opened = Client::open(client_options);
+#endif
 	if (!opened)
 	{
 		std::cerr << "edge client open failed: " << error_text(opened.error()) << '\n';
 		return 3;
 	}
 	Client client = std::move(opened.value());
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	bool connected = false;
+	const auto connect_deadline = std::chrono::steady_clock::now() + client_options.feedback_open_timeout;
+	while (!stop_requested && std::chrono::steady_clock::now() < connect_deadline)
+	{
+		const auto remaining = connect_deadline - std::chrono::steady_clock::now();
+		auto ready = client.connect(control_link_edge_client::control_budget(
+			std::min(std::chrono::duration_cast<std::chrono::nanoseconds>(remaining), std::chrono::nanoseconds{20'000'000})));
+		if (ready) { connected = true; break; }
+		if (ready.error().code != edge_runtime::ErrorCode::kTimeout &&
+			ready.error().code != edge_runtime::ErrorCode::kNotFound &&
+			ready.error().code != edge_runtime::ErrorCode::kProducerOffline) break;
+	}
+	if (!connected) stop_requested = 1;
+#endif
 
 	std::optional<SessionId> target_session;
 	std::uint64_t next_command_sequence = 0U;
@@ -277,11 +297,22 @@ int main(int argc, char **argv)
 		}
 	}
 
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+	while (true)
+	{
+		auto closed = client.close(control_link_edge_client::control_budget(std::chrono::milliseconds{100}));
+		if (closed && closed.value() == control_link_edge_client::CloseStatus::kClosed) break;
+		std::cerr << "SDK cleanup pending; retaining owner, fresh-context retry (not closed)\n";
+		std::this_thread::sleep_for(std::chrono::milliseconds{100});
+	}
+	if (!connected) return 3;
+#else
 	const auto closed = client.close();
 	if (!closed)
 	{
 		std::cerr << "SDK close failed: " << error_text(closed.error()) << '\n';
 		return 5;
 	}
+#endif
 	return 0;
 }

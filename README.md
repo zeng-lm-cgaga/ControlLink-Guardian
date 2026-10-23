@@ -172,6 +172,8 @@ SelfIPCs v0.5 的 `ChannelOptions::stale_timeout` 已弃用且仅接受默认 10
 
 adapters 构建时显式开启 `CONTROL_LINK_ENABLE_SOMEIP=ON` 才提供 bridge；launch 使用 `planning_transport:=someip`，必须提供 server 的绝对 `vsomeip_config_path`，并使用完整 `config_root` 下的网络 YAML。外部 client 另行提供自己的 JSON、application identity 与网络配置，`someip_configure` 可从唯一 YAML 生成 JSON。SDK/构建/启动接口、网络夹具条件与限制见 [网络接入契约](docs/17_network_protocol_contracts.md)。
 
+锁定 vsomeip3.4.10 的 service JSON 必须先声明 `events` 再声明 `eventgroups`；生产预检在网络初始化前拒绝反序配置，不静默重写文件，也不要求无关对象键序与生成文本完全一致。
+
 新握手显式绑定 GetStatus 观察到的开立域（服务实例与非回绕代次）；Open/Keep/Close 使用同一域，响应丢失重试不更换域。串行释放旧 publisher 后先关闭旧域、再回收其记录，因此有限退役键预算不再限制服务总会话次数；缺域或旧域请求明确拒绝。读取公开域不取得控制资格，也不承担认证。
 
 ### gRPC 异步网络接入

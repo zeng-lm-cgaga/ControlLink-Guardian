@@ -15,6 +15,7 @@
 #include <vector>
 
 #include <gtest/gtest.h>
+#include <boost/property_tree/json_parser.hpp>
 #include <yaml-cpp/yaml.h>
 
 namespace control_link::someip {
@@ -435,6 +436,97 @@ TEST(SomeipConfig, RuntimeJsonMatchesOwnerButKeepsExplicitAssemblyIdentity) {
   EXPECT_NO_THROW(validate_vsomeip_configuration(config, client.path(), "external", false));
   EXPECT_THROW(validate_vsomeip_configuration(config, client.path(), "other", false), std::invalid_argument);
   EXPECT_THROW(validate_vsomeip_configuration(config, client.path(), "external", true), std::invalid_argument);
+}
+
+TEST(SomeipConfig, RuntimeJsonRejectsEventgroupsBeforeEventsWithIdenticalValues) {
+  const auto config = load_config(source_config_path());
+  const auto generated = vsomeip_configuration_json(config, config.application_name, 0x3101, "event-order", true);
+  std::istringstream input(generated);
+  boost::property_tree::ptree document;
+  boost::property_tree::read_json(input, document);
+  auto &service = document.get_child("services").front().second;
+  const auto original_service = service;
+  const auto events = service.get_child("events");
+  const auto groups = service.get_child("eventgroups");
+  service.erase("events");
+  service.erase("eventgroups");
+  service.push_back({"eventgroups", groups});
+  service.push_back({"events", events});
+  ASSERT_EQ(service.size(), original_service.size());
+  for (const auto &field : original_service) {
+    EXPECT_TRUE(field.second == service.get_child(field.first)) << field.first;
+  }
+  std::ostringstream output;
+  boost::property_tree::write_json(output, document, false);
+  const TemporaryConfig reversed(output.str());
+  try {
+    validate_vsomeip_configuration(config, reversed.path(), config.application_name, true);
+    FAIL() << "equal JSON values cannot hide event declaration order from the pinned library";
+  } catch (const std::invalid_argument &error) {
+    const std::string message = error.what();
+    EXPECT_NE(message.find("services[0].eventgroups"), std::string::npos);
+    EXPECT_NE(message.find("vsomeip 3.4.10 requires events before eventgroups"), std::string::npos);
+  }
+  std::ifstream unchanged(reversed.path());
+  std::ostringstream actual;
+  actual << unchanged.rdbuf();
+  EXPECT_EQ(actual.str(), output.str());
+}
+
+TEST(SomeipConfig, RuntimeJsonAllowsUnrelatedObjectKeyOrder) {
+  const auto config = load_config(source_config_path());
+  for (const bool server : {false, true}) {
+    std::istringstream input(vsomeip_configuration_json(config, config.application_name, 0x3101, "other-order", server));
+    boost::property_tree::ptree document;
+    boost::property_tree::read_json(input, document);
+    document.reverse();
+    if (server) {
+      auto &service = document.get_child("services").front().second;
+      const auto groups = service.get_child("eventgroups");
+      service.erase("eventgroups");
+      service.reverse();
+      service.push_back({"eventgroups", groups});
+      service.get_child("reliable").reverse();
+    }
+    std::ostringstream output;
+    boost::property_tree::write_json(output, document, false);
+    const TemporaryConfig reordered(output.str());
+    EXPECT_NO_THROW(validate_vsomeip_configuration(config, reordered.path(), config.application_name, server));
+  }
+}
+
+TEST(SomeipConfig, RuntimeJsonEventOrderUsesDecodedKeys) {
+  const auto config = load_config(source_config_path());
+  for (const bool reversed : {false, true}) {
+    std::istringstream input(vsomeip_configuration_json(config, config.application_name, 0x3101, "escaped-order", true));
+    boost::property_tree::ptree document;
+    boost::property_tree::read_json(input, document);
+    if (reversed) {
+      auto &service = document.get_child("services").front().second;
+      const auto events = service.get_child("events");
+      service.erase("events");
+      service.push_back({"events", events});
+    }
+    std::ostringstream output;
+    boost::property_tree::write_json(output, document, false);
+    auto escaped = output.str();
+    for (const auto &key : {std::string{"events"}, std::string{"eventgroups"}}) {
+      const auto position = escaped.find("\"" + key + "\":");
+      ASSERT_NE(position, std::string::npos);
+      escaped.replace(position + 1, 1, "\\u0065");
+    }
+    const TemporaryConfig file(escaped);
+    if (!reversed) {
+      EXPECT_NO_THROW(validate_vsomeip_configuration(config, file.path(), config.application_name, true));
+    } else {
+      try {
+        validate_vsomeip_configuration(config, file.path(), config.application_name, true);
+        FAIL() << "escaped keys must not bypass event declaration order";
+      } catch (const std::invalid_argument &error) {
+        EXPECT_NE(std::string{error.what()}.find("services[0].eventgroups"), std::string::npos);
+      }
+    }
+  }
 }
 
 TEST(SomeipConfig, RuntimeJsonCannotOverrideSafetyResourceOrDiscoveryOwner) {

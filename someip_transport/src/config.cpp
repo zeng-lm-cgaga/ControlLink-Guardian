@@ -435,6 +435,21 @@ void validate_vsomeip_configuration(const Config &config, const std::string &pat
     const auto expected = YAML::Load(vsomeip_configuration_json(assembled, application_name,
         static_cast<std::uint16_t>(application_id), network, server));
     compare_configuration(document, expected, "vsomeip JSON");
+    if (server) {
+      std::size_t service_index = 0;
+      for (const auto &service : json_document.get_child("services")) {
+        bool events_declared = false;
+        // 锁定库先解析eventgroups会创建UNRELIABLE占位；只约束这对有语义差异的键序。
+        for (const auto &field : service.second) {
+          if (field.first == "events") events_declared = true;
+          else if (field.first == "eventgroups" && !events_declared) {
+            invalid("vsomeip JSON.services[" + std::to_string(service_index) + "].eventgroups",
+                    "vsomeip 3.4.10 requires events before eventgroups to preserve event reliability");
+          }
+        }
+        ++service_index;
+      }
+    }
   } catch (const boost::property_tree::json_parser_error &error) {
     invalid("vsomeip JSON", "invalid JSON syntax: " + std::string{error.what()});
   } catch (const YAML::Exception &error) {

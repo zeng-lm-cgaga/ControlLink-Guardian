@@ -257,6 +257,82 @@ TEST_P(ControlContextTest, ReplacementRetiresOldNotificationAndRejectsOldSession
 	if (GetParam() == WaitMode::kEventFd) { EXPECT_GE(client->status().notification_registrations, 2U); }
 }
 
+TEST_P(ControlContextTest, ReplacementBeforeFirstNotificationRecoversAndRejectsOldSession)
+{
+	make_feedback_producer();
+	ASSERT_TRUE(client->connect(control_budget(500ms)));
+	publish(1);
+	ASSERT_TRUE(client->try_feedback());
+	ASSERT_EQ(client->status().notification_registrations, 0U);
+	ASSERT_EQ(client->status().notification_registration_failures, 0U);
+	const auto old_session = client->current_session();
+	const auto old_target = target(1);
+	ASSERT_TRUE(client->submit(old_target));
+	ASSERT_TRUE(feedback->remove_if_owner());
+	feedback.reset();
+	make_feedback_producer();
+
+	bool recovered = false;
+	unsigned attempts = 0;
+	const auto before = std::chrono::steady_clock::now();
+	const auto deadline = before + 1s;
+	for (; attempts < 20 && std::chrono::steady_clock::now() < deadline; ++attempts)
+	{
+		publish(attempts + 1, 2);
+		auto sample = client->wait_feedback(50ms);
+		if (sample && sample.value().frame.session_token.bytes[0] == std::byte{2})
+		{
+			recovered = true;
+			break;
+		}
+		std::this_thread::sleep_for(5ms);
+	}
+	RecordProperty("recovery_wait_calls", std::to_string(attempts + (recovered ? 1U : 0U)));
+	RecordProperty("recovery_elapsed_monotonic_ns", std::to_string(
+		std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - before).count()));
+	ASSERT_TRUE(recovered);
+	const auto new_session = client->current_session();
+	EXPECT_TRUE(new_session.ready);
+	EXPECT_GT(new_session.id.epoch, old_session.id.epoch);
+	EXPECT_NE(new_session.id.token, old_session.id.token);
+	EXPECT_NE(new_session.transport_instance_nonce, old_session.transport_instance_nonce);
+	auto stale = client->submit(old_target);
+	ASSERT_FALSE(stale);
+	EXPECT_EQ(stale.error().code, edge_runtime::ErrorCode::kStaleHandle);
+	EXPECT_TRUE(client->submit(target(1)));
+
+	const auto registrations = client->status().notification_registrations;
+	const auto failures = client->status().notification_registration_failures;
+	RecordProperty("notification_registrations", std::to_string(registrations));
+	RecordProperty("notification_registration_failures", std::to_string(failures));
+	if (GetParam() == WaitMode::kEventFd)
+	{
+		EXPECT_EQ(registrations, 2U);
+		EXPECT_EQ(failures, 1U);
+	}
+	else
+	{
+		EXPECT_EQ(registrations, 0U);
+		EXPECT_EQ(failures, 0U);
+	}
+	for (unsigned sequence = 100; sequence < 103; ++sequence)
+	{
+		publish(sequence, 2);
+		auto sample = client->wait_feedback(50ms);
+		ASSERT_TRUE(sample);
+		EXPECT_EQ(sample.value().frame.feedback_sequence, sequence);
+		EXPECT_EQ(client->current_session().id, new_session.id);
+	}
+	EXPECT_EQ(client->status().notification_registrations, registrations);
+	EXPECT_EQ(client->status().notification_registration_failures, failures);
+	EXPECT_TRUE(client->submit(target(2)));
+	auto closed = client->close(control_budget(500ms));
+	ASSERT_TRUE(closed);
+	EXPECT_EQ(closed.value(), CloseStatus::kClosed);
+	EXPECT_FALSE(client->status().cleanup_pending);
+	EXPECT_EQ(client->close(ControlContext(0)).value(), CloseStatus::kClosed);
+}
+
 TEST_P(ControlContextTest, OfficialLockContentionDeadlineAndCancellation)
 {
 #ifdef CONTROL_LOCK_PEER

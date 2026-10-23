@@ -281,15 +281,18 @@ namespace control_link_edge_client
 				}
 			}
 
-#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
-			if (controlled_ && timeout.count() > 0)
+			auto result = [&]() -> edge_runtime::Result<edge_runtime::Sample<FeedbackFrame>>
 			{
-				auto registered = feedback_wait_.ensure(*feedback_consumer_, context);
-				if (!registered) return registered.error();
-			}
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+				if (controlled_ && timeout.count() > 0)
+				{
+					auto registered = feedback_wait_.ensure(*feedback_consumer_, context);
+					if (!registered) return registered.error();
+				}
 #endif
-			auto result = feedback_wait_.read(*feedback_consumer_, nonnegative_timeout(
-				std::chrono::duration_cast<std::chrono::nanoseconds>(read_deadline - std::chrono::steady_clock::now())));
+				return feedback_wait_.read(*feedback_consumer_, nonnegative_timeout(
+					std::chrono::duration_cast<std::chrono::nanoseconds>(read_deadline - std::chrono::steady_clock::now())));
+			}();
 			if (!result)
 			{
 				if (should_reconnect(result.error().code))
@@ -323,6 +326,9 @@ namespace control_link_edge_client
 					}
 				}
 				else if (result.error().code != edge_runtime::ErrorCode::kTimeout &&
+#if CONTROL_LINK_EDGE_HAS_CONTROL_CONTEXT
+					result.error().code != edge_runtime::ErrorCode::kCancelled &&
+#endif
 					result.error().code != edge_runtime::ErrorCode::kNoNewSample &&
 					result.error().code != edge_runtime::ErrorCode::kDataStale)
 				{

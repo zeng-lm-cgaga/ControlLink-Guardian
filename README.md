@@ -166,6 +166,8 @@ SelfIPCs v0.5 的 `ChannelOptions::stale_timeout` 已弃用且仅接受默认 10
 
 可选 C++ SDK 使用 vsomeip 与 Protobuf，复用同一 ROS-free 64B command codec；提供 `start`、`wait_available`、`open`、`keep`、`submit`、`get_status`、`status`、`set_status_subscription`、`close` 和 `stop`。SDK 单 owner，独立示例 [someip_planning_consumer](someip_transport/examples/someip_planning_consumer/CMakeLists.txt) 可在未 source ROS2 的环境中通过 `find_package(control_link_someip_transport CONFIG REQUIRED)` 链接 `ControlLink::control_link_someip_transport`，不依赖 EdgeRuntime。
 
+`ClientStatus.gateway_subscription/vehicle_subscription` 分别暴露Pending/Accepted/Rejected及超时未知态，不把发起subscribe、收到状态event或查询成功当成对端接受。Accepted仅表示最后一次已观察ACK，不保证随后续订仍被接受。固定vsomeip3.4.10自routing-host的拒订阅回调有API可观察性限制；owner可显式取消只读订阅后GetStatus，Keep/Close仍走原控制契约，不改变holder/token/GID。重新订阅后缺少底层请求代次的回调保守标Unknown，保留实际error/时刻。详细字段、等待预算与生命周期边界见[网络接入契约](docs/17_network_protocol_contracts.md)。
+
 示例默认每 50ms 计算新目标、每 1000ms 发送独立 Keep；Keep 只维护网络 holder，不刷新命令时间或 lease。目标保留调用者的原始 SYSTEM 时间戳和当前 session 的业务 sequence；换 session 后重新计算目标，不为旧目标换 token、重盖时间或自动重发。SD available、`submission_ready`、协议回复均不等于 Gateway 接受或 planning ACTIVE；Gateway、SourceStatus、VehicleState 反馈保留各自时间与 validity，不是原子状态或任务 ACK。
 
 adapters 构建时显式开启 `CONTROL_LINK_ENABLE_SOMEIP=ON` 才提供 bridge；launch 使用 `planning_transport:=someip`，必须提供 server 的绝对 `vsomeip_config_path`，并使用完整 `config_root` 下的网络 YAML。外部 client 另行提供自己的 JSON、application identity 与网络配置，`someip_configure` 可从唯一 YAML 生成 JSON。SDK/构建/启动接口、网络夹具条件与限制见 [网络接入契约](docs/17_network_protocol_contracts.md)。

@@ -2,6 +2,7 @@
 #include "control_link_someip_transport/server.hpp"
 #include "application_runtime.hpp"
 #include "session_reply_order.hpp"
+#include "subscription_state.hpp"
 
 #include <array>
 #include <condition_variable>
@@ -99,8 +100,10 @@ struct SomeipClient::Impl {
   std::condition_variable wake;
   ClientStatus current;
   bool started{false};
-  bool subscribed{false};
+  bool subscription_requested{false};
   bool subscription_enabled{true};
+  detail::SubscriptionObservationState gateway_subscription;
+  detail::SubscriptionObservationState vehicle_subscription;
   std::shared_ptr<vsomeip::message> pending;
   bool response_ready{false};
   std::string response_bytes;
@@ -113,9 +116,14 @@ struct SomeipClient::Impl {
   std::uint64_t vehicle_sequence{0};
 
   Impl(Config settings, std::string json, std::string name)
-      : config(std::move(settings)), path(std::move(json)), application_name(std::move(name)) {}
+      : config(std::move(settings)), path(std::move(json)), application_name(std::move(name)),
+        gateway_subscription(config.service_id, config.instance_id, config.gateway_eventgroup, config.gateway_event),
+        vehicle_subscription(config.service_id, config.instance_id, config.vehicle_eventgroup, config.vehicle_event) {}
 
   void invalidate_locked(const std::string &reason) {
+    subscription_requested = false;
+    gateway_subscription.reset(subscription_enabled ? SubscriptionState::Unknown : SubscriptionState::Disabled);
+    vehicle_subscription.reset(subscription_enabled ? SubscriptionState::Unknown : SubscriptionState::Disabled);
     session_reply_order.observe_revocation();
     current.session.Clear();
     current.observations.Clear();
@@ -149,7 +157,6 @@ struct SomeipClient::Impl {
             vsomeip::reliability_type_e::RT_RELIABLE);
       } else {
         current.service_available = false;
-        subscribed = false;
         invalidate_locked("SOME/IP application deregistered");
       }
       wake.notify_all();
@@ -164,20 +171,42 @@ struct SomeipClient::Impl {
     if (!current.running) return;
     try {
       if (!available && current.service_available) {
-        subscribed = false;
         invalidate_locked("SOME/IP service unavailable; old targets must be discarded");
       }
       current.service_available = available;
-      if (available && subscription_enabled && !subscribed) {
-        app->subscribe(config.service_id, config.instance_id,
-                       config.gateway_eventgroup, config.major_version);
-        app->subscribe(config.service_id, config.instance_id,
-                       config.vehicle_eventgroup, config.major_version);
-        subscribed = true;
-      }
+      if (available && subscription_enabled && !subscription_requested) request_subscriptions_locked();
       wake.notify_all();
     } catch (const std::exception &failure) {
       invalidate_locked(failure.what());
+    }
+  }
+
+  void request_subscriptions_locked() {
+    const auto now = steady_now_ns();
+    const auto budget = static_cast<std::uint64_t>(config.reconnect_max_ms) * 1000000ULL;
+    auto install = [&](detail::SubscriptionObservationState &observation, std::uint16_t group,
+                       std::uint16_t event) {
+      const auto generation = observation.begin(current.availability_generation, now, budget);
+      app->register_subscription_status_handler(config.service_id, config.instance_id, group, event,
+          [this, generation](vsomeip::service_t service, vsomeip::instance_t instance,
+                            vsomeip::eventgroup_t group, vsomeip::event_t event, std::uint16_t error) {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!current.running || !current.service_available || !subscription_enabled || !subscription_requested) return;
+            auto &state = group == config.gateway_eventgroup ? gateway_subscription : vehicle_subscription;
+            state.observe(generation, service, instance, group, event, error, steady_now_ns());
+            wake.notify_all();
+          }, true);
+    };
+    subscription_requested = true;
+    try {
+      install(gateway_subscription, config.gateway_eventgroup, config.gateway_event);
+      install(vehicle_subscription, config.vehicle_eventgroup, config.vehicle_event);
+      app->subscribe(config.service_id, config.instance_id, config.gateway_eventgroup, config.major_version);
+      app->subscribe(config.service_id, config.instance_id, config.vehicle_eventgroup, config.major_version);
+    } catch (const std::exception &failure) {
+      gateway_subscription.reset(SubscriptionState::Unknown);
+      vehicle_subscription.reset(SubscriptionState::Unknown);
+      current.failure = std::string("Readonly subscription request failed: ") + failure.what();
     }
   }
 
@@ -441,6 +470,8 @@ void SomeipClient::stop() noexcept {
     impl_->current.registered = false;
     impl_->current.service_available = false;
     impl_->invalidate_locked("SOME/IP local stop");
+    impl_->gateway_subscription.reset(SubscriptionState::Disabled);
+    impl_->vehicle_subscription.reset(SubscriptionState::Disabled);
   }
   impl_->wake.notify_all();
   try {
@@ -465,6 +496,9 @@ void SomeipClient::stop() noexcept {
   } catch (...) {
   }
   impl_->app.reset();
+  std::lock_guard<std::mutex> lock(impl_->mutex);
+  impl_->gateway_subscription.reset(SubscriptionState::Disabled);
+  impl_->vehicle_subscription.reset(SubscriptionState::Disabled);
 }
 
 bool SomeipClient::wait_available(std::chrono::milliseconds timeout) {
@@ -479,23 +513,21 @@ bool SomeipClient::wait_available(std::chrono::milliseconds timeout) {
 void SomeipClient::set_status_subscription(bool enabled) {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   if (!impl_->current.running) throw std::runtime_error("SOME/IP client is not running");
+  const bool was_requested = impl_->subscription_requested;
   impl_->subscription_enabled = enabled;
-  if (enabled && !impl_->subscribed && impl_->current.service_available) {
-    impl_->app->subscribe(impl_->config.service_id, impl_->config.instance_id,
-                          impl_->config.gateway_eventgroup, impl_->config.major_version);
-    impl_->app->subscribe(impl_->config.service_id, impl_->config.instance_id,
-                          impl_->config.vehicle_eventgroup, impl_->config.major_version);
-    impl_->subscribed = true;
-  } else if (!enabled && impl_->subscribed) {
+  if (enabled && !impl_->subscription_requested && impl_->current.service_available) {
+    impl_->request_subscriptions_locked();
+  } else if (!enabled) {
+    impl_->subscription_requested = false;
+    impl_->gateway_subscription.reset(SubscriptionState::Disabled);
+    impl_->vehicle_subscription.reset(SubscriptionState::Disabled);
+    impl_->current.gateway_status_received_steady_ns = 0;
+    impl_->current.vehicle_status_received_steady_ns = 0;
+    if (!was_requested) return;
     impl_->app->unsubscribe(impl_->config.service_id, impl_->config.instance_id,
                             impl_->config.gateway_eventgroup);
     impl_->app->unsubscribe(impl_->config.service_id, impl_->config.instance_id,
                             impl_->config.vehicle_eventgroup);
-    impl_->subscribed = false;
-  }
-  if (!enabled) {
-    impl_->current.gateway_status_received_steady_ns = 0;
-    impl_->current.vehicle_status_received_steady_ns = 0;
   }
 }
 
@@ -568,6 +600,8 @@ ClientStatus SomeipClient::status() const {
   std::lock_guard<std::mutex> lock(impl_->mutex);
   auto result = impl_->current;
   const auto now = steady_now_ns();
+  result.gateway_subscription = impl_->gateway_subscription.snapshot(now);
+  result.vehicle_subscription = impl_->vehicle_subscription.snapshot(now);
   // 只评估网络观察是否停更；原组的业务时效/validity 已由 server 的 immutable Contract 判断。
   // 此预算不能延长命令、Gateway 或 Vehicle 的有效期，原时间元数据不改写。
   const auto budget = static_cast<std::uint64_t>(impl_->config.keep_period_ms) * 1000000ULL;

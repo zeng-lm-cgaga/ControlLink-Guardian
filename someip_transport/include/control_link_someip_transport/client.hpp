@@ -9,6 +9,20 @@
 
 namespace control_link::someip {
 
+enum class SubscriptionState { Disabled, Pending, Accepted, Rejected, TimedOut, Unknown };
+
+// 只读订阅观察，不是控制资格或执行ACK。TimedOut不推断对端NACK；error仅在callback_observed时有效。
+struct SubscriptionObservation {
+  SubscriptionState state{SubscriptionState::Disabled};
+  std::uint16_t service{0}, instance{0}, eventgroup{0}, event{0};
+  std::uint64_t request_generation{0}, availability_generation{0};
+  std::uint64_t requested_steady_ns{0}, deadline_steady_ns{0}, callback_steady_ns{0};
+  bool callback_observed{false};
+  bool callback_attempt_unambiguous{false};
+  std::uint16_t error{0};
+  std::uint64_t ignored_callbacks{0};
+};
+
 struct ClientStatus {
   bool running{false};
   bool registered{false};
@@ -19,6 +33,8 @@ struct ClientStatus {
   std::uint64_t vehicle_status_received_steady_ns{0};
   wire::SessionInfo session;
   wire::StatusSnapshot observations;
+  SubscriptionObservation gateway_subscription;
+  SubscriptionObservation vehicle_subscription;
   std::string failure;
 };
 
